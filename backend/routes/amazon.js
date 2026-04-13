@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
 
 const router = Router();
 
@@ -25,10 +26,8 @@ function extractFirstMatch(html, patterns) {
 function extractAmazonImage(html) {
   return extractFirstMatch(html, [
     /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
     /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
-    /"hiRes"\s*:\s*"([^"]+)"/i,
-    /"large"\s*:\s*"([^"]+)"/i
+    /"hiRes"\s*:\s*"([^"]+)"/i
   ]);
 }
 
@@ -52,13 +51,16 @@ function extractAmazonTitle(html) {
   ]);
 }
 
+function extractCanonicalUrl(html) {
+  return extractFirstMatch(html, [
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
+    /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i
+  ]);
+}
+
 function extractAmazonPrice(html) {
-  const whole = html.match(
-    /<span[^>]+class=["'][^"']*a-price-whole[^"']*["'][^>]*>\s*([^<]+)\s*<\/span>/i
-  )?.[1];
-  const fraction = html.match(
-    /<span[^>]+class=["'][^"']*a-price-fraction[^"']*["'][^>]*>\s*([^<]+)\s*<\/span>/i
-  )?.[1];
+  const whole = html.match(/<span[^>]+class=["'][^"']*a-price-whole[^"']*["'][^>]*>\s*([^<]+)\s*<\/span>/i)?.[1];
+  const fraction = html.match(/<span[^>]+class=["'][^"']*a-price-fraction[^"']*["'][^>]*>\s*([^<]+)\s*<\/span>/i)?.[1];
 
   if (whole && fraction) {
     return decodeHtml(`${whole},${fraction}`);
@@ -77,12 +79,39 @@ function extractAmazonOldPrice(html) {
   ]);
 }
 
+function stripHtml(value) {
+  return decodeHtml(value.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractSellerInfo(html) {
+  const merchantChunk = extractFirstMatch(html, [
+    /<div[^>]+id=["']merchantInfo_feature_div["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<div[^>]+id=["']merchant-info["'][^>]*>([\s\S]*?)<\/div>/i
+  ]);
+
+  const merchantText = stripHtml(merchantChunk || html);
+  const soldByAmazon =
+    /verkauf und versand durch amazon/i.test(merchantText) ||
+    /sold by amazon/i.test(merchantText);
+  const shippedByAmazon =
+    soldByAmazon ||
+    /versand durch amazon/i.test(merchantText) ||
+    /fulfilled by amazon/i.test(merchantText) ||
+    /ships from amazon/i.test(merchantText);
+
+  return {
+    sellerType: classifySellerType({ soldByAmazon, shippedByAmazon })
+  };
+}
+
 async function handleScrape(req, res) {
   try {
     console.log('SCRAPE ROUTE HIT');
     console.log('REQ BODY:', req.body);
     const { url } = req.body ?? {};
-    console.log('REQ BODY URL:', req.body?.url);
+    console.log('REQ BODY URL:', url);
 
     if (!url || typeof url !== 'string' || !url.trim()) {
       return res.status(400).json({
@@ -93,8 +122,6 @@ async function handleScrape(req, res) {
     }
 
     const trimmedUrl = url.trim();
-    console.log('[amazon/scrape] start scraping', { url: trimmedUrl });
-
     if (!/^https?:\/\//i.test(trimmedUrl)) {
       return res.status(400).json({
         success: false,
@@ -113,7 +140,7 @@ async function handleScrape(req, res) {
 
     const html = await response.text();
 
-    if (response.status === 403 || /captcha|robot check|benningtonschools|sorry/i.test(html)) {
+    if (response.status === 403 || /captcha|robot check|sorry/i.test(html)) {
       return res.status(502).json({
         success: false,
         error: 'Amazon blockiert den Scrape-Zugriff',
@@ -129,37 +156,28 @@ async function handleScrape(req, res) {
       });
     }
 
-    const title = extractAmazonTitle(html);
-    const image = normalizeDealImageUrl(extractAmazonImage(html));
-    const oldPrice = extractAmazonOldPrice(html);
-    const price = extractAmazonPrice(html);
-
-    console.log('[amazon/scrape] result', {
-      url: trimmedUrl,
-      hasTitle: Boolean(title),
-      hasPrice: Boolean(price),
-      hasOldPrice: Boolean(oldPrice),
-      hasImage: Boolean(image)
-    });
-    console.log('[amazon/scrape] success');
+    const canonicalUrl = extractCanonicalUrl(html);
+    const asin = extractAsin(canonicalUrl) || extractAsin(trimmedUrl) || '';
+    const normalizedUrl = normalizeAmazonLink(canonicalUrl || trimmedUrl);
+    const sellerInfo = extractSellerInfo(html);
+    console.log('EXTRACTED ASIN', asin);
 
     return res.status(200).json({
       success: true,
-      title: title || '',
-      image: image || '',
-      price: price || '',
-      oldPrice: oldPrice || ''
+      title: extractAmazonTitle(html) || '',
+      image: normalizeDealImageUrl(extractAmazonImage(html)) || '',
+      price: extractAmazonPrice(html) || '',
+      oldPrice: extractAmazonOldPrice(html) || '',
+      asin,
+      finalUrl: canonicalUrl || response.url || trimmedUrl,
+      originalUrl: trimmedUrl,
+      normalizedUrl,
+      sellerType: sellerInfo.sellerType
     });
   } catch (error) {
-    console.error('[amazon/scrape] scrape error', error);
-    console.log('[amazon/scrape] error');
-
     return res.status(500).json({
       success: false,
-      error:
-        error instanceof Error
-          ? `Scrape failed: ${error.message}`
-          : 'Scrape failed',
+      error: error instanceof Error ? `Scrape failed: ${error.message}` : 'Scrape failed',
       code: 'SCRAPE_FAILED'
     });
   }

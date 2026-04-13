@@ -1,15 +1,31 @@
 .generator-desktop-page {
   width: 100%;
-  padding: 1rem 0 3.5rem;
+  min-height: calc(100vh - 2rem);
+  padding: 0.25rem 0 10rem;
   min-width: 0;
 }
 
 .generator-desktop-shell {
-  width: min(100%, 1280px);
-  margin: 0 auto;
+  width: 100%;
+  margin: 0;
   display: grid;
-  gap: 1.25rem;
+  gap: 1.6rem;
   min-width: 0;
+  align-content: start;
+}
+
+.generator-content-header {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.2rem 0 0.1rem;
+}
+
+.generator-eyebrow {
+  margin: 0;
+  color: #93a4ba;
+  font-size: 0.82rem;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
 }
 
 .generator-panel {
@@ -23,8 +39,11 @@
 }
 
 .generator-intro-panel {
-  padding-top: 2rem;
-  padding-bottom: 1.9rem;
+  padding-top: 2.1rem;
+  padding-bottom: 2rem;
+  background:
+    radial-gradient(circle at top right, rgba(20, 184, 166, 0.08), transparent 30%),
+    linear-gradient(180deg, #111827 0%, #0d1220 100%);
 }
 
 .generator-panel-header {
@@ -58,6 +77,12 @@
 .generator-column-fields {
   display: grid;
   gap: 1.1rem;
+}
+
+.generator-intro-actions {
+  display: grid;
+  gap: 0.9rem;
+  align-items: center;
 }
 
 .generator-form-field {
@@ -153,6 +178,140 @@
   line-height: 1.5;
 }
 
+.generator-history-panel {
+  display: grid;
+  gap: 1rem;
+}
+
+.generator-history-panel.is-blocked {
+  border-color: rgba(248, 113, 113, 0.42);
+  background:
+    radial-gradient(circle at top right, rgba(248, 113, 113, 0.12), transparent 32%),
+    linear-gradient(180deg, #111827 0%, #0d1220 100%);
+}
+
+.generator-history-grid {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.generator-history-item {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.generator-history-item span {
+  font-size: 0.8rem;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.generator-history-item strong {
+  color: #e6eef7;
+  line-height: 1.45;
+}
+
+.generator-history-alert {
+  margin: 0;
+  padding: 0.95rem 1rem;
+  border-radius: 16px;
+  background: rgba(248, 113, 113, 0.12);
+  color: #fecaca;
+}
+
+.generator-history-inline {
+  display: grid;
+  gap: 0.12rem;
+  margin-top: -0.1rem;
+}
+
+.generator-history-inline p {
+  margin: 0;
+  color: #f87171;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.generator-post-preview {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.generator-post-preview pre {
+  margin: 0;
+  padding: 1rem 1.05rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+  color: #e6eef7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.generator-coupon-preview {
+  display: grid;
+  gap: 0.42rem;
+  width: 100%;
+  padding: 1rem 1.05rem;
+  border: 1px solid rgba(245, 158, 11, 0.38);
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(245, 158, 11, 0.11), rgba(255, 255, 255, 0.03)),
+    radial-gradient(circle at top right, rgba(251, 191, 36, 0.14), transparent 42%);
+  color: #f8fafc;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.generator-coupon-preview:hover {
+  border-color: rgba(251, 191, 36, 0.72);
+  transform: translateY(-1px);
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.16);
+}
+
+.generator-coupon-preview:focus-visible {
+  outline: none;
+  border-color: rgba(251, 191, 36, 0.86);
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.16);
+}
+
+.generator-coupon-preview span {
+  font-size: 0.82rem;
+  color: #fbbf24;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.generator-coupon-preview strong {
+  font-size: 1.08rem;
+  line-height: 1.35;
+  letter-spacing: 0.04em;
+}
+
+.generator-coupon-preview strong + strong {
+  display: none;
+}
+
+.generator-coupon-preview em {
+  font-style: normal;
+  font-size: 0.82rem;
+  color: #cbd5e1;
+}
+
+.generator-coupon-preview.is-empty {
+  border-color: rgba(248, 113, 113, 0.55);
+  background: linear-gradient(180deg, rgba(127, 29, 29, 0.24), rgba(255, 255, 255, 0.03));
+}
+
 .generator-inline-field {
   display: grid;
   gap: 0.7rem;
@@ -231,9 +390,22 @@
 
 .generator-price-grid {
   display: grid;
+  gap: 1rem;
+  width: 100%;
+}
+
+.generator-price-grid.single-price {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.generator-price-grid.has-old-price {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1.4rem 1.8rem;
-  width: 100%;
+}
+
+.generator-price-panel {
+  display: grid;
+  gap: 0.85rem;
 }
 
 .generator-submit-panel {
@@ -249,34 +421,32 @@
 @media (min-width: 1200px) {
   .generator-desktop-page {
     width: 100%;
-    padding-top: 1.25rem;
+    padding-top: 0.05rem;
   }
 
   .generator-desktop-shell {
     width: 100%;
-    max-width: 1240px;
-    margin-left: auto;
-    margin-right: auto;
-    gap: 1.4rem;
+    max-width: none;
+    gap: 1.75rem;
   }
 
   .generator-panel {
-    width: 100%;
-    padding: 2.2rem 2.5rem;
-    border-radius: 24px;
+    padding: 2.05rem 2.35rem;
+    border-radius: 26px;
   }
 
   .generator-intro-panel {
-    padding-top: 2.35rem;
-    padding-bottom: 2.1rem;
+    padding-top: 2.3rem;
+    padding-bottom: 2.15rem;
+    min-height: 280px;
   }
 
   .generator-panel-header {
-    margin-bottom: 1.55rem;
+    margin-bottom: 1.7rem;
   }
 
   .generator-panel-header h1 {
-    font-size: clamp(2.35rem, 3vw, 3.15rem);
+    font-size: clamp(2.45rem, 3vw, 3.35rem);
   }
 
   .generator-panel-header h2 {
@@ -284,23 +454,46 @@
   }
 
   .generator-base-fields {
-    gap: 1.15rem;
+    gap: 1.3rem;
+  }
+
+  .generator-intro-actions {
+    grid-template-columns: minmax(300px, 360px) auto;
+    justify-content: space-between;
+    gap: 1rem 1.5rem;
+    padding-top: 0.2rem;
+  }
+
+  .generator-intro-actions .generator-action-button.secondary {
+    width: 100%;
+    min-height: 3.4rem;
+  }
+
+  .generator-intro-actions .generator-checkbox-row {
+    min-height: 3.4rem;
+    padding: 0 0.15rem;
+    justify-self: end;
   }
 
   .generator-vertical-list,
   .generator-price-grid,
   .generator-column-fields,
-  .generator-form-field {
+  .generator-form-field,
+  .generator-history-grid {
     width: 100%;
     min-width: 0;
+  }
+
+  .generator-history-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .generator-form-field input,
   .generator-form-field select,
   .generator-form-field textarea {
     width: 100%;
-    padding: 1rem 1.05rem;
-    border-radius: 15px;
+    padding: 1.05rem 1.1rem;
+    border-radius: 16px;
   }
 
   .generator-form-field textarea {
@@ -328,8 +521,11 @@
   }
 
   .generator-price-grid {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     align-items: start;
+  }
+
+  .generator-price-grid.has-old-price {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 1.9rem 2.4rem;
   }
 
@@ -338,6 +534,7 @@
   }
 
   .generator-submit-panel {
+    margin-top: 0.2rem;
     padding-top: 1.6rem;
     padding-bottom: 1.6rem;
   }
@@ -361,6 +558,10 @@
   .generator-panel-header-inline {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .generator-intro-actions {
+    grid-template-columns: 1fr;
   }
 
   .generator-price-grid {

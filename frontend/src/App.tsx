@@ -10,6 +10,7 @@ import AutobotPage from './pages/Autobot';
 import LogsPage from './pages/Logs';
 import TeamPage from './pages/Team';
 import SettingsPage from './pages/Settings';
+import DealHistoryAdminPage from './pages/DealHistoryAdmin';
 
 function App() {
   const { user } = useAuth();
@@ -29,6 +30,7 @@ function App() {
               <Route path="autobot" element={<AutobotPage />} />
               <Route path="logs" element={<LogsPage />} />
               <Route path="team" element={<TeamPage />} />
+              <Route path="deal-history" element={<DealHistoryAdminPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

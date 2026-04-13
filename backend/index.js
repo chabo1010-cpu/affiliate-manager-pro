@@ -18,6 +18,7 @@ app.use(express.json());
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
+console.log('Registering deals routes on /api/deals');
 app.use('/api/deals', dealsRoutes);
 app.use('/api/posts', postsRoutes);
 app.use('/api/bot', botRoutes);

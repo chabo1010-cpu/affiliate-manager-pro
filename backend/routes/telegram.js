@@ -65,13 +65,21 @@ router.post('/send', async (req, res) => {
       imageUrl,
       amazonLink,
       rabattgutscheinCode,
-      chatId: bodyChatId
+      chatId: bodyChatId,
+      asin,
+      normalizedUrl,
+      productTitle,
+      currentPrice,
+      oldPrice,
+      sellerType,
+      shippingType,
+      marketplaceType
     } = req.body ?? {};
     const { token, chatId: envChatId } = getTelegramConfig();
     const finalChatId = (bodyChatId || envChatId || '').toString().trim();
     const trimmedImageUrl = typeof imageUrl === 'string' ? imageUrl.trim() : '';
-    const trimmedCouponCode =
-      typeof rabattgutscheinCode === 'string' ? rabattgutscheinCode.trim() : '';
+    const trimmedCouponCode = typeof rabattgutscheinCode === 'string' ? rabattgutscheinCode.trim() : '';
+    const followUpText = trimmedCouponCode;
 
     console.log('[telegram/send] incoming request', {
       hasText: typeof text === 'string' && text.trim().length > 0,
@@ -121,7 +129,6 @@ router.post('/send', async (req, res) => {
       ? {
           chat_id: finalChatId,
           photo: trimmedImageUrl,
-          // Caption is passed through as a raw string so Telegram can interpret the HTML tags.
           caption: String(text)
         }
       : {
@@ -139,9 +146,7 @@ router.post('/send', async (req, res) => {
 
     if (!telegramResponse.ok || !telegramData?.ok) {
       const telegramDescription =
-        telegramData?.description ||
-        telegramData?.raw ||
-        'Telegram API hat einen unbekannten Fehler geliefert';
+        telegramData?.description || telegramData?.raw || 'Telegram API hat einen unbekannten Fehler geliefert';
 
       return res.status(502).json({
         success: false,
@@ -156,10 +161,10 @@ router.post('/send', async (req, res) => {
 
     let couponMessageId = null;
 
-    if (trimmedCouponCode) {
+    if (followUpText) {
       const couponPayload = {
         chat_id: finalChatId,
-        text: `🏷️ Rabattgutschein: ${trimmedCouponCode}`
+        text: followUpText
       };
 
       const { telegramResponse: couponResponse, telegramData: couponData } = await sendTelegramRequest(
@@ -175,9 +180,7 @@ router.post('/send', async (req, res) => {
 
       if (!couponResponse.ok || !couponData?.ok) {
         const couponDescription =
-          couponData?.description ||
-          couponData?.raw ||
-          'Telegram API hat die Rabattgutschein-Nachricht abgelehnt';
+          couponData?.description || couponData?.raw || 'Telegram API hat die Rabattgutschein-Nachricht abgelehnt';
 
         return res.status(502).json({
           success: false,
@@ -191,10 +194,9 @@ router.post('/send', async (req, res) => {
 
       couponMessageId = couponData.result?.message_id ?? null;
     }
-
     return res.status(200).json({
       success: true,
-      message: trimmedCouponCode
+      message: followUpText
         ? 'Post und Rabattgutschein erfolgreich zu Telegram gesendet'
         : trimmedImageUrl
           ? 'Post erfolgreich mit Bild zu Telegram gesendet'

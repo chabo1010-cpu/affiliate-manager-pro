@@ -1,14 +1,56 @@
 export interface PostConfig {
   productTitle?: string;
   freiText?: string;
-  textBaustein?: string;
+  textBaustein?: string | string[];
   alterPreis?: string;
   neuerPreis?: string;
+  alterPreisLabel?: string;
+  neuerPreisLabel?: string;
   amazonLink?: string;
   werbung?: boolean;
   extraOptions?: string[];
   rabattgutscheinCode?: string;
 }
+
+export const INTERNAL_WITHOUT_OPTIONS = '__WITHOUT_OPTIONS__';
+export const WITHOUT_OPTIONS_LABEL = 'Ohne Optionen';
+export const COUPON_OPTION_LABEL = '\u{1F3F7} Rabattgutschein:';
+export const COUPON_LINE_PREFIX = '\u{1F3F7} Rabattgutschein:';
+export const MASTER_PRIMARY_OPTIONS: readonly string[] = [
+  '\u2705 Coupon aktivieren',
+  '\u2705 Werbeaktion aktivieren',
+  '\u2705 Coupon + Werbeaktion aktivieren',
+  '\u2139\uFE0F Automatischer Kassenrabatt',
+  '\u26A1\uFE0F Blitzangebot',
+  '\u23F0\uFE0F Zeitlich begrenztes Angebot',
+  '\u{1F4C9} Spar-Abo einrichten (jederzeit kündbar)',
+  '\u2139\uFE0F Ab 4 Stück nochmals 5% Ersparnis'
+] as const;
+export const MASTER_EXTRA_OPTIONS: readonly string[] = [
+  '\u2139\uFE0F Verschiedene Größen und Farben',
+  '\u2139\uFE0F Über ‚Andere Verkäufer‘ in den Warenkorb legen',
+  '\u2139\uFE0F Verschiedene Ausführungen',
+  '\u2139\uFE0F Lieferzeit beachten',
+  '\u2139\uFE0F Zzgl. Pfand',
+  COUPON_OPTION_LABEL,
+  '\u2139\uFE0F Derzeit vorbestellbar',
+  '\u2139\uFE0F Eventuell Verkäufer wechslen'
+] as const;
+const OLD_PRICE_ICON = '\u{1F534}';
+const PRICE_ICON = '\u{1F525}';
+const LINK_ICON = '\u27A1\uFE0F';
+const DEFAULT_PRIMARY_OPTION = INTERNAL_WITHOUT_OPTIONS;
+const DEFAULT_FREE_TEXT = '\u2139\uFE0F';
+const VALID_PRIMARY_OPTIONS = new Set(MASTER_PRIMARY_OPTIONS);
+
+type PostLine =
+  | { kind: 'title'; value: string }
+  | { kind: 'blank' }
+  | { kind: 'oldPrice'; label: string; price: string }
+  | { kind: 'price'; label: string; price: string }
+  | { kind: 'link'; value: string }
+  | { kind: 'text'; value: string }
+  | { kind: 'footer'; value: string };
 
 export const DEAL_IMAGE_RENDER = {
   width: 1200,
@@ -18,10 +60,6 @@ export const DEAL_IMAGE_RENDER = {
 
 function cleanText(value?: string): string {
   return value?.trim() || '';
-}
-
-function stripOptionPrefix(value?: string): string {
-  return cleanText(value).replace(/^[A-Z]\s+/, '').trim();
 }
 
 function escapeHtml(value: string): string {
@@ -37,26 +75,61 @@ function normalizePrice(value?: string): string {
   return cleanText(value).replace(/\s+/g, '');
 }
 
-function uniqueLines(lines: string[]): string[] {
-  const seen = new Set<string>();
-  return lines.filter((line) => {
-    const normalized = line.trim().toLowerCase();
-    if (!normalized || seen.has(normalized)) {
-      return false;
-    }
+function normalizeFreeText(value?: string): string {
+  const trimmed = cleanText(value);
+  if (!trimmed || trimmed === DEFAULT_FREE_TEXT) {
+    return '';
+  }
 
-    seen.add(normalized);
-    return true;
-  });
+  return trimmed;
 }
 
-function buildOptionLines(config: PostConfig): string[] {
-  const lines: string[] = [];
-  const mainOption = stripOptionPrefix(config.textBaustein);
-
-  if (mainOption && !/ohne optionen/i.test(mainOption)) {
-    lines.push(`✔️ ${mainOption}`);
+function normalizePrimaryOptions(value?: string | string[]): string[] {
+  if (Array.isArray(value)) {
+    return value.map(cleanText).filter(Boolean);
   }
+
+  const trimmed = cleanText(value);
+  return trimmed ? [trimmed] : [];
+}
+
+export function hasRealFreeText(value?: string): boolean {
+  return normalizeFreeText(value).length > 0;
+}
+
+export function hasValidPrimaryOption(value?: string | string[]): boolean {
+  return normalizePrimaryOptions(value).some(
+    (option) => option === WITHOUT_OPTIONS_LABEL || VALID_PRIMARY_OPTIONS.has(option)
+  );
+}
+
+export function hasValidCouponOnlyCase(isCouponActive: boolean, couponCode?: string): boolean {
+  return isCouponActive && cleanText(couponCode).length > 0;
+}
+
+export function hasEffectivePostQualifier(
+  primaryOption?: string | string[],
+  freeText?: string,
+  isCouponActive = false,
+  couponCode?: string
+): boolean {
+  return (
+    hasValidPrimaryOption(primaryOption) ||
+    hasRealFreeText(freeText) ||
+    hasValidCouponOnlyCase(isCouponActive, couponCode)
+  );
+}
+
+export function getOrderedSelectedOptions(config: PostConfig): string[] {
+  const lines: string[] = [];
+  const primaryOptions = normalizePrimaryOptions(config.textBaustein);
+  const couponCode = cleanText(config.rabattgutscheinCode);
+
+  primaryOptions.forEach((option) => {
+    if (option && option !== DEFAULT_PRIMARY_OPTION && option !== WITHOUT_OPTIONS_LABEL) {
+      lines.push(option);
+    }
+  });
 
   for (const option of config.extraOptions || []) {
     const trimmedOption = cleanText(option);
@@ -64,74 +137,124 @@ function buildOptionLines(config: PostConfig): string[] {
       continue;
     }
 
-    if (trimmedOption === 'Rabattgutschein') {
-      lines.push('🏷️ Rabattgutschein aktiv');
+    if (trimmedOption === COUPON_OPTION_LABEL) {
+      if (couponCode) {
+        lines.push(`${COUPON_LINE_PREFIX} ${couponCode}`);
+      }
       continue;
     }
 
-    if (/coupon/i.test(trimmedOption)) {
-      lines.push(`✔️ ${trimmedOption}`);
-      continue;
-    }
-
-    lines.push(`• ${trimmedOption}`);
+    lines.push(trimmedOption);
   }
 
-  const freeTextLines = cleanText(config.freiText)
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => `• ${line}`);
-
-  lines.push(...freeTextLines);
-
-  return uniqueLines(lines);
+  return lines;
 }
 
-function buildBaseLines(config: PostConfig, channel: 'telegram' | 'whatsapp'): string[] {
+function buildStructuredPost(config: PostConfig): PostLine[] {
   const title = cleanText(config.productTitle) || 'Amazon Produkt';
+  const oldPrice = normalizePrice(config.alterPreis);
   const price = normalizePrice(config.neuerPreis);
+  const oldPriceLabel = cleanText(config.alterPreisLabel) || 'Statt';
+  const priceLabel = cleanText(config.neuerPreisLabel) || 'Jetzt';
   const link = cleanText(config.amazonLink);
-  const optionLines = buildOptionLines(config);
+  const optionLines = getOrderedSelectedOptions(config);
+  const freeText = normalizeFreeText(config.freiText);
 
-  const bold = (value: string) => (channel === 'telegram' ? `<b>${escapeHtml(value)}</b>` : `*${value}*`);
-  const italic = (value: string) => (channel === 'telegram' ? `<i>${escapeHtml(value)}</i>` : `_${value}_`);
-  const plain = (value: string) => (channel === 'telegram' ? escapeHtml(value) : value);
+  const lines: PostLine[] = [{ kind: 'title', value: title }, { kind: 'blank' }];
 
-  const sections: string[] = [];
-  sections.push(bold(title));
+  if (oldPrice) {
+    lines.push({ kind: 'oldPrice', label: oldPriceLabel, price: oldPrice });
+  }
 
-  const priceLinkBlock: string[] = [];
   if (price) {
-    priceLinkBlock.push(`🔥 Jetzt ${bold(price)}`);
+    lines.push({ kind: 'price', label: priceLabel, price });
   }
 
   if (link) {
-    priceLinkBlock.push(`➡️ ${plain(link)}`);
+    lines.push({ kind: 'link', value: link });
   }
 
-  if (priceLinkBlock.length > 0) {
-    sections.push(priceLinkBlock.join('\n'));
+  optionLines.forEach((value) => {
+    lines.push({ kind: 'text', value });
+  });
+
+  if (freeText) {
+    lines.push({ kind: 'text', value: freeText });
   }
 
-  if (optionLines.length > 0) {
-    sections.push(optionLines.map(plain).join('\n'));
+  lines.push({ kind: 'blank' }, { kind: 'blank' }, { kind: 'footer', value: 'Anzeige/Partnerlink' });
+  return lines;
+}
+
+export function buildPostLines(config: PostConfig): string[] {
+  return buildStructuredPost(config).map((line) => {
+    switch (line.kind) {
+      case 'title':
+      case 'text':
+      case 'footer':
+      case 'link':
+        return line.value;
+      case 'oldPrice':
+        return `${OLD_PRICE_ICON} ${line.label} ${line.price}`;
+      case 'price':
+        return `${PRICE_ICON} ${line.label} ${line.price}`;
+      case 'blank':
+        return '';
+    }
+  });
+}
+
+function renderLine(line: PostLine, channel: 'telegram' | 'whatsapp'): string {
+  if (channel === 'telegram') {
+    switch (line.kind) {
+      case 'title':
+        return `<b>${escapeHtml(line.value)}</b>`;
+      case 'oldPrice':
+        return `${OLD_PRICE_ICON} ${escapeHtml(line.label)} <b>${escapeHtml(line.price)}</b>`;
+      case 'price':
+        return `${PRICE_ICON} ${escapeHtml(line.label)} <b>${escapeHtml(line.price)}</b>`;
+      case 'link':
+        return `${LINK_ICON} <b>${escapeHtml(line.value)}</b>`;
+      case 'text':
+        return escapeHtml(line.value);
+      case 'footer':
+        return '<i>Anzeige/Partnerlink</i>';
+      case 'blank':
+        return '';
+    }
   }
 
-  sections.push(italic('Anzeige/Partnerlink'));
-  return sections.filter(Boolean);
+  switch (line.kind) {
+    case 'title':
+      return `*${line.value}*`;
+    case 'oldPrice':
+      return `${OLD_PRICE_ICON} ${line.label} *${line.price}*`;
+    case 'price':
+      return `${PRICE_ICON} ${line.label} *${line.price}*`;
+    case 'link':
+      return `${LINK_ICON} *${line.value}*`;
+    case 'text':
+      return line.value;
+    case 'footer':
+      return '_Anzeige/Partnerlink_';
+    case 'blank':
+      return '';
+  }
+}
+
+function buildBaseLines(config: PostConfig, channel: 'telegram' | 'whatsapp'): string[] {
+  return buildStructuredPost(config).map((line) => renderLine(line, channel));
 }
 
 export function generatePostText(config: PostConfig) {
-  const telegramCaption = buildBaseLines(config, 'telegram').join('\n\n');
-  const whatsappText = buildBaseLines(config, 'whatsapp').join('\n\n');
+  const telegramCaption = buildBaseLines(config, 'telegram').join('\n');
+  const whatsappText = buildBaseLines(config, 'whatsapp').join('\n');
   const rabattgutscheinCode = cleanText(config.rabattgutscheinCode);
-  const couponFollowUp = rabattgutscheinCode ? `🏷️ Rabattgutschein: ${rabattgutscheinCode}` : '';
 
   return {
     telegramCaption,
     whatsappText,
-    couponFollowUp,
+    couponFollowUp: rabattgutscheinCode,
     productTitle: cleanText(config.productTitle) || 'Amazon Produkt'
   };
 }

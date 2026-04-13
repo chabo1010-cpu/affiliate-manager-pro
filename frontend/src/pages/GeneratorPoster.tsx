@@ -1,55 +1,123 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '../components/layout/Layout';
-import { DEAL_IMAGE_RENDER, generatePostText, normalizeDealImageUrl } from '../lib/postGenerator';
+import {
+  COUPON_LINE_PREFIX,
+  COUPON_OPTION_LABEL,
+  MASTER_EXTRA_OPTIONS,
+  MASTER_PRIMARY_OPTIONS,
+  WITHOUT_OPTIONS_LABEL,
+  hasEffectivePostQualifier,
+  copyToClipboard,
+  generatePostText,
+  normalizeDealImageUrl
+} from '../lib/postGenerator';
 import { Toast, useToast } from '../components/Toast';
 import './GeneratorPoster.css';
 
-const textOptions = [
-  { value: 'A Ohne Optionen', label: 'A Ohne Optionen' },
-  { value: 'B Automatischer Kassenrabatt', label: 'B Automatischer Kassenrabatt' },
-  { value: 'C Coupon', label: 'C Coupon' },
-  { value: 'D Werbeaktion', label: 'D Werbeaktion' },
-  { value: 'E Coupon + Werbeaktion aktivieren', label: 'E Coupon + Werbeaktion aktivieren' },
-  { value: 'F Voll Spar Abo', label: 'F Voll Spar Abo' },
-  { value: 'G Ab 4 Stueck nochmals 5% Ersparnis', label: 'G Ab 4 Stueck nochmals 5% Ersparnis' },
-  { value: 'H 15% Rabatt ab 50 EUR mit Prime', label: 'H 15% Rabatt ab 50 EUR mit Prime' },
-  { value: 'I Blitzangebot', label: 'I Blitzangebot' },
-  { value: 'J Zeitlich begrenztes Angebot', label: 'J Zeitlich begrenztes Angebot' }
-];
+const DEFAULT_FREE_TEXT = 'ℹ️ ';
+const NORMALIZED_DEFAULT_FREE_TEXT = 'ℹ️ ';
+const SUCCESS_RESET_DELAY_MS = 1100;
 
-const extraOptions = [
-  'Ueber "Andere Verkaeufer" in den Warenkorb legen',
-  'Derzeit vorbestellbar',
-  'Eventuell Verkaeufer wechseln',
-  'Lieferzeit beachten',
-  'Rabattgutschein',
-  'Spar Abo',
-  'Ueber "Alle Angebote" in den Warenkorb legen',
-  'Verschiedene Ausfuehrungen',
-  'Verschiedene Farben',
-  'Verschiedene Groessen',
-  'Verschiedene Groessen und Farben',
-  'Zzgl. Pfand'
-];
+const textOptions = MASTER_PRIMARY_OPTIONS.map((option) => ({ value: option, label: option }));
+const extraOptions = [...MASTER_EXTRA_OPTIONS];
 
 const oldIconOptions = ['Statt', 'Vorher', 'Alt'];
 const newIconOptions = ['Jetzt', 'Deal', 'Neu'];
-const amazonScrapeApiUrl =
-  `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/scrape`;
-const telegramApiUrl =
-  `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/telegram/send`;
+const amazonScrapeApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/amazon/scrape`;
+const telegramApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/telegram/send`;
+const dealsCheckApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/deals/check`;
+const dealsSaveApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/deals/save`;
+const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
+const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
+const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
+
+function parseEnabledFlag(value: unknown) {
+  return value === true || value === 1 || value === '1';
+}
+
+function parseBlockedFlag(value: unknown) {
+  return value === true || value === 1 || value === '1';
+}
+
+function formatDealDateTime(value: string) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  const day = String(parsed.getDate()).padStart(2, '0');
+  const month = String(parsed.getMonth() + 1).padStart(2, '0');
+  const year = parsed.getFullYear();
+  const hours = String(parsed.getHours()).padStart(2, '0');
+  const minutes = String(parsed.getMinutes()).padStart(2, '0');
+
+  return `${day}.${month}.${year} ${hours}:${minutes}`;
+}
+
+function parseDealPriceValue(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function formatPriceRangeValue(value: number | null) {
+  if (value === null || Number.isNaN(value)) {
+    return null;
+  }
+
+  return new Intl.NumberFormat('de-DE', {
+    style: 'currency',
+    currency: 'EUR'
+  })
+    .format(value)
+    .replace(/\s/g, '');
+}
+
+function formatRemainingTime(value: number) {
+  if (!value || value <= 0) {
+    return '0 Minuten';
+  }
+
+  const totalMinutes = Math.max(1, Math.ceil(value / 60000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  const hourLabel = hours === 1 ? 'Stunde' : 'Stunden';
+  const minuteLabel = minutes === 1 ? 'Minute' : 'Minuten';
+
+  if (hours > 0 && minutes > 0) {
+    return `${hours} ${hourLabel} ${minutes} ${minuteLabel}`;
+  }
+
+  if (hours > 0) {
+    return `${hours} ${hourLabel}`;
+  }
+
+  return `${minutes} ${minuteLabel}`;
+}
 
 function GeneratorPosterPage() {
   const [amazonLink, setAmazonLink] = useState('');
   const [advertising, setAdvertising] = useState(false);
-  const [textBlock, setTextBlock] = useState(textOptions[0].value);
+  const [selectedPrimaryOptions, setSelectedPrimaryOptions] = useState<string[]>([]);
   const [expandedAdvanced, setExpandedAdvanced] = useState(false);
   const [selectedExtras, setSelectedExtras] = useState<string[]>([]);
-  const [oldPrice, setOldPrice] = useState('39,99 EUR');
-  const [currentPrice, setCurrentPrice] = useState('24,90 EUR');
+  const [showOldPrice, setShowOldPrice] = useState(false);
+  const [oldPrice, setOldPrice] = useState('');
+  const [currentPrice, setCurrentPrice] = useState('');
   const [oldIcon, setOldIcon] = useState(oldIconOptions[1]);
   const [newIcon, setNewIcon] = useState(newIconOptions[0]);
-  const [extraText, setExtraText] = useState('Sofort verfuegbar, Versand heute.');
+  const [extraText, setExtraText] = useState(NORMALIZED_DEFAULT_FREE_TEXT);
   const [publishing, setPublishing] = useState(false);
   const [scraping, setScraping] = useState(false);
   const [hasScraped, setHasScraped] = useState(false);
@@ -57,8 +125,31 @@ function GeneratorPosterPage() {
   const [scrapedTitle, setScrapedTitle] = useState('');
   const [rabattgutscheinCode, setRabattgutscheinCode] = useState('');
   const [formError, setFormError] = useState('');
+  const [dealSnapshot, setDealSnapshot] = useState<{
+    asin: string;
+    finalUrl: string;
+    normalizedUrl: string;
+    sellerType: string;
+    lastPostedAt: string;
+    minPrice: number | null;
+    maxPrice: number | null;
+    postingCount: number;
+    blocked: boolean;
+    remainingMs: number;
+    cooldownEnabled: boolean;
+    cooldownHours: number;
+  } | null>(null);
+  const resetTimeoutRef = useRef<number | null>(null);
   const { toast, showToast } = useToast();
-  const rabattgutscheinAktiv = selectedExtras.includes('Rabattgutschein');
+  const rabattgutscheinAktiv = selectedExtras.includes(COUPON_OPTION_LABEL);
+
+  useEffect(() => {
+    return () => {
+      if (resetTimeoutRef.current !== null) {
+        window.clearTimeout(resetTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const combinedExtraText = useMemo(() => extraText.trim(), [extraText]);
 
@@ -67,22 +158,51 @@ function GeneratorPosterPage() {
       generatePostText({
         productTitle: scrapedTitle,
         freiText: combinedExtraText,
-        textBaustein: textBlock,
-        alterPreis: oldPrice,
+        textBaustein: selectedPrimaryOptions,
+        alterPreis: showOldPrice ? oldPrice : '',
         neuerPreis: currentPrice,
+        alterPreisLabel: showOldPrice ? oldIcon : '',
+        neuerPreisLabel: newIcon,
         amazonLink,
         werbung: advertising,
         extraOptions: selectedExtras,
-        rabattgutscheinCode
+        rabattgutscheinCode: rabattgutscheinAktiv ? rabattgutscheinCode : ''
       }),
-    [scrapedTitle, combinedExtraText, textBlock, oldPrice, currentPrice, amazonLink, advertising, selectedExtras, rabattgutscheinCode]
+    [
+      scrapedTitle,
+      combinedExtraText,
+      selectedPrimaryOptions,
+      showOldPrice,
+      oldPrice,
+      currentPrice,
+      amazonLink,
+      advertising,
+      selectedExtras,
+      rabattgutscheinAktiv,
+      rabattgutscheinCode
+    ]
   );
 
-  const validateBeforePublish = () => {
-    if (!textBlock.trim()) {
-      return 'Bitte eine Hauptoption waehlen.';
+  const previewMainPost = useMemo(() => {
+    if (!rabattgutscheinAktiv || !rabattgutscheinCode.trim()) {
+      return generatedPost.telegramCaption;
     }
 
+    return generatedPost.telegramCaption.replace(`\n🏷️ Rabattgutschein: ${rabattgutscheinCode.trim()}`, '');
+  }, [generatedPost, rabattgutscheinAktiv, rabattgutscheinCode]);
+
+  const previewDisplayPost = useMemo(
+    () =>
+      generatedPost.telegramCaption
+        .split('\n')
+        .filter((line) => !line.includes(`Rabattgutschein: ${rabattgutscheinCode.trim()}`))
+        .join('\n'),
+    [generatedPost, rabattgutscheinCode]
+  );
+
+  const couponFieldError = rabattgutscheinAktiv && formError === 'Rabattgutschein fehlt.' ? formError : '';
+
+  const validateRabattgutscheinCode = () => {
     if (rabattgutscheinAktiv && !rabattgutscheinCode.trim()) {
       return 'Rabattgutschein fehlt.';
     }
@@ -90,36 +210,102 @@ function GeneratorPosterPage() {
     return '';
   };
 
-  const handleScrape = async () => {
-    console.log('BUTTON CLICK');
-    console.log('STATE amazonLink:', amazonLink);
+  const validateBeforePublish = () => {
+    const couponError = validateRabattgutscheinCode();
+    if (couponError) {
+      return couponError;
+    }
 
-    if (scraping) return;
+    if (!hasEffectivePostQualifier(selectedPrimaryOptions, extraText, rabattgutscheinAktiv, rabattgutscheinCode)) {
+      return "Keine Option angewählt. Wähle 'Ohne Optionen' oder schreibe einen Freitext.";
+    }
+
+    return '';
+  };
+
+  const resetGeneratorState = () => {
+    setAmazonLink('');
+    setAdvertising(false);
+    setSelectedPrimaryOptions([]);
+    setExpandedAdvanced(false);
+    setSelectedExtras([]);
+    setShowOldPrice(false);
+    setOldPrice('');
+    setCurrentPrice('');
+    setOldIcon(oldIconOptions[1]);
+    setNewIcon(newIconOptions[0]);
+    setExtraText(NORMALIZED_DEFAULT_FREE_TEXT);
+    setHasScraped(false);
+    setScrapedImageUrl('');
+    setScrapedTitle('');
+    setRabattgutscheinCode('');
+    setFormError('');
+    setDealSnapshot(null);
+  };
+
+  const handleTogglePrimaryOption = (option: string) => {
+    setSelectedPrimaryOptions((prev) => {
+      if (option === WITHOUT_OPTIONS_LABEL) {
+        return prev.includes(WITHOUT_OPTIONS_LABEL) ? [] : [WITHOUT_OPTIONS_LABEL];
+      }
+
+      const withoutDefault = prev.filter((item) => item !== WITHOUT_OPTIONS_LABEL);
+      const isActive = withoutDefault.includes(option);
+      let next = isActive ? withoutDefault.filter((item) => item !== option) : [...withoutDefault, option];
+
+      if (!isActive && option === BLITZANGEBOT_LABEL && !next.includes(ZEITLICH_BEGRENZT_LABEL)) {
+        next = [...next, ZEITLICH_BEGRENZT_LABEL];
+      }
+
+      return next;
+    });
+  };
+
+  const handleScrape = async () => {
+    if (scraping) {
+      console.log('EARLY RETURN REASON', {
+        blocked: dealSnapshot?.blocked ?? null,
+        lastPostedAt: dealSnapshot?.lastPostedAt ?? null,
+        remainingSeconds: dealSnapshot?.remainingMs ? Math.ceil(dealSnapshot.remainingMs / 1000) : 0,
+        reason: 'already_scraping'
+      });
+      return;
+    }
 
     const finalAmazonLink = (amazonLink || '').trim();
-    console.log('FINAL URL:', finalAmazonLink);
+    console.log('SCRAPE BUTTON CLICK');
+    console.log('SCRAPE START', finalAmazonLink);
 
     if (!finalAmazonLink) {
       setHasScraped(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
-      setFormError('');
-      showToast('Bitte zuerst einen Amazon-Link eingeben.');
+      setFormError('Link vergessen.');
+      setDealSnapshot(null);
+      showToast('Link vergessen.');
+      console.log('EARLY RETURN REASON', {
+        blocked: null,
+        lastPostedAt: null,
+        remainingSeconds: 0,
+        reason: 'missing_link'
+      });
       return;
     }
 
-    const payload = { url: finalAmazonLink };
-    console.log('SCRAPE PAYLOAD:', payload);
     setScraping(true);
+    setFormError('');
+    setDealSnapshot(null);
 
     try {
-      const response = await fetch('http://localhost:4000/api/scrape', {
+      console.log('SCRAPE REQUEST START');
+      const response = await fetch(amazonScrapeApiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ url: finalAmazonLink })
       });
+      console.log('SCRAPE RESPONSE STATUS', response.status);
 
       const rawResponse = await response.text();
       let data: {
@@ -132,6 +318,10 @@ function GeneratorPosterPage() {
         price?: string;
         oldPrice?: string;
         link?: string;
+        asin?: string;
+        finalUrl?: string;
+        normalizedUrl?: string;
+        sellerType?: string;
       } = {};
 
       try {
@@ -140,30 +330,157 @@ function GeneratorPosterPage() {
         data = { error: rawResponse || 'Unbekannte Scrape-Antwort' };
       }
 
-      console.log('SCRAPE STATUS:', response.status);
-      console.log('SCRAPE RESPONSE:', data);
+      console.log('SCRAPE RESULT', {
+        ok: response.ok,
+        status: response.status,
+        data
+      });
+      console.log('SCRAPE RESPONSE', data);
+      console.log('SCRAPE RESPONSE DATA', data);
 
       if (!response.ok) {
         setHasScraped(false);
         setScrapedImageUrl('');
         setScrapedTitle('');
         setFormError('');
+        setDealSnapshot(null);
         showToast(
           data.error ||
             data.message ||
             data.code ||
             `Scrape fehlgeschlagen (${response.status}). Bitte Backend pruefen.`
         );
+        console.log('EARLY RETURN REASON', {
+          blocked: null,
+          lastPostedAt: null,
+          remainingSeconds: 0,
+          reason: 'scrape_request_failed'
+        });
         return;
       }
+
+      const checkPayload = {
+        asin: data.asin || '',
+        url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
+        normalizedUrl: data.normalizedUrl || ''
+      };
+      console.log('CHECK PAYLOAD', checkPayload);
+
+      const checkResponse = await fetch(dealsCheckApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(checkPayload)
+      });
+
+      const checkRawResponse = await checkResponse.text();
+      let checkData: {
+        success?: boolean;
+        error?: string;
+        asin?: string;
+        resolvedFinalUrl?: string | null;
+        normalizedUrl?: string;
+        blocked?: boolean;
+        remainingSeconds?: number | null;
+        repostCooldownEnabled?: boolean;
+        repostCooldownHours?: number;
+        lastPostedAt?: string | null;
+        minPrice?: number | null;
+        maxPrice?: number | null;
+        postingCount?: number;
+        sellerType?: string | null;
+        lastDeal?: {
+          postedAt?: string;
+          sellerType?: string;
+          title?: string;
+          price?: string;
+        } | null;
+      } = {};
+
+      try {
+        checkData = checkRawResponse ? JSON.parse(checkRawResponse) : {};
+      } catch {
+        checkData = { error: checkRawResponse || 'Unbekannte Deal-Check-Antwort' };
+      }
+
+      console.log('CHECK RESULT', {
+        status: checkResponse.status,
+        data: checkData
+      });
+      console.log('CHECK RESPONSE', checkData);
+      console.log('CHECK RESULT', checkData);
+
+      if (!checkResponse.ok) {
+        setHasScraped(false);
+        setScrapedImageUrl('');
+        setScrapedTitle('');
+        setFormError('');
+        setDealSnapshot(null);
+        showToast(checkData.error || 'Deal-Check fehlgeschlagen.');
+        console.log('EARLY RETURN REASON', {
+          blocked: checkData?.blocked ?? null,
+          lastPostedAt: checkData?.lastPostedAt || checkData?.lastDeal?.postedAt || null,
+          remainingSeconds: checkData?.remainingSeconds ?? 0,
+          reason: 'deal_check_failed'
+        });
+        return;
+      }
+
+      const isKnownDeal = Boolean(checkData.lastPostedAt || checkData.lastDeal?.postedAt);
+      const isBlocked = checkData.blocked === true;
+      console.log('KNOWN DEAL?', isKnownDeal);
+      console.log('BLOCKED?', checkData.blocked);
+      console.log('CONTINUE TO GENERATOR?', !isBlocked);
+
+      const nextDealSnapshot = {
+        asin: checkData.asin || data.asin || '',
+        finalUrl: data.finalUrl || checkData.resolvedFinalUrl || data.normalizedUrl || '',
+        normalizedUrl: data.normalizedUrl || checkData.normalizedUrl || '',
+        sellerType: data.sellerType || checkData.sellerType || checkData.lastDeal?.sellerType || '',
+        lastPostedAt: checkData.lastPostedAt || checkData.lastDeal?.postedAt || '',
+        minPrice: parseDealPriceValue(checkData.minPrice),
+        maxPrice: parseDealPriceValue(checkData.maxPrice),
+        postingCount: Number(checkData.postingCount || 0),
+        blocked: isBlocked,
+        remainingMs: Number(checkData.remainingSeconds || 0) * 1000,
+        cooldownEnabled: parseEnabledFlag(checkData.repostCooldownEnabled),
+        cooldownHours: Number(checkData.repostCooldownHours ?? 12)
+      };
+
+      setDealSnapshot(nextDealSnapshot);
+      console.log('GENERATOR HISTORY META STATE', {
+        blocked: nextDealSnapshot.blocked,
+        lastPostedAt: nextDealSnapshot.lastPostedAt,
+        minPrice: nextDealSnapshot.minPrice,
+        maxPrice: nextDealSnapshot.maxPrice,
+        repostCooldownEnabled: nextDealSnapshot.cooldownEnabled
+      });
 
       const normalizedImageUrl = normalizeDealImageUrl(data.image || '');
       setScrapedImageUrl(normalizedImageUrl);
       setScrapedTitle(data.title || '');
-      setOldPrice(data.oldPrice || oldPrice);
-      setCurrentPrice(data.price || currentPrice);
-      setHasScraped(true);
+      setOldPrice(data.oldPrice || '');
+      setCurrentPrice(data.price || '');
+      setSelectedPrimaryOptions([]);
+
+      if (isBlocked) {
+        const blockMessage = `Link bereits gepostet. Erneut moeglich in ${formatRemainingTime(nextDealSnapshot.remainingMs)}.`;
+        setFormError(blockMessage);
+        setHasScraped(false);
+        console.log('BLOCK MESSAGE', blockMessage);
+        console.log('EARLY RETURN REASON', {
+          blocked: isBlocked,
+          lastPostedAt: checkData.lastPostedAt || checkData.lastDeal?.postedAt || null,
+          remainingSeconds: checkData.remainingSeconds ?? 0,
+          reason: 'deal_blocked'
+        });
+        return;
+      }
+
+      console.log('BLOCK MESSAGE', '');
       setFormError('');
+      setHasScraped(true);
       showToast(
         normalizedImageUrl
           ? 'Amazon Link erfolgreich gescrapt und Produktbild geladen'
@@ -173,6 +490,15 @@ function GeneratorPosterPage() {
       if (!data.title) {
         showToast('Produkttitel konnte nicht gelesen werden. Fallback wird verwendet.', 2600);
       }
+    } catch (error) {
+      const finalError =
+        error instanceof Error ? error.message : 'Unbekannter Scrape-Fehler';
+      console.error('final error', error);
+      setHasScraped(false);
+      setScrapedImageUrl('');
+      setScrapedTitle('');
+      setFormError(`Scrape fehlgeschlagen: ${finalError}`);
+      showToast(`Scrape fehlgeschlagen: ${finalError}`);
     } finally {
       setScraping(false);
     }
@@ -200,6 +526,7 @@ function GeneratorPosterPage() {
 
     setFormError('');
     setPublishing(true);
+
     try {
       const response = await fetch(telegramApiUrl, {
         method: 'POST',
@@ -215,7 +542,7 @@ function GeneratorPosterPage() {
       });
 
       const rawResponse = await response.text();
-      let data: { message?: string; error?: string; code?: string } = {};
+      let data: { success?: boolean; message?: string; error?: string; code?: string } = {};
 
       try {
         data = rawResponse ? JSON.parse(rawResponse) : {};
@@ -223,7 +550,7 @@ function GeneratorPosterPage() {
         data = { error: rawResponse || 'Unbekannte Backend-Antwort' };
       }
 
-      if (!response.ok) {
+      if (!response.ok || data.success === false) {
         const backendMessage =
           data.error || data.message || `Backend-Fehler (${response.status}) beim Telegram-Versand`;
         setFormError(backendMessage);
@@ -231,23 +558,56 @@ function GeneratorPosterPage() {
         return;
       }
 
+      console.log('POST SUCCESS -> SAVE DEAL START');
+
+      const savePayload = {
+        asin: dealSnapshot?.asin || '',
+        originalUrl: amazonLink,
+        finalUrl: dealSnapshot?.finalUrl || dealSnapshot?.normalizedUrl || amazonLink,
+        url: dealSnapshot?.finalUrl || dealSnapshot?.normalizedUrl || amazonLink,
+        normalizedUrl: dealSnapshot?.normalizedUrl || '',
+        title: scrapedTitle || generatedPost.productTitle,
+        price: currentPrice,
+        oldPrice: showOldPrice ? oldPrice : '',
+        sellerType: dealSnapshot?.sellerType || 'FBM',
+        postedAt: new Date().toISOString(),
+        channel: 'TELEGRAM',
+        couponCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : ''
+      };
+
+      console.log('SAVE DEAL PAYLOAD', savePayload);
+
+      const saveResponse = await fetch(dealsSaveApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(savePayload)
+      });
+
+      if (!saveResponse.ok) {
+        showToast('Telegram gesendet, aber Historie konnte nicht gespeichert werden.', SUCCESS_RESET_DELAY_MS);
+      }
+
       showToast(
         rabattgutscheinAktiv
           ? 'Post und Rabattgutschein zu Telegram gesendet'
-          : 'Post zu Telegram gesendet'
+          : 'Post erfolgreich zu Telegram gesendet',
+        SUCCESS_RESET_DELAY_MS
       );
+      resetTimeoutRef.current = window.setTimeout(() => {
+        resetGeneratorState();
+        resetTimeoutRef.current = null;
+      }, SUCCESS_RESET_DELAY_MS);
     } catch (error) {
       console.error('Telegram send error:', error);
-      setFormError(
+      const message =
         error instanceof Error
           ? `Telegram-Verbindungsfehler: ${error.message}`
-          : 'Telegram-Verbindungsfehler'
-      );
-      showToast(
-        error instanceof Error
-          ? `Telegram-Verbindungsfehler: ${error.message}`
-          : 'Telegram-Verbindungsfehler'
-      );
+          : 'Telegram-Verbindungsfehler';
+
+      setFormError(message);
+      showToast(message);
     } finally {
       setPublishing(false);
     }
@@ -256,7 +616,7 @@ function GeneratorPosterPage() {
   const handleToggleExtra = (option: string) => {
     setSelectedExtras((prev) => {
       const next = prev.includes(option) ? prev.filter((item) => item !== option) : [...prev, option];
-      if (!next.includes('Rabattgutschein')) {
+      if (!next.includes(COUPON_OPTION_LABEL)) {
         setRabattgutscheinCode('');
         setFormError('');
       }
@@ -264,10 +624,65 @@ function GeneratorPosterPage() {
     });
   };
 
+  const handleToggleOldPrice = (checked: boolean) => {
+    setShowOldPrice(checked);
+    if (!checked) {
+      setOldPrice('');
+      setOldIcon(oldIconOptions[1]);
+    }
+  };
+
+  const handleCouponCopy = async () => {
+    const trimmedCouponCode = rabattgutscheinCode.trim();
+    if (!trimmedCouponCode) {
+      const errorMessage = validateRabattgutscheinCode();
+      if (errorMessage) {
+        setFormError(errorMessage);
+        showToast(errorMessage);
+      }
+      return;
+    }
+
+    const success = await copyToClipboard(trimmedCouponCode);
+    if (success) {
+      showToast('Rabattgutschein kopiert');
+      setFormError('');
+      return;
+    }
+
+    showToast('Rabattgutschein konnte nicht kopiert werden');
+  };
+
+  const formattedLastPostedAt = dealSnapshot ? formatDealDateTime(dealSnapshot.lastPostedAt) : null;
+  const formattedMinPrice = dealSnapshot ? formatPriceRangeValue(dealSnapshot.minPrice) : null;
+  const formattedMaxPrice = dealSnapshot ? formatPriceRangeValue(dealSnapshot.maxPrice) : null;
+  const shouldShowHistoryMeta =
+    Boolean(dealSnapshot) &&
+    !dealSnapshot?.blocked &&
+    Boolean(formattedLastPostedAt) &&
+    Boolean(formattedMinPrice) &&
+    Boolean(formattedMaxPrice);
+  console.log('GENERATOR SHOW HISTORY META', shouldShowHistoryMeta);
+  console.log('SHOW HISTORY META?', {
+    blocked: dealSnapshot?.blocked ?? null,
+    historyLastPostedAt: dealSnapshot?.lastPostedAt ?? null,
+    historyMinPrice: dealSnapshot?.minPrice ?? null,
+    historyMaxPrice: dealSnapshot?.maxPrice ?? null,
+    showHistoryMeta: shouldShowHistoryMeta
+  });
+  console.log('FORMATTED HISTORY META', {
+    formattedDate: formattedLastPostedAt,
+    formattedMinPrice,
+    formattedMaxPrice
+  });
   return (
-    <Layout showSidebar={false}>
+    <Layout showSidebar>
       <div className="generator-desktop-page">
         <div className="generator-desktop-shell">
+          <section className="generator-content-header">
+            <p className="generator-eyebrow">AFFILIATE MANAGER</p>
+          </section>
+
           <section className="generator-panel generator-intro-panel">
             <div className="generator-panel-header">
               <h1>Generator Poster</h1>
@@ -280,45 +695,52 @@ function GeneratorPosterPage() {
                   type="text"
                   value={amazonLink}
                   onChange={(e) => {
-                    console.log('INPUT CHANGE', e.target.value);
                     setAmazonLink(e.target.value);
                     setHasScraped(false);
                     setScrapedImageUrl('');
                     setScrapedTitle('');
+                    setSelectedPrimaryOptions([]);
                     setFormError('');
+                    setDealSnapshot(null);
                   }}
                   placeholder="https://amazon.de/..."
                 />
               </label>
 
-              {hasScraped && (
-                <div className="generator-scrape-meta">
-                  <p>
-                    Produkttitel: <strong>{generatedPost.productTitle}</strong>
-                  </p>
-                  <p>
-                    Bild vorbereitet: {DEAL_IMAGE_RENDER.width}x{DEAL_IMAGE_RENDER.height} {DEAL_IMAGE_RENDER.fit}
-                  </p>
-                </div>
+              <div className="generator-intro-actions">
+                <button
+                  type="button"
+                  className="generator-action-button secondary"
+                  onClick={handleScrape}
+                  disabled={scraping}
+                >
+                  {scraping ? 'Amazon Link wird gescrapt...' : 'Scrap Amazon Link'}
+                </button>
+
+                <label className="generator-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={advertising}
+                    onChange={(e) => setAdvertising(e.target.checked)}
+                  />
+                  <span>Werbung</span>
+                </label>
+              </div>
+
+              {formError === 'Link vergessen.' && <p className="generator-form-error">{formError}</p>}
+
+              {dealSnapshot?.blocked && (
+                <p className="generator-history-alert">
+                  Link bereits gepostet. Erneut moeglich in {formatRemainingTime(dealSnapshot.remainingMs)}.
+                </p>
               )}
 
-              <button
-                type="button"
-                className="generator-action-button secondary"
-                onClick={handleScrape}
-                disabled={scraping}
-              >
-                {scraping ? 'Amazon Link wird gescrapt...' : 'Scrap Amazon Link'}
-              </button>
-
-              <label className="generator-checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={advertising}
-                  onChange={(e) => setAdvertising(e.target.checked)}
-                />
-                <span>Werbung</span>
-              </label>
+              {shouldShowHistoryMeta && (
+                <div className="generator-history-inline">
+                  <p>Zuletzt gepostet am: {formattedLastPostedAt}</p>
+                  <p>Preisspanne 6 Monate: {formattedMinPrice} - {formattedMaxPrice}</p>
+                </div>
+              )}
             </div>
           </section>
 
@@ -330,14 +752,20 @@ function GeneratorPosterPage() {
                 </div>
 
                 <div className="generator-vertical-list">
+                  <label className="generator-list-row">
+                    <input
+                      type="checkbox"
+                      checked={selectedPrimaryOptions.includes(WITHOUT_OPTIONS_LABEL)}
+                      onChange={() => handleTogglePrimaryOption(WITHOUT_OPTIONS_LABEL)}
+                    />
+                    <span>{WITHOUT_OPTIONS_LABEL}</span>
+                  </label>
                   {textOptions.map((option) => (
                     <label key={option.value} className="generator-list-row">
                       <input
-                        type="radio"
-                        name="textBlock"
-                        value={option.value}
-                        checked={textBlock === option.value}
-                        onChange={() => setTextBlock(option.value)}
+                        type="checkbox"
+                        checked={selectedPrimaryOptions.includes(option.value)}
+                        onChange={() => handleTogglePrimaryOption(option.value)}
                       />
                       <span>{option.label}</span>
                     </label>
@@ -377,7 +805,7 @@ function GeneratorPosterPage() {
                         <label className="generator-form-field">
                           <span>Rabattgutschein eingeben</span>
                           <input
-                            className={formError ? 'generator-coupon-input has-error' : 'generator-coupon-input'}
+                            className={couponFieldError ? 'generator-coupon-input has-error' : 'generator-coupon-input'}
                             type="text"
                             value={rabattgutscheinCode}
                             onChange={(e) => {
@@ -388,9 +816,9 @@ function GeneratorPosterPage() {
                           />
                         </label>
                         <p className="generator-field-hint">
-                          Wird nach dem Hauptpost automatisch als zweite Nachricht gesendet.
+                          Pflichtfeld. Wird im Hauptbeitrag angezeigt und danach als zweite Nachricht gesendet.
                         </p>
-                        {formError && <p className="generator-form-error">{formError}</p>}
+                        {couponFieldError && <p className="generator-form-error">{couponFieldError}</p>}
                       </div>
                     )}
                   </>
@@ -402,52 +830,67 @@ function GeneratorPosterPage() {
                   <h2>Preise</h2>
                 </div>
 
-                <div className="generator-price-grid">
-                  <div className="generator-column-fields">
-                    <label className="generator-form-field">
-                      <span>Icon Alt</span>
-                      <select value={oldIcon} onChange={(e) => setOldIcon(e.target.value)}>
-                        {oldIconOptions.map((option) => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                <div className="generator-price-panel">
+                  <label className="generator-checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={showOldPrice}
+                      onChange={(e) => handleToggleOldPrice(e.target.checked)}
+                    />
+                    <span>Stattpreis anzeigen</span>
+                  </label>
 
-                    <label className="generator-form-field">
-                      <span>Icon Neu</span>
-                      <select value={newIcon} onChange={(e) => setNewIcon(e.target.value)}>
-                        {newIconOptions.map((option) => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                  <div className={`generator-price-grid${showOldPrice ? ' has-old-price' : ' single-price'}`}>
+                    {showOldPrice && (
+                      <div className="generator-column-fields">
+                        <label className="generator-form-field">
+                          <span>Icon Alt</span>
+                          <select value={oldIcon} onChange={(e) => setOldIcon(e.target.value)}>
+                            {oldIconOptions.map((option) => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="generator-form-field">
+                          <span>Alter Preis</span>
+                          <input
+                            type="text"
+                            value={oldPrice}
+                            onChange={(e) => setOldPrice(e.target.value)}
+                            placeholder="39,99 EUR"
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    <div className="generator-column-fields">
+                      <label className="generator-form-field">
+                        <span>Icon Neu</span>
+                        <select value={newIcon} onChange={(e) => setNewIcon(e.target.value)}>
+                          {newIconOptions.map((option) => (
+                            <option key={option} value={option}>
+                              {option}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="generator-form-field">
+                        <span>Aktueller Preis</span>
+                        <input
+                          type="text"
+                          value={currentPrice}
+                          onChange={(e) => setCurrentPrice(e.target.value)}
+                          placeholder="24,90 EUR"
+                        />
+                      </label>
+                    </div>
                   </div>
 
-                  <div className="generator-column-fields">
-                    <label className="generator-form-field">
-                      <span>Alter Preis</span>
-                      <input
-                        type="text"
-                        value={oldPrice}
-                        onChange={(e) => setOldPrice(e.target.value)}
-                        placeholder="39,99 EUR"
-                      />
-                    </label>
-
-                    <label className="generator-form-field">
-                      <span>Aktueller Preis</span>
-                      <input
-                        type="text"
-                        value={currentPrice}
-                        onChange={(e) => setCurrentPrice(e.target.value)}
-                        placeholder="24,90 EUR"
-                      />
-                    </label>
-                  </div>
+                  {!showOldPrice && <p className="generator-field-hint">Standardmaessig wird nur der Jetzt-Preis verwendet.</p>}
                 </div>
               </section>
 
@@ -460,15 +903,39 @@ function GeneratorPosterPage() {
                   <span>Zusatztext</span>
                   <textarea
                     value={extraText}
-                    onChange={(e) => setExtraText(e.target.value)}
-                    placeholder="z. B. Sofort verfuegbar, Versand heute."
+                    onChange={(e) => {
+                      setExtraText(e.target.value);
+                      setFormError('');
+                    }}
                     rows={7}
                   />
                 </label>
               </section>
 
+              <section className="generator-panel">
+                <div className="generator-panel-header">
+                  <h2>Hauptbeitrag</h2>
+                </div>
+
+                <div className="generator-post-preview">
+                  <pre>{previewDisplayPost}</pre>
+                  {rabattgutscheinAktiv && (
+                    <button
+                      type="button"
+                      className={`generator-coupon-preview${!rabattgutscheinCode.trim() ? ' is-empty' : ''}`}
+                      onClick={handleCouponCopy}
+                      title={rabattgutscheinCode.trim() ? 'Rabattgutschein kopieren' : 'Rabattgutschein fehlt'}
+                    >
+                      <span>Rabattgutschein</span>
+                      <strong>{`${COUPON_PREVIEW_PREFIX} ${rabattgutscheinCode.trim() || 'Rabattgutschein fehlt.'}`}</strong>
+                      <em>{rabattgutscheinCode.trim() ? 'Zum Kopieren klicken' : 'Pflichtfeld vor dem Versand'}</em>
+                    </button>
+                  )}
+                </div>
+              </section>
+
               <section className="generator-panel generator-submit-panel">
-                {formError && <p className="generator-form-error">{formError}</p>}
+                {formError && formError !== 'Rabattgutschein fehlt.' && <p className="generator-form-error">{formError}</p>}
                 <button
                   type="button"
                   className="generator-action-button primary"

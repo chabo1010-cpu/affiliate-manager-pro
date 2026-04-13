@@ -8,12 +8,12 @@ interface LayoutProps extends PropsWithChildren {
 
 function Layout({ children, showSidebar = true }: LayoutProps) {
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+    <div className="app-layout">
       <MobileHeader />
-      <div className="page-container" style={{ padding: '1rem', maxWidth: '1440px', margin: '0 auto' }}>
+      <div className="page-container">
         <div className="desktop-shell">
           {showSidebar && <Sidebar />}
-          <main style={{ width: '100%' }}>{children}</main>
+          <main className="layout-main">{children}</main>
         </div>
         <div className="mobile-shell">
           <main>{children}</main>
