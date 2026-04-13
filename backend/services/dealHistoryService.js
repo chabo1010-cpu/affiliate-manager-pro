@@ -1,6 +1,7 @@
 import { getDb } from '../db.js';
 
 const db = getDb();
+const DEFAULT_TELEGRAM_COPY_BUTTON_TEXT = '📋 Zum Kopieren hier klicken';
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -119,19 +120,23 @@ export function getRepostCooldownHours() {
 
 export function getRepostSettingsRow() {
   let row = db
-    .prepare(`SELECT id, repostCooldownEnabled, repostCooldownHours FROM app_settings WHERE id = 1`)
+    .prepare(
+      `SELECT id, repostCooldownEnabled, repostCooldownHours, telegramCopyButtonText FROM app_settings WHERE id = 1`
+    )
     .get();
 
   if (!row) {
     db.prepare(
       `
-        INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours)
-        VALUES (1, 1, 12)
+        INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours, telegramCopyButtonText)
+        VALUES (1, 1, 12, ?)
       `
-    ).run();
+    ).run(DEFAULT_TELEGRAM_COPY_BUTTON_TEXT);
 
     row = db
-      .prepare(`SELECT id, repostCooldownEnabled, repostCooldownHours FROM app_settings WHERE id = 1`)
+      .prepare(
+        `SELECT id, repostCooldownEnabled, repostCooldownHours, telegramCopyButtonText FROM app_settings WHERE id = 1`
+      )
       .get();
   }
 
@@ -143,6 +148,7 @@ export function getRepostSettings() {
 
   const enabledRaw = row?.repostCooldownEnabled;
   const hoursRaw = row?.repostCooldownHours;
+  const telegramCopyButtonTextRaw = cleanText(row?.telegramCopyButtonText);
   const repostCooldownEnabled = parseEnabledFlag(enabledRaw);
   const repostCooldownHours = hoursRaw === undefined || hoursRaw === null ? 12 : Number(hoursRaw);
 
@@ -151,7 +157,8 @@ export function getRepostSettings() {
   return {
     repostCooldownEnabled,
     repostCooldownHours:
-      Number.isFinite(repostCooldownHours) && repostCooldownHours >= 0 ? repostCooldownHours : 12
+      Number.isFinite(repostCooldownHours) && repostCooldownHours >= 0 ? repostCooldownHours : 12,
+    telegramCopyButtonText: telegramCopyButtonTextRaw || DEFAULT_TELEGRAM_COPY_BUTTON_TEXT
   };
 }
 
@@ -159,34 +166,46 @@ function parseEnabledValue(value) {
   return parseEnabledFlag(value);
 }
 
-export function saveRepostSettings({ repostCooldownEnabled, repostCooldownHours }) {
+export function saveRepostSettings({
+  repostCooldownEnabled,
+  repostCooldownHours,
+  telegramCopyButtonText
+}) {
   const enabled = parseEnabledValue(repostCooldownEnabled) ? 1 : 0;
   const hours = Number(repostCooldownHours);
   const nextHours = Number.isFinite(hours) && hours >= 0 ? Math.round(hours) : 12;
+  const nextTelegramCopyButtonText = cleanText(telegramCopyButtonText) || DEFAULT_TELEGRAM_COPY_BUTTON_TEXT;
 
   const updateResult = db
     .prepare(
       `
         UPDATE app_settings
-        SET repostCooldownEnabled = ?, repostCooldownHours = ?
+        SET repostCooldownEnabled = ?, repostCooldownHours = ?, telegramCopyButtonText = ?
         WHERE id = 1
       `
     )
-    .run(enabled, nextHours);
+    .run(enabled, nextHours, nextTelegramCopyButtonText);
 
   if (!updateResult.changes) {
     db.prepare(
       `
-        INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours)
-        VALUES (1, ?, ?)
+        INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours, telegramCopyButtonText)
+        VALUES (1, ?, ?, ?)
       `
-    ).run(enabled, nextHours);
+    ).run(enabled, nextHours, nextTelegramCopyButtonText);
   }
 
   return {
     repostCooldownEnabled: enabled === 1,
-    repostCooldownHours: nextHours
+    repostCooldownHours: nextHours,
+    telegramCopyButtonText: nextTelegramCopyButtonText
   };
+}
+
+export function getTelegramCopyButtonText() {
+  const row = getRepostSettingsRow();
+  const telegramCopyButtonText = cleanText(row?.telegramCopyButtonText);
+  return telegramCopyButtonText || DEFAULT_TELEGRAM_COPY_BUTTON_TEXT;
 }
 
 function getDealMatchClause(asin, normalizedUrl) {
@@ -254,25 +273,48 @@ export function getDealHistorySummary({ asin = '', normalizedUrl = '' } = {}) {
   };
 }
 
+function buildHistorySummary(rows = []) {
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+  const prices = rows
+    .filter((row) => {
+      const postedAt = new Date(row.postedAt).getTime();
+      return Number.isFinite(postedAt) && postedAt >= sixMonthsAgo.getTime();
+    })
+    .map((row) => parseNumber(row.price))
+    .filter((value) => typeof value === 'number');
+
+  const latest = rows[0] || null;
+  const minPrice = prices.length ? Math.min(...prices) : null;
+  const maxPrice = prices.length ? Math.max(...prices) : null;
+
+  return {
+    latest,
+    minPrice,
+    maxPrice,
+    count: rows.length
+  };
+}
+
 export function checkDealCooldown(input = {}) {
   const rawUrl = cleanText(input.url || '');
   const finalUrl = cleanText(input.finalUrl || input.url || '');
   const extractedAsin =
     cleanText(input.asin).toUpperCase() || extractAsin(input.finalUrl || input.url || input.normalizedUrl || '');
   const normalizedUrl = normalizeAmazonLink(input.normalizedUrl || input.finalUrl || input.url || '');
-  const matchedByAsin = extractedAsin ? findLatestDealByField('asin', extractedAsin) : null;
   const matchesByAsin = extractedAsin ? findDealsByField('asin', extractedAsin) : [];
-  const matchedByFinalUrl = !matchedByAsin && normalizedUrl ? findLatestDealByField('normalizedUrl', normalizedUrl) : null;
-  const matchesByFinalUrl = !matchedByAsin && normalizedUrl ? findDealsByField('normalizedUrl', normalizedUrl) : [];
-  const matchedByRawUrl = !matchedByAsin && !matchedByFinalUrl && rawUrl ? findLatestDealByField('url', rawUrl) : null;
+  const matchesByNormalizedUrl = normalizedUrl ? findDealsByField('normalizedUrl', normalizedUrl) : [];
   const matchesByUrl =
-    !matchedByAsin && !matchedByFinalUrl && rawUrl
-      ? findDealsByField('url', rawUrl)
-      : [];
-  const asin = cleanText(matchedByAsin?.asin || matchedByFinalUrl?.asin || matchedByRawUrl?.asin || extractedAsin).toUpperCase();
-  const lookupNormalizedUrl = cleanText(
-    matchedByAsin?.normalizedUrl || matchedByFinalUrl?.normalizedUrl || matchedByRawUrl?.normalizedUrl || normalizedUrl
-  );
+    !matchesByAsin.length && !matchesByNormalizedUrl.length && rawUrl ? findDealsByField('url', rawUrl) : [];
+  const historyRows = matchesByAsin.length
+    ? matchesByAsin
+    : matchesByNormalizedUrl.length
+      ? matchesByNormalizedUrl
+      : matchesByUrl;
+  const latestMatch = historyRows[0] || null;
+  const asin = cleanText(latestMatch?.asin || extractedAsin).toUpperCase();
+  const lookupNormalizedUrl = cleanText(latestMatch?.normalizedUrl || normalizedUrl);
 
   console.log('CHECK INPUT', {
     url: rawUrl,
@@ -281,73 +323,55 @@ export function checkDealCooldown(input = {}) {
     normalizedUrl: lookupNormalizedUrl
   });
   console.log('MATCH BY ASIN', matchesByAsin);
-  console.log('MATCH BY NORMALIZED URL', matchesByFinalUrl.length ? matchesByFinalUrl : matchesByUrl);
+  console.log(
+    'MATCH BY NORMALIZED URL',
+    matchesByNormalizedUrl.length ? matchesByNormalizedUrl : matchesByUrl
+  );
 
-  const summary = getDealHistorySummary({ asin, normalizedUrl: lookupNormalizedUrl });
+  const summary = buildHistorySummary(historyRows);
   const settingsRow = getRepostSettingsRow();
-  const settings = getRepostSettings();
-  const cooldownEnabled = settings.repostCooldownEnabled;
-  const cooldownHours = settings.repostCooldownHours;
+  const repostCooldownEnabled = parseEnabledFlag(settingsRow?.repostCooldownEnabled);
+  const parsedCooldownHours = Number(settingsRow?.repostCooldownHours);
+  const repostCooldownHours =
+    Number.isFinite(parsedCooldownHours) && parsedCooldownHours >= 0 ? parsedCooldownHours : 12;
   const lastPostedAt = summary.latest?.postedAt || null;
   let blocked = false;
-  let remainingMs = 0;
-  console.log('CHECK SETTINGS USED', {
-    id: 1,
-    repostCooldownEnabled: cooldownEnabled ? 1 : 0,
-    repostCooldownHours: cooldownHours
-  });
+  let remainingSeconds = 0;
+
   console.log('CHECK SETTINGS', {
-    repostCooldownEnabled: cooldownEnabled,
-    repostCooldownHours: cooldownHours
-  });
-  console.log('SETTINGS USED IN CHECK', settingsRow);
-  console.log('CHECK COOLDOWN HOURS', cooldownHours);
-  console.log('CHECK MATCH FOUND', {
-    hasHistory: !!lastPostedAt
+    repostCooldownEnabled,
+    repostCooldownHours
   });
   console.log('CHECK LAST POSTED AT', lastPostedAt);
 
-  if (summary.latest?.postedAt && cooldownEnabled) {
-    const lastTimestamp = new Date(summary.latest.postedAt).getTime();
-    const diffMs = Date.now() - lastTimestamp;
-    const cooldownMs = cooldownHours * 60 * 60 * 1000;
-    remainingMs = Math.max(0, cooldownMs - diffMs);
-    console.log('CHECK TIME DIFF MS', diffMs);
-    blocked = remainingMs > 0;
+  if (repostCooldownEnabled === true && lastPostedAt) {
+    const nowMs = Date.now();
+    const lastPostedMs = new Date(lastPostedAt).getTime();
+    const cooldownMs = Number(repostCooldownHours) * 60 * 60 * 1000;
+    const diffMs = nowMs - lastPostedMs;
+
+    console.log('CHECK DIFF MS', diffMs);
+
+    if (diffMs < cooldownMs) {
+      blocked = true;
+      remainingSeconds = Math.ceil((cooldownMs - diffMs) / 1000);
+    }
   }
 
-  if (!summary.latest?.postedAt) {
-    console.log('CHECK BLOCK RESULT', {
-      blocked: false,
-      remainingSeconds: 0
-    });
-    return {
-      asin,
-      normalizedUrl: lookupNormalizedUrl,
-      blocked: false,
-      remainingMs: 0,
-      cooldownEnabled,
-      cooldownHours,
-      lastDeal: null,
-      minPrice: summary.minPrice,
-      maxPrice: summary.maxPrice,
-      postingCount: summary.count
-    };
+  if (repostCooldownEnabled !== true) {
+    blocked = false;
+    remainingSeconds = 0;
   }
 
-  console.log('CHECK BLOCK RESULT', {
-    blocked,
-    remainingSeconds: Math.ceil(remainingMs / 1000)
-  });
-  console.log('CHECK REMAINING SECONDS', Math.ceil(remainingMs / 1000));
+  console.log('CHECK REMAINING SECONDS', remainingSeconds);
 
   return {
     asin,
     normalizedUrl: lookupNormalizedUrl,
     blocked,
-    remainingMs,
-    cooldownEnabled,
-    cooldownHours,
+    remainingSeconds,
+    repostCooldownEnabled,
+    repostCooldownHours,
     lastDeal: summary.latest,
     minPrice: summary.minPrice,
     maxPrice: summary.maxPrice,

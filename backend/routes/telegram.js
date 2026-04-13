@@ -1,17 +1,16 @@
 import { Router } from 'express';
 import { getTelegramConfig } from '../env.js';
+import { getTelegramCopyButtonText } from '../services/dealHistoryService.js';
 
 const router = Router();
-
-async function sendTelegramRequest(token, method, payload) {
-  const finalPayload = {
-    ...payload,
-    parse_mode: 'HTML'
-  };
-
-  if (finalPayload.parse_mode !== 'HTML') {
-    throw new Error('Telegram parse_mode fehlt oder ist nicht HTML.');
-  }
+async function sendTelegramRequest(token, method, payload, options = {}) {
+  const useHtml = options.html !== false;
+  const finalPayload = useHtml
+    ? {
+        ...payload,
+        parse_mode: 'HTML'
+      }
+    : { ...payload };
 
   console.log('[telegram/send] final telegram request body', {
     method,
@@ -19,7 +18,8 @@ async function sendTelegramRequest(token, method, payload) {
     parse_mode: finalPayload.parse_mode,
     caption: typeof finalPayload.caption === 'string' ? finalPayload.caption : '',
     text: typeof finalPayload.text === 'string' ? finalPayload.text : '',
-    photo: typeof finalPayload.photo === 'string' ? finalPayload.photo : ''
+    photo: typeof finalPayload.photo === 'string' ? finalPayload.photo : '',
+    reply_markup: finalPayload.reply_markup ?? null
   });
 
   const telegramResponse = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -65,21 +65,28 @@ router.post('/send', async (req, res) => {
       imageUrl,
       amazonLink,
       rabattgutscheinCode,
-      chatId: bodyChatId,
-      asin,
-      normalizedUrl,
-      productTitle,
-      currentPrice,
-      oldPrice,
-      sellerType,
-      shippingType,
-      marketplaceType
+      chatId: bodyChatId
     } = req.body ?? {};
     const { token, chatId: envChatId } = getTelegramConfig();
     const finalChatId = (bodyChatId || envChatId || '').toString().trim();
     const trimmedImageUrl = typeof imageUrl === 'string' ? imageUrl.trim() : '';
     const trimmedCouponCode = typeof rabattgutscheinCode === 'string' ? rabattgutscheinCode.trim() : '';
-    const followUpText = trimmedCouponCode;
+    const buttonText = getTelegramCopyButtonText().trim() || '📋 Zum Kopieren hier klicken';
+    const replyMarkup = trimmedCouponCode
+      ? {
+          inline_keyboard: [
+            [
+              {
+                text: buttonText,
+                copy_text: {
+                  text: trimmedCouponCode
+                }
+              }
+            ]
+          ]
+        }
+      : undefined;
+    const editOperationPayload = null;
 
     console.log('[telegram/send] incoming request', {
       hasText: typeof text === 'string' && text.trim().length > 0,
@@ -91,6 +98,13 @@ router.post('/send', async (req, res) => {
       textLength: typeof text === 'string' ? text.length : 0,
       hasCouponCode: Boolean(trimmedCouponCode)
     });
+    console.log('MAIN POST COUPON RAW', rabattgutscheinCode);
+    console.log('MAIN POST COUPON TRIMMED', trimmedCouponCode);
+    console.log('MAIN POST WITH COUPON', trimmedCouponCode);
+    console.log('MAIN POST BUTTON TEXT', 'Code kopieren');
+    console.log('MAIN POST REPLY MARKUP', JSON.stringify(replyMarkup, null, 2));
+    console.log('SECOND COUPON MESSAGE DISABLED', true);
+    console.log('TELEGRAM SEND START', { hasCoupon: !!trimmedCouponCode });
 
     if (!req.body || typeof req.body !== 'object') {
       return res.status(400).json({
@@ -129,12 +143,20 @@ router.post('/send', async (req, res) => {
       ? {
           chat_id: finalChatId,
           photo: trimmedImageUrl,
-          caption: String(text)
+          caption: String(text),
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {})
         }
       : {
           chat_id: finalChatId,
-          text: String(text)
+          text: String(text),
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {})
         };
+
+    console.log('MAIN POST PAYLOAD', JSON.stringify(telegramPayload, null, 2));
+    console.log('USES INLINE KEYBOARD', !!telegramPayload.reply_markup?.inline_keyboard);
+    console.log('USES REPLY KEYBOARD', !!telegramPayload.reply_markup?.keyboard);
+    console.log('HAS INLINE KEYBOARD AT SEND TIME', !!telegramPayload.reply_markup?.inline_keyboard);
+    console.log('ANY EDIT AFTER SEND', editOperationPayload);
 
     const { telegramResponse, telegramData } = await sendTelegramRequest(token, telegramMethod, telegramPayload);
 
@@ -159,52 +181,15 @@ router.post('/send', async (req, res) => {
       });
     }
 
-    let couponMessageId = null;
-
-    if (followUpText) {
-      const couponPayload = {
-        chat_id: finalChatId,
-        text: followUpText
-      };
-
-      const { telegramResponse: couponResponse, telegramData: couponData } = await sendTelegramRequest(
-        token,
-        'sendMessage',
-        couponPayload
-      );
-
-      console.log('[telegram/send] coupon telegram response', {
-        status: couponResponse.status,
-        response: couponData
-      });
-
-      if (!couponResponse.ok || !couponData?.ok) {
-        const couponDescription =
-          couponData?.description || couponData?.raw || 'Telegram API hat die Rabattgutschein-Nachricht abgelehnt';
-
-        return res.status(502).json({
-          success: false,
-          error: `Hauptpost gesendet, aber Rabattgutschein fehlgeschlagen: ${couponDescription}`,
-          code: 'TELEGRAM_COUPON_ERROR',
-          details: {
-            mainMessageId: telegramData.result?.message_id
-          }
-        });
-      }
-
-      couponMessageId = couponData.result?.message_id ?? null;
-    }
     return res.status(200).json({
       success: true,
-      message: followUpText
-        ? 'Post und Rabattgutschein erfolgreich zu Telegram gesendet'
-        : trimmedImageUrl
-          ? 'Post erfolgreich mit Bild zu Telegram gesendet'
-          : 'Post erfolgreich zu Telegram gesendet',
+      message: trimmedImageUrl
+        ? 'Post erfolgreich mit Bild zu Telegram gesendet'
+        : 'Post erfolgreich zu Telegram gesendet',
       data: {
         method: telegramMethod,
         messageId: telegramData.result?.message_id,
-        couponMessageId,
+        couponMessageId: null,
         chatId: telegramData.result?.chat?.id ?? finalChatId,
         textLength: text.length,
         imageUrl: trimmedImageUrl || null

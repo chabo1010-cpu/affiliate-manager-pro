@@ -13,7 +13,10 @@ import telegramRoutes from './routes/telegram.js';
 const app = express();
 const port = getApiPort();
 
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:5173'],
+  credentials: false
+}));
 app.use(express.json());
 
 app.use('/api/auth', authRoutes);

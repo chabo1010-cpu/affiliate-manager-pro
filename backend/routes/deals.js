@@ -82,7 +82,7 @@ router.post('/check', async (req, res) => {
       minPrice: null,
       maxPrice: null,
       sellerType: null,
-      remainingSeconds: null,
+      remainingSeconds: 0,
       error: 'URL fehlt'
     });
   }
@@ -111,16 +111,13 @@ router.post('/check', async (req, res) => {
     normalizedUrl: identity.normalizedFinalUrl,
     asin: identity.asin
   });
-  const isBlocked = result.blocked === true;
   const responsePayload = {
-    blocked: isBlocked,
+    blocked: result.blocked === true,
     lastPostedAt: result.lastDeal?.postedAt || null,
     minPrice: result.minPrice ?? null,
     maxPrice: result.maxPrice ?? null,
     sellerType: result.lastDeal?.sellerType || null,
-    remainingSeconds: isBlocked && typeof result.remainingMs === 'number' ? Math.ceil(result.remainingMs / 1000) : 0,
-    repostCooldownEnabled: Boolean(result.cooldownEnabled),
-    repostCooldownHours: result.cooldownHours ?? 12,
+    remainingSeconds: Number.isFinite(result.remainingSeconds) ? result.remainingSeconds : 0,
     postingCount: result.postingCount ?? 0,
     asin: result.asin || null,
     normalizedUrl: result.normalizedUrl || null,
@@ -173,7 +170,8 @@ router.get('/settings', (req, res) => {
       CREATE TABLE IF NOT EXISTS app_settings (
         id INTEGER PRIMARY KEY,
         repostCooldownEnabled INTEGER NOT NULL DEFAULT 1,
-        repostCooldownHours INTEGER NOT NULL DEFAULT 12
+        repostCooldownHours INTEGER NOT NULL DEFAULT 12,
+        telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'
       )
     `);
 
@@ -186,7 +184,8 @@ router.get('/settings', (req, res) => {
 
     return res.json({
       repostCooldownEnabled: settings.repostCooldownEnabled,
-      repostCooldownHours: settings.repostCooldownHours
+      repostCooldownHours: settings.repostCooldownHours,
+      telegramCopyButtonText: settings.telegramCopyButtonText
     });
   } catch (error) {
     console.error('SETTINGS LOAD ERROR', error);
@@ -203,15 +202,23 @@ const saveSettingsHandler = (req, res) => {
 
     const rawEnabled = req.body?.repostCooldownEnabled;
     const rawHours = req.body?.repostCooldownHours;
+    const rawTelegramCopyButtonText = req.body?.telegramCopyButtonText;
+    const requesterRole = String(req.headers['x-user-role'] || '').trim().toLowerCase();
+    const wantsToSaveTelegramCopyButtonText = rawTelegramCopyButtonText !== undefined;
+    const currentSettings = getRepostSettings();
+
+    if (wantsToSaveTelegramCopyButtonText && requesterRole !== 'admin') {
+      return res.status(403).json({ error: 'Nur Admin darf den Telegram Copy-Button Text speichern.' });
+    }
 
     const enabled =
-      rawEnabled === true ||
-      rawEnabled === 1 ||
-      rawEnabled === '1';
+      rawEnabled === undefined
+        ? currentSettings.repostCooldownEnabled
+        : rawEnabled === true || rawEnabled === 1 || rawEnabled === '1';
 
     const hours =
       rawHours === undefined || rawHours === null || rawHours === ''
-        ? 12
+        ? currentSettings.repostCooldownHours
         : Number(rawHours);
 
     if (Number.isNaN(hours)) {
@@ -222,34 +229,17 @@ const saveSettingsHandler = (req, res) => {
       CREATE TABLE IF NOT EXISTS app_settings (
         id INTEGER PRIMARY KEY,
         repostCooldownEnabled INTEGER NOT NULL DEFAULT 1,
-        repostCooldownHours INTEGER NOT NULL DEFAULT 12
+        repostCooldownHours INTEGER NOT NULL DEFAULT 12,
+        telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'
       )
     `);
-
     console.log('SETTINGS SAVE DB BEFORE', db.prepare(`SELECT * FROM app_settings WHERE id = 1`).get());
 
-    const existing = db.prepare(`
-      SELECT id FROM app_settings WHERE id = 1
-    `).get();
-
-    if (existing) {
-      db.prepare(`
-        UPDATE app_settings
-        SET repostCooldownEnabled = ?, repostCooldownHours = ?
-        WHERE id = 1
-      `).run(enabled ? 1 : 0, hours);
-    } else {
-      db.prepare(`
-        INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours)
-        VALUES (1, ?, ?)
-      `).run(enabled ? 1 : 0, hours);
-    }
-
-    const saved = db.prepare(`
-      SELECT id, repostCooldownEnabled, repostCooldownHours
-      FROM app_settings
-      WHERE id = 1
-    `).get();
+    const saved = saveRepostSettings({
+      repostCooldownEnabled: enabled ? 1 : 0,
+      repostCooldownHours: hours,
+      telegramCopyButtonText: wantsToSaveTelegramCopyButtonText ? rawTelegramCopyButtonText : undefined
+    });
 
     console.log('SETTINGS SAVE FINAL', { enabled, hours });
     console.log('SETTINGS SAVE DB AFTER', saved);
@@ -257,8 +247,9 @@ const saveSettingsHandler = (req, res) => {
 
     return res.json({
       success: true,
-      repostCooldownEnabled: saved.repostCooldownEnabled === 1,
-      repostCooldownHours: Number(saved.repostCooldownHours)
+      repostCooldownEnabled: Boolean(saved.repostCooldownEnabled),
+      repostCooldownHours: Number(saved.repostCooldownHours),
+      telegramCopyButtonText: saved.telegramCopyButtonText
     });
   } catch (error) {
     console.error('SETTINGS SAVE ERROR', error);

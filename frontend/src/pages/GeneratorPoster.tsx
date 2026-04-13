@@ -7,7 +7,6 @@ import {
   MASTER_PRIMARY_OPTIONS,
   WITHOUT_OPTIONS_LABEL,
   hasEffectivePostQualifier,
-  copyToClipboard,
   generatePostText,
   normalizeDealImageUrl
 } from '../lib/postGenerator';
@@ -86,24 +85,25 @@ function formatPriceRangeValue(value: number | null) {
 
 function formatRemainingTime(value: number) {
   if (!value || value <= 0) {
-    return '0 Minuten';
+    return '1 Minute';
   }
 
-  const totalMinutes = Math.max(1, Math.ceil(value / 60000));
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
+  const totalSeconds = Math.max(0, Math.floor(value));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const safeMinutes = hours === 0 ? Math.max(1, minutes) : minutes;
   const hourLabel = hours === 1 ? 'Stunde' : 'Stunden';
-  const minuteLabel = minutes === 1 ? 'Minute' : 'Minuten';
+  const minuteLabel = safeMinutes === 1 ? 'Minute' : 'Minuten';
 
-  if (hours > 0 && minutes > 0) {
-    return `${hours} ${hourLabel} ${minutes} ${minuteLabel}`;
+  if (hours > 0 && safeMinutes > 0) {
+    return `${hours} ${hourLabel} ${safeMinutes} ${minuteLabel}`;
   }
 
   if (hours > 0) {
     return `${hours} ${hourLabel}`;
   }
 
-  return `${minutes} ${minuteLabel}`;
+  return `${safeMinutes} ${minuteLabel}`;
 }
 
 function GeneratorPosterPage() {
@@ -428,10 +428,7 @@ function GeneratorPosterPage() {
       }
 
       const isKnownDeal = Boolean(checkData.lastPostedAt || checkData.lastDeal?.postedAt);
-      const isBlocked = checkData.blocked === true;
       console.log('KNOWN DEAL?', isKnownDeal);
-      console.log('BLOCKED?', checkData.blocked);
-      console.log('CONTINUE TO GENERATOR?', !isBlocked);
 
       const nextDealSnapshot = {
         asin: checkData.asin || data.asin || '',
@@ -442,7 +439,7 @@ function GeneratorPosterPage() {
         minPrice: parseDealPriceValue(checkData.minPrice),
         maxPrice: parseDealPriceValue(checkData.maxPrice),
         postingCount: Number(checkData.postingCount || 0),
-        blocked: isBlocked,
+        blocked: checkData.blocked === true,
         remainingMs: Number(checkData.remainingSeconds || 0) * 1000,
         cooldownEnabled: parseEnabledFlag(checkData.repostCooldownEnabled),
         cooldownHours: Number(checkData.repostCooldownHours ?? 12)
@@ -464,13 +461,15 @@ function GeneratorPosterPage() {
       setCurrentPrice(data.price || '');
       setSelectedPrimaryOptions([]);
 
-      if (isBlocked) {
-        const blockMessage = `Link bereits gepostet. Erneut moeglich in ${formatRemainingTime(nextDealSnapshot.remainingMs)}.`;
-        setFormError(blockMessage);
+      if (checkData.blocked === true) {
+        const formattedBlockMessage = `Link bereits gepostet. Erneut möglich in ${formatRemainingTime(
+          Number(checkData.remainingSeconds || 0)
+        )}.`;
+        console.log('FORMATTED BLOCK MESSAGE', formattedBlockMessage);
+        setFormError(formattedBlockMessage);
         setHasScraped(false);
-        console.log('BLOCK MESSAGE', blockMessage);
         console.log('EARLY RETURN REASON', {
-          blocked: isBlocked,
+          blocked: true,
           lastPostedAt: checkData.lastPostedAt || checkData.lastDeal?.postedAt || null,
           remainingSeconds: checkData.remainingSeconds ?? 0,
           reason: 'deal_blocked'
@@ -478,7 +477,7 @@ function GeneratorPosterPage() {
         return;
       }
 
-      console.log('BLOCK MESSAGE', '');
+      console.log('FORMATTED BLOCK MESSAGE', '');
       setFormError('');
       setHasScraped(true);
       showToast(
@@ -632,27 +631,6 @@ function GeneratorPosterPage() {
     }
   };
 
-  const handleCouponCopy = async () => {
-    const trimmedCouponCode = rabattgutscheinCode.trim();
-    if (!trimmedCouponCode) {
-      const errorMessage = validateRabattgutscheinCode();
-      if (errorMessage) {
-        setFormError(errorMessage);
-        showToast(errorMessage);
-      }
-      return;
-    }
-
-    const success = await copyToClipboard(trimmedCouponCode);
-    if (success) {
-      showToast('Rabattgutschein kopiert');
-      setFormError('');
-      return;
-    }
-
-    showToast('Rabattgutschein konnte nicht kopiert werden');
-  };
-
   const formattedLastPostedAt = dealSnapshot ? formatDealDateTime(dealSnapshot.lastPostedAt) : null;
   const formattedMinPrice = dealSnapshot ? formatPriceRangeValue(dealSnapshot.minPrice) : null;
   const formattedMaxPrice = dealSnapshot ? formatPriceRangeValue(dealSnapshot.maxPrice) : null;
@@ -731,7 +709,7 @@ function GeneratorPosterPage() {
 
               {dealSnapshot?.blocked && (
                 <p className="generator-history-alert">
-                  Link bereits gepostet. Erneut moeglich in {formatRemainingTime(dealSnapshot.remainingMs)}.
+                  Link bereits gepostet. Erneut möglich in {formatRemainingTime(dealSnapshot.remainingMs / 1000)}.
                 </p>
               )}
 
@@ -775,14 +753,16 @@ function GeneratorPosterPage() {
 
               <section className="generator-panel">
                 <div className="generator-panel-header generator-panel-header-inline">
-                  <h2>Erweiterte Ansicht</h2>
-                  <button
-                    type="button"
-                    className="generator-action-button secondary compact"
-                    onClick={() => setExpandedAdvanced((prev) => !prev)}
-                  >
-                    {expandedAdvanced ? 'Ausblenden' : 'Einblenden'}
-                  </button>
+                  <div className="generator-panel-header-inline-title">
+                    <h2>Erweiterte Ansicht</h2>
+                    <button
+                      type="button"
+                      className="generator-action-button secondary compact"
+                      onClick={() => setExpandedAdvanced((prev) => !prev)}
+                    >
+                      {expandedAdvanced ? 'Ausblenden' : 'Einblenden'}
+                    </button>
+                  </div>
                 </div>
 
                 {expandedAdvanced && (
@@ -920,16 +900,11 @@ function GeneratorPosterPage() {
                 <div className="generator-post-preview">
                   <pre>{previewDisplayPost}</pre>
                   {rabattgutscheinAktiv && (
-                    <button
-                      type="button"
-                      className={`generator-coupon-preview${!rabattgutscheinCode.trim() ? ' is-empty' : ''}`}
-                      onClick={handleCouponCopy}
-                      title={rabattgutscheinCode.trim() ? 'Rabattgutschein kopieren' : 'Rabattgutschein fehlt'}
-                    >
+                    <div className={`generator-coupon-preview${!rabattgutscheinCode.trim() ? ' is-empty' : ''}`}>
                       <span>Rabattgutschein</span>
                       <strong>{`${COUPON_PREVIEW_PREFIX} ${rabattgutscheinCode.trim() || 'Rabattgutschein fehlt.'}`}</strong>
-                      <em>{rabattgutscheinCode.trim() ? 'Zum Kopieren klicken' : 'Pflichtfeld vor dem Versand'}</em>
-                    </button>
+                      {!rabattgutscheinCode.trim() && <em>Pflichtfeld vor dem Versand</em>}
+                    </div>
                   )}
                 </div>
               </section>

@@ -3,9 +3,9 @@ import Layout from '../components/layout/Layout';
 import { Toast, useToast } from '../components/Toast';
 import './DealHistoryAdmin.css';
 
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
-const adminSettingsApiUrl = `${apiBaseUrl}/api/deals/settings`;
-const adminHistoryApiUrl = `${apiBaseUrl}/api/deals/history`;
+const API_BASE_URL = 'http://localhost:4000';
+const adminSettingsApiUrl = `${API_BASE_URL}/api/deals/settings`;
+const adminHistoryApiUrl = `${API_BASE_URL}/api/deals/history`;
 
 interface AdminSettings {
   repostCooldownEnabled: boolean;
@@ -205,6 +205,7 @@ function DealHistoryAdminPage() {
         time: new Date().toLocaleTimeString('de-DE')
       });
     } catch (error) {
+      console.error('SETTINGS SAVE FETCH ERROR', error);
       const message = error instanceof Error ? error.message : 'Senden fehlgeschlagen';
       console.log('SETTINGS SAVE RESPONSE DATA', error);
       showToast(message);

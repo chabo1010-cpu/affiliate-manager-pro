@@ -38,13 +38,15 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS settings (
     repostCooldownEnabled INTEGER NOT NULL DEFAULT 1,
-    repostCooldownHours INTEGER NOT NULL DEFAULT 12
+    repostCooldownHours INTEGER NOT NULL DEFAULT 12,
+    telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'
   );
 
   CREATE TABLE IF NOT EXISTS app_settings (
     id INTEGER PRIMARY KEY,
     repostCooldownEnabled INTEGER NOT NULL DEFAULT 1,
-    repostCooldownHours INTEGER NOT NULL DEFAULT 12
+    repostCooldownHours INTEGER NOT NULL DEFAULT 12,
+    telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'
   );
 `);
 
@@ -53,19 +55,32 @@ const hasCooldownEnabledColumn = settingsColumns.some((column) => column.name ==
 if (!hasCooldownEnabledColumn) {
   db.exec(`ALTER TABLE settings ADD COLUMN repostCooldownEnabled INTEGER NOT NULL DEFAULT 1`);
 }
+const hasTelegramCopyButtonTextColumn = settingsColumns.some((column) => column.name === 'telegramCopyButtonText');
+if (!hasTelegramCopyButtonTextColumn) {
+  db.exec(`ALTER TABLE settings ADD COLUMN telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'`);
+}
 
 const row = db.prepare(`SELECT COUNT(*) AS count FROM settings`).get();
 if (!row?.count) {
-  db.prepare(`INSERT INTO settings (repostCooldownEnabled, repostCooldownHours) VALUES (1, 12)`).run();
+  db.prepare(
+    `INSERT INTO settings (repostCooldownEnabled, repostCooldownHours, telegramCopyButtonText) VALUES (1, 12, '📋 Zum Kopieren hier klicken')`
+  ).run();
 } else {
   db.prepare(`DELETE FROM settings WHERE rowid NOT IN (SELECT MIN(rowid) FROM settings)`).run();
   db.prepare(
     `
       UPDATE settings
       SET repostCooldownEnabled = COALESCE(repostCooldownEnabled, 1),
-          repostCooldownHours = COALESCE(repostCooldownHours, 12)
+          repostCooldownHours = COALESCE(repostCooldownHours, 12),
+          telegramCopyButtonText = COALESCE(NULLIF(TRIM(telegramCopyButtonText), ''), '📋 Zum Kopieren hier klicken')
     `
   ).run();
+}
+
+const appSettingsColumns = db.prepare(`PRAGMA table_info(app_settings)`).all();
+const hasAppTelegramCopyButtonTextColumn = appSettingsColumns.some((column) => column.name === 'telegramCopyButtonText');
+if (!hasAppTelegramCopyButtonTextColumn) {
+  db.exec(`ALTER TABLE app_settings ADD COLUMN telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'`);
 }
 
 const appSettingsRow = db.prepare(`SELECT COUNT(*) AS count FROM app_settings`).get();
@@ -76,12 +91,13 @@ if (!appSettingsRow?.count) {
 
   db.prepare(
     `
-      INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours)
-      VALUES (1, ?, ?)
+      INSERT INTO app_settings (id, repostCooldownEnabled, repostCooldownHours, telegramCopyButtonText)
+      VALUES (1, ?, ?, ?)
     `
   ).run(
     legacySettings?.repostCooldownEnabled ?? 1,
-    legacySettings?.repostCooldownHours ?? 12
+    legacySettings?.repostCooldownHours ?? 12,
+    legacySettings?.telegramCopyButtonText ?? '📋 Zum Kopieren hier klicken'
   );
 } else {
   db.prepare(`DELETE FROM app_settings WHERE id != 1`).run();
@@ -89,7 +105,8 @@ if (!appSettingsRow?.count) {
     `
       UPDATE app_settings
       SET repostCooldownEnabled = COALESCE(repostCooldownEnabled, 1),
-          repostCooldownHours = COALESCE(repostCooldownHours, 12)
+          repostCooldownHours = COALESCE(repostCooldownHours, 12),
+          telegramCopyButtonText = COALESCE(NULLIF(TRIM(telegramCopyButtonText), ''), '📋 Zum Kopieren hier klicken')
       WHERE id = 1
     `
   ).run();
