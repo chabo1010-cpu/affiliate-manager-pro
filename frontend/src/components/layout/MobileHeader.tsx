@@ -4,12 +4,13 @@ import { useAuth } from '../../context/AuthContext';
 const mobileNav = [
   { label: 'Home', path: '/', icon: '🏠' },
   { label: 'Generator', path: '/generator', icon: '📝' },
-  { label: 'Scraper', path: '/scraper', icon: '🔍' },
-  { label: 'Logs', path: '/logs', icon: '📋' }
+  { label: 'Copybot', path: '/copybot', icon: '🗂' },
+  { label: 'Publishing', path: '/publishing', icon: '📦' }
 ];
 
 function MobileHeader() {
   const { user } = useAuth();
+
   return (
     <header className="mobile-header">
       <div className="top-line">
@@ -24,7 +25,7 @@ function MobileHeader() {
           <NavLink
             key={item.path}
             to={item.path}
-            className={({ isActive }) => isActive ? 'mobile-nav-link active' : 'mobile-nav-link'}
+            className={({ isActive }) => (isActive ? 'mobile-nav-link active' : 'mobile-nav-link')}
           >
             <span>{item.icon}</span>
             <span>{item.label}</span>

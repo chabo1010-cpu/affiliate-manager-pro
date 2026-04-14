@@ -7,6 +7,8 @@ const navItems = [
   { label: 'Templates', path: '/templates', icon: '\u{1F9E9}' },
   { label: 'Scraper', path: '/scraper', icon: '\u{1F50D}' },
   { label: 'Autobot', path: '/autobot', icon: '\u{1F916}' },
+  { label: 'Copybot', path: '/copybot', icon: '\u{1F5C2}' },
+  { label: 'Publishing', path: '/publishing', icon: '\u{1F4E6}' },
   { label: 'Logs', path: '/logs', icon: '\u{1F4CB}' },
   { label: 'Deal Historie', path: '/deal-history', icon: '\u23F2\uFE0F' },
   { label: 'Team', path: '/team', icon: '\u{1F465}' },

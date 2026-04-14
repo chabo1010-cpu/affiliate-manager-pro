@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { publishGeneratorPostDirect } from '../services/directPublisher.js';
 const router = Router();
 
 const posts = [
@@ -18,6 +19,18 @@ router.post('/', (req, res) => {
   const data = { id: Date.now(), ...req.body };
   posts.unshift(data);
   res.status(201).json(data);
+});
+
+router.post('/direct', async (req, res) => {
+  try {
+    const result = await publishGeneratorPostDirect(req.body ?? {});
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Direkt-Posting fehlgeschlagen'
+    });
+  }
 });
 
 export default router;

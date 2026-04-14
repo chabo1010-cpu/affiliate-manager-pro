@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '../components/layout/Layout';
 import {
   COUPON_LINE_PREFIX,
@@ -19,13 +19,21 @@ const SUCCESS_RESET_DELAY_MS = 1100;
 
 const textOptions = MASTER_PRIMARY_OPTIONS.map((option) => ({ value: option, label: option }));
 const extraOptions = [...MASTER_EXTRA_OPTIONS];
+const imageSourceOptions = [
+  { value: 'standard', label: 'Standardbild' },
+  { value: 'upload', label: 'eigener Upload' },
+  { value: 'none', label: 'kein Bild' }
+] as const;
+const facebookImageSourceOptions = [
+  ...imageSourceOptions,
+  { value: 'link_preview', label: 'nur Link Preview' }
+] as const;
 
 const oldIconOptions = ['Statt', 'Vorher', 'Alt'];
 const newIconOptions = ['Jetzt', 'Deal', 'Neu'];
 const amazonScrapeApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/amazon/scrape`;
-const telegramApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/telegram/send`;
 const dealsCheckApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/deals/check`;
-const dealsSaveApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/deals/save`;
+const directPublishApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/posts/direct`;
 const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
 const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
 const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
@@ -122,6 +130,16 @@ function GeneratorPosterPage() {
   const [scraping, setScraping] = useState(false);
   const [hasScraped, setHasScraped] = useState(false);
   const [scrapedImageUrl, setScrapedImageUrl] = useState('');
+  const [uploadedImageDataUrl, setUploadedImageDataUrl] = useState('');
+  const [uploadedImageName, setUploadedImageName] = useState('');
+  const [telegramImageSource, setTelegramImageSource] = useState<'standard' | 'upload' | 'none'>('standard');
+  const [whatsappImageSource, setWhatsappImageSource] = useState<'standard' | 'upload' | 'none'>('standard');
+  const [facebookImageSource, setFacebookImageSource] = useState<'standard' | 'upload' | 'none' | 'link_preview'>(
+    'link_preview'
+  );
+  const [telegramEnabled, setTelegramEnabled] = useState(true);
+  const [whatsappEnabled, setWhatsappEnabled] = useState(false);
+  const [facebookEnabled, setFacebookEnabled] = useState(false);
   const [scrapedTitle, setScrapedTitle] = useState('');
   const [rabattgutscheinCode, setRabattgutscheinCode] = useState('');
   const [formError, setFormError] = useState('');
@@ -207,6 +225,10 @@ function GeneratorPosterPage() {
       return 'Rabattgutschein fehlt.';
     }
 
+    if (!telegramEnabled && !whatsappEnabled && !facebookEnabled) {
+      return 'Mindestens ein Kanal muss aktiviert sein.';
+    }
+
     return '';
   };
 
@@ -237,6 +259,14 @@ function GeneratorPosterPage() {
     setExtraText(NORMALIZED_DEFAULT_FREE_TEXT);
     setHasScraped(false);
     setScrapedImageUrl('');
+    setUploadedImageDataUrl('');
+    setUploadedImageName('');
+    setTelegramImageSource('standard');
+    setWhatsappImageSource('standard');
+    setFacebookImageSource('link_preview');
+    setTelegramEnabled(true);
+    setWhatsappEnabled(false);
+    setFacebookEnabled(false);
     setScrapedTitle('');
     setRabattgutscheinCode('');
     setFormError('');
@@ -527,16 +557,33 @@ function GeneratorPosterPage() {
     setPublishing(true);
 
     try {
-      const response = await fetch(telegramApiUrl, {
+      const response = await fetch(directPublishApiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          text: generatedPost.telegramCaption,
-          imageUrl: scrapedImageUrl || undefined,
-          amazonLink,
-          rabattgutscheinCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : undefined
+          title: scrapedTitle || generatedPost.productTitle,
+          link: amazonLink,
+          normalizedUrl: dealSnapshot?.normalizedUrl || '',
+          asin: dealSnapshot?.asin || '',
+          sellerType: dealSnapshot?.sellerType || 'FBM',
+          currentPrice,
+          oldPrice: showOldPrice ? oldPrice : '',
+          couponCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '',
+          textByChannel: {
+            telegram: generatedPost.telegramCaption,
+            whatsapp: generatedPost.whatsappText,
+            facebook: previewMainPost
+          },
+          generatedImagePath: scrapedImageUrl || '',
+          uploadedImagePath: uploadedImageDataUrl || '',
+          telegramImageSource,
+          whatsappImageSource,
+          facebookImageSource,
+          enableTelegram: telegramEnabled,
+          enableWhatsapp: whatsappEnabled,
+          enableFacebook: facebookEnabled
         })
       });
 
@@ -549,49 +596,17 @@ function GeneratorPosterPage() {
         data = { error: rawResponse || 'Unbekannte Backend-Antwort' };
       }
 
-      if (!response.ok || data.success === false) {
-        const backendMessage =
-          data.error || data.message || `Backend-Fehler (${response.status}) beim Telegram-Versand`;
+      if (!response.ok) {
+        const backendMessage = data.error || data.message || `Backend-Fehler (${response.status}) beim Direkt-Posting`;
         setFormError(backendMessage);
         showToast(backendMessage);
         return;
       }
 
-      console.log('POST SUCCESS -> SAVE DEAL START');
-
-      const savePayload = {
-        asin: dealSnapshot?.asin || '',
-        originalUrl: amazonLink,
-        finalUrl: dealSnapshot?.finalUrl || dealSnapshot?.normalizedUrl || amazonLink,
-        url: dealSnapshot?.finalUrl || dealSnapshot?.normalizedUrl || amazonLink,
-        normalizedUrl: dealSnapshot?.normalizedUrl || '',
-        title: scrapedTitle || generatedPost.productTitle,
-        price: currentPrice,
-        oldPrice: showOldPrice ? oldPrice : '',
-        sellerType: dealSnapshot?.sellerType || 'FBM',
-        postedAt: new Date().toISOString(),
-        channel: 'TELEGRAM',
-        couponCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : ''
-      };
-
-      console.log('SAVE DEAL PAYLOAD', savePayload);
-
-      const saveResponse = await fetch(dealsSaveApiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(savePayload)
-      });
-
-      if (!saveResponse.ok) {
-        showToast('Telegram gesendet, aber Historie konnte nicht gespeichert werden.', SUCCESS_RESET_DELAY_MS);
-      }
-
       showToast(
-        rabattgutscheinAktiv
-          ? 'Post und Rabattgutschein zu Telegram gesendet'
-          : 'Post erfolgreich zu Telegram gesendet',
+        whatsappEnabled || facebookEnabled
+          ? 'Generator-Post direkt gesendet. Weitere Kanaele sind fuer spaetere Direkt-Implementierung vorbereitet.'
+          : 'Generator-Post sofort zu Telegram gesendet',
         SUCCESS_RESET_DELAY_MS
       );
       resetTimeoutRef.current = window.setTimeout(() => {
@@ -629,6 +644,22 @@ function GeneratorPosterPage() {
       setOldPrice('');
       setOldIcon(oldIconOptions[1]);
     }
+  };
+
+  const handleUploadImage = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      setUploadedImageDataUrl('');
+      setUploadedImageName('');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      setUploadedImageDataUrl(typeof reader.result === 'string' ? reader.result : '');
+      setUploadedImageName(file.name);
+    };
+    reader.readAsDataURL(file);
   };
 
   const formattedLastPostedAt = dealSnapshot ? formatDealDateTime(dealSnapshot.lastPostedAt) : null;
@@ -894,6 +925,74 @@ function GeneratorPosterPage() {
 
               <section className="generator-panel">
                 <div className="generator-panel-header">
+                  <h2>Bildquellen pro Kanal</h2>
+                </div>
+
+                <div style={{ display: 'grid', gap: '1rem' }}>
+                  <label className="generator-form-field">
+                    <span>Eigener Upload / Screenshot</span>
+                    <input type="file" accept="image/*" onChange={handleUploadImage} />
+                  </label>
+                  <p className="generator-field-hint">
+                    Keine automatische Screenshot-Erstellung. Generator-Posts werden direkt versendet; nur Copybot-Deals laufen ueber Queue und Worker.
+                  </p>
+                  {(scrapedImageUrl || uploadedImageDataUrl) && (
+                    <div className="split-row">
+                      <div className="card" style={{ padding: '0.85rem' }}>
+                        <p className="section-title">Standardbild</p>
+                        <strong>{scrapedImageUrl ? 'vorhanden' : 'nicht vorhanden'}</strong>
+                      </div>
+                      <div className="card" style={{ padding: '0.85rem' }}>
+                        <p className="section-title">Eigener Upload</p>
+                        <strong>{uploadedImageName || 'nicht vorhanden'}</strong>
+                      </div>
+                    </div>
+                  )}
+                  <div className="form-row">
+                    <label className="checkbox-card">
+                      <span>Telegram aktiv</span>
+                      <input type="checkbox" checked={telegramEnabled} onChange={(e) => setTelegramEnabled(e.target.checked)} />
+                    </label>
+                    <label className="checkbox-card">
+                      <span>WhatsApp aktiv</span>
+                      <input type="checkbox" checked={whatsappEnabled} onChange={(e) => setWhatsappEnabled(e.target.checked)} />
+                    </label>
+                    <label className="checkbox-card">
+                      <span>Facebook aktiv</span>
+                      <input type="checkbox" checked={facebookEnabled} onChange={(e) => setFacebookEnabled(e.target.checked)} />
+                    </label>
+                  </div>
+                  <div className="form-row">
+                    <label className="generator-form-field">
+                      <span>Telegram Bildquelle</span>
+                      <select value={telegramImageSource} onChange={(e) => setTelegramImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
+                        {imageSourceOptions.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="generator-form-field">
+                      <span>WhatsApp Bildquelle</span>
+                      <select value={whatsappImageSource} onChange={(e) => setWhatsappImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
+                        {imageSourceOptions.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="generator-form-field">
+                      <span>Facebook Bildquelle</span>
+                      <select value={facebookImageSource} onChange={(e) => setFacebookImageSource(e.target.value as 'standard' | 'upload' | 'none' | 'link_preview')}>
+                        {facebookImageSourceOptions.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section className="generator-panel">
+                <div className="generator-panel-header">
                   <h2>Hauptbeitrag</h2>
                 </div>
 
@@ -917,7 +1016,7 @@ function GeneratorPosterPage() {
                   onClick={handlePublish}
                   disabled={publishing}
                 >
-                  {publishing ? 'Wird gesendet...' : 'Zu Telegram veroeffentlichen'}
+                  {publishing ? 'Wird direkt gesendet...' : 'Sofort posten'}
                 </button>
               </section>
             </>

@@ -67,6 +67,23 @@ async function resolveDealIdentity(inputUrl) {
   return { rawUrl, resolvedFinalUrl, asin, normalizedFinalUrl };
 }
 
+router.get('/', async (req, res) => {
+  try {
+    const deals = db.prepare(`SELECT * FROM deals ORDER BY createdAt DESC`).all();
+    return res.json(deals);
+  } catch (error) {
+    if (error instanceof Error && /no such table:\s*deals/i.test(error.message)) {
+      console.warn('GET /api/deals: deals table not found, returning empty list');
+      return res.json([]);
+    }
+
+    console.error('GET /api/deals error:', error);
+    return res.status(500).json({
+      error: 'Failed to fetch deals'
+    });
+  }
+});
+
 router.post('/check', async (req, res) => {
   const { url = '', asin = '', normalizedUrl = '' } = req.body ?? {};
   console.log('CHECK REQUEST BODY', req.body);

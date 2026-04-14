@@ -104,8 +104,8 @@ function SettingsPage() {
         {isAdmin && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.85rem' }}>
             <div>
-              <p className="section-title">Admin</p>
-              <h2 style={{ margin: '0.25rem 0 0.5rem', fontSize: '1.35rem' }}>Telegram Texte</h2>
+              <p className="section-title">Telegram</p>
+              <h2 style={{ margin: '0.25rem 0 0.5rem', fontSize: '1.35rem' }}>Copy Button Text</h2>
               <p style={{ margin: 0, color: '#94a3b8' }}>
                 Zentraler Text fuer den Telegram Copy-Button unter Rabattcode-Posts.
               </p>
