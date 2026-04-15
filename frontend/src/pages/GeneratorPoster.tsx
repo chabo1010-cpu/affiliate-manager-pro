@@ -6,6 +6,7 @@ import {
   MASTER_EXTRA_OPTIONS,
   MASTER_PRIMARY_OPTIONS,
   WITHOUT_OPTIONS_LABEL,
+  formatPrice,
   hasEffectivePostQualifier,
   generatePostText,
   normalizeDealImageUrl
@@ -34,6 +35,7 @@ const newIconOptions = ['Jetzt', 'Deal', 'Neu'];
 const amazonScrapeApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/amazon/scrape`;
 const dealsCheckApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/deals/check`;
 const directPublishApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/posts/direct`;
+const publishingQueueApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/publishing/generator`;
 const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
 const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
 const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
@@ -114,6 +116,27 @@ function formatRemainingTime(value: number) {
   return `${safeMinutes} ${minuteLabel}`;
 }
 
+function decodeHtmlEntities(text: string) {
+  if (typeof window === 'undefined' || !window.document) {
+    return text;
+  }
+
+  const textarea = window.document.createElement('textarea');
+  textarea.innerHTML = text;
+  return textarea.value;
+}
+
+function stripHtmlForValidation(text: string) {
+  const withoutTags = text.replace(/<[^>]*>/g, ' ');
+  const decodedOnce = decodeHtmlEntities(withoutTags);
+  const decodedTwice = decodeHtmlEntities(decodedOnce);
+
+  return decodedTwice
+    .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function GeneratorPosterPage() {
   const [amazonLink, setAmazonLink] = useState('');
   const [advertising, setAdvertising] = useState(false);
@@ -130,7 +153,8 @@ function GeneratorPosterPage() {
   const [scraping, setScraping] = useState(false);
   const [hasScraped, setHasScraped] = useState(false);
   const [scrapedImageUrl, setScrapedImageUrl] = useState('');
-  const [uploadedImageDataUrl, setUploadedImageDataUrl] = useState('');
+  const [uploadedImageFile, setUploadedImageFile] = useState<File | null>(null);
+  const [uploadedImagePreviewUrl, setUploadedImagePreviewUrl] = useState('');
   const [uploadedImageName, setUploadedImageName] = useState('');
   const [telegramImageSource, setTelegramImageSource] = useState<'standard' | 'upload' | 'none'>('standard');
   const [whatsappImageSource, setWhatsappImageSource] = useState<'standard' | 'upload' | 'none'>('standard');
@@ -158,6 +182,7 @@ function GeneratorPosterPage() {
     cooldownHours: number;
   } | null>(null);
   const resetTimeoutRef = useRef<number | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const { toast, showToast } = useToast();
   const rabattgutscheinAktiv = selectedExtras.includes(COUPON_OPTION_LABEL);
 
@@ -166,10 +191,16 @@ function GeneratorPosterPage() {
       if (resetTimeoutRef.current !== null) {
         window.clearTimeout(resetTimeoutRef.current);
       }
+
+      if (uploadedImagePreviewUrl) {
+        URL.revokeObjectURL(uploadedImagePreviewUrl);
+      }
     };
-  }, []);
+  }, [uploadedImagePreviewUrl]);
 
   const combinedExtraText = useMemo(() => extraText.trim(), [extraText]);
+  const formattedCurrentPrice = useMemo(() => formatPrice(currentPrice), [currentPrice]);
+  const formattedOldPrice = useMemo(() => formatPrice(oldPrice), [oldPrice]);
 
   const generatedPost = useMemo(
     () =>
@@ -177,8 +208,8 @@ function GeneratorPosterPage() {
         productTitle: scrapedTitle,
         freiText: combinedExtraText,
         textBaustein: selectedPrimaryOptions,
-        alterPreis: showOldPrice ? oldPrice : '',
-        neuerPreis: currentPrice,
+        alterPreis: showOldPrice ? formattedOldPrice : '',
+        neuerPreis: formattedCurrentPrice,
         alterPreisLabel: showOldPrice ? oldIcon : '',
         neuerPreisLabel: newIcon,
         amazonLink,
@@ -191,8 +222,8 @@ function GeneratorPosterPage() {
       combinedExtraText,
       selectedPrimaryOptions,
       showOldPrice,
-      oldPrice,
-      currentPrice,
+      formattedOldPrice,
+      formattedCurrentPrice,
       amazonLink,
       advertising,
       selectedExtras,
@@ -201,22 +232,41 @@ function GeneratorPosterPage() {
     ]
   );
 
+  const finalPostText = generatedPost.telegramCaption || '';
   const previewMainPost = useMemo(() => {
     if (!rabattgutscheinAktiv || !rabattgutscheinCode.trim()) {
-      return generatedPost.telegramCaption;
+      return finalPostText;
     }
 
-    return generatedPost.telegramCaption.replace(`\n🏷️ Rabattgutschein: ${rabattgutscheinCode.trim()}`, '');
-  }, [generatedPost, rabattgutscheinAktiv, rabattgutscheinCode]);
+    return finalPostText.replace(`\n🏷️ Rabattgutschein: ${rabattgutscheinCode.trim()}`, '');
+  }, [finalPostText, rabattgutscheinAktiv, rabattgutscheinCode]);
 
   const previewDisplayPost = useMemo(
     () =>
-      generatedPost.telegramCaption
+      finalPostText
         .split('\n')
         .filter((line) => !line.includes(`Rabattgutschein: ${rabattgutscheinCode.trim()}`))
         .join('\n'),
-    [generatedPost, rabattgutscheinCode]
+    [finalPostText, rabattgutscheinCode]
   );
+
+  const cleanValidationText = stripHtmlForValidation(finalPostText);
+  const isFinalPostTextValid = Boolean(cleanValidationText);
+
+  const hasUploadedImage = Boolean(uploadedImageFile && uploadedImagePreviewUrl);
+  const generatorPreviewImageUrl = uploadedImagePreviewUrl || scrapedImageUrl || '';
+  const generatorPreviewImageLabel = uploadedImagePreviewUrl
+    ? uploadedImageName || 'Eigener Upload'
+    : scrapedImageUrl
+      ? 'Standardbild'
+      : '';
+
+  const effectiveTelegramImageSource =
+    telegramImageSource === 'upload' && !hasUploadedImage ? 'standard' : telegramImageSource;
+  const effectiveWhatsappImageSource =
+    whatsappImageSource === 'upload' && !hasUploadedImage ? 'standard' : whatsappImageSource;
+  const effectiveFacebookImageSource =
+    facebookImageSource === 'upload' && !hasUploadedImage ? 'standard' : facebookImageSource;
 
   const couponFieldError = rabattgutscheinAktiv && formError === 'Rabattgutschein fehlt.' ? formError : '';
 
@@ -238,12 +288,24 @@ function GeneratorPosterPage() {
       return couponError;
     }
 
+    if (!isFinalPostTextValid) {
+      return 'Text ist erforderlich';
+    }
+
     if (!hasEffectivePostQualifier(selectedPrimaryOptions, extraText, rabattgutscheinAktiv, rabattgutscheinCode)) {
       return "Keine Option angewählt. Wähle 'Ohne Optionen' oder schreibe einen Freitext.";
     }
 
     return '';
   };
+
+  useEffect(() => {
+    console.log('GENERATOR FINAL TEXT:', finalPostText);
+    console.log('GENERATOR PREVIEW FINAL TEXT:', finalPostText);
+    console.log('GENERATOR VALIDATION RAW TEXT:', finalPostText);
+    console.log('GENERATOR VALIDATION CLEAN TEXT:', cleanValidationText);
+    console.log('GENERATOR VALIDATION RESULT:', isFinalPostTextValid);
+  }, [finalPostText, cleanValidationText, isFinalPostTextValid]);
 
   const resetGeneratorState = () => {
     setAmazonLink('');
@@ -259,7 +321,11 @@ function GeneratorPosterPage() {
     setExtraText(NORMALIZED_DEFAULT_FREE_TEXT);
     setHasScraped(false);
     setScrapedImageUrl('');
-    setUploadedImageDataUrl('');
+    if (uploadedImagePreviewUrl) {
+      URL.revokeObjectURL(uploadedImagePreviewUrl);
+    }
+    setUploadedImageFile(null);
+    setUploadedImagePreviewUrl('');
     setUploadedImageName('');
     setTelegramImageSource('standard');
     setWhatsappImageSource('standard');
@@ -271,7 +337,58 @@ function GeneratorPosterPage() {
     setRabattgutscheinCode('');
     setFormError('');
     setDealSnapshot(null);
+    if (uploadInputRef.current) {
+      uploadInputRef.current.value = '';
+    }
   };
+
+  useEffect(() => {
+    if (!hasUploadedImage) {
+      return;
+    }
+
+    setTelegramImageSource((prev) => {
+      if (prev === 'upload') {
+        return prev;
+      }
+
+      console.log('Upload-Bild automatisch aktiviert');
+      return 'upload';
+    });
+  }, [hasUploadedImage]);
+
+  useEffect(() => {
+    if (hasUploadedImage) {
+      return;
+    }
+
+    setTelegramImageSource((prev) => {
+      if (prev !== 'upload') {
+        return prev;
+      }
+
+      console.log('Bildquelle auf Standardbild zurueckgesetzt');
+      return 'standard';
+    });
+
+    setWhatsappImageSource((prev) => {
+      if (prev !== 'upload') {
+        return prev;
+      }
+
+      console.log('Bildquelle auf Standardbild zurueckgesetzt');
+      return 'standard';
+    });
+
+    setFacebookImageSource((prev) => {
+      if (prev !== 'upload') {
+        return prev;
+      }
+
+      console.log('Bildquelle auf Standardbild zurueckgesetzt');
+      return 'standard';
+    });
+  }, [hasUploadedImage]);
 
   const handleTogglePrimaryOption = (option: string) => {
     setSelectedPrimaryOptions((prev) => {
@@ -487,8 +604,8 @@ function GeneratorPosterPage() {
       const normalizedImageUrl = normalizeDealImageUrl(data.image || '');
       setScrapedImageUrl(normalizedImageUrl);
       setScrapedTitle(data.title || '');
-      setOldPrice(data.oldPrice || '');
-      setCurrentPrice(data.price || '');
+      setOldPrice(formatPrice(data.oldPrice || ''));
+      setCurrentPrice(formatPrice(data.price || ''));
       setSelectedPrimaryOptions([]);
 
       if (checkData.blocked === true) {
@@ -533,7 +650,55 @@ function GeneratorPosterPage() {
     }
   };
 
-  const handlePublish = async () => {
+  async function fileToDataUrl(file: File) {
+    return await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          resolve(reader.result);
+          return;
+        }
+
+        reject(new Error('Upload-Datei konnte nicht gelesen werden.'));
+      };
+      reader.onerror = () => reject(new Error('Upload-Datei konnte nicht gelesen werden.'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  const buildGeneratorPayload = async () => {
+    const uploadForQueue = hasUploadedImage && uploadedImageFile ? await fileToDataUrl(uploadedImageFile) : '';
+
+    if (hasUploadedImage && effectiveTelegramImageSource === 'upload') {
+      console.log('Generator verwendet Upload-Bild im Payload');
+    }
+
+    return {
+      title: scrapedTitle || generatedPost.productTitle,
+      link: amazonLink,
+      normalizedUrl: dealSnapshot?.normalizedUrl || '',
+      asin: dealSnapshot?.asin || '',
+      sellerType: dealSnapshot?.sellerType || 'FBM',
+      currentPrice: formattedCurrentPrice,
+      oldPrice: showOldPrice ? formattedOldPrice : '',
+      couponCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '',
+      textByChannel: {
+        telegram: finalPostText,
+        whatsapp: generatedPost.whatsappText,
+        facebook: previewMainPost
+      },
+      generatedImagePath: scrapedImageUrl || '',
+      uploadedImagePath: uploadForQueue,
+      telegramImageSource: effectiveTelegramImageSource,
+      whatsappImageSource: effectiveWhatsappImageSource,
+      facebookImageSource: effectiveFacebookImageSource,
+      enableTelegram: telegramEnabled,
+      enableWhatsapp: whatsappEnabled,
+      enableFacebook: facebookEnabled
+    };
+  };
+
+  const handlePublish = async (mode: 'direct' | 'queue') => {
     if (publishing) return;
 
     if (!hasScraped) {
@@ -543,13 +708,32 @@ function GeneratorPosterPage() {
 
     const validationError = validateBeforePublish();
     if (validationError) {
+      console.log('GENERATOR VALIDATION RAW TEXT:', finalPostText);
+      console.log('GENERATOR VALIDATION CLEAN TEXT:', cleanValidationText);
+      console.log('GENERATOR VALIDATION RESULT:', isFinalPostTextValid);
+      console.log('GENERATOR VALIDATION FAILED: empty clean text');
+      console.log('GENERATOR VALIDATION FAILED PAYLOAD STATE:', {
+        finalPostText,
+        cleanValidationText,
+        payloadText: finalPostText
+      });
       setFormError(validationError);
       showToast(validationError);
       return;
     }
 
-    if (!generatedPost.telegramCaption || generatedPost.telegramCaption.trim().length === 0) {
-      showToast('Bitte fuellen Sie das Formular aus');
+    console.log('GENERATOR VALIDATION RAW TEXT:', finalPostText);
+    console.log('GENERATOR VALIDATION CLEAN TEXT:', cleanValidationText);
+    console.log('GENERATOR VALIDATION RESULT:', isFinalPostTextValid);
+
+    if (!isFinalPostTextValid) {
+      console.log('GENERATOR VALIDATION FAILED: empty clean text');
+      console.log('GENERATOR VALIDATION FAILED PAYLOAD STATE:', {
+        finalPostText,
+        cleanValidationText,
+        payloadText: finalPostText
+      });
+      showToast('Text ist erforderlich');
       return;
     }
 
@@ -557,35 +741,67 @@ function GeneratorPosterPage() {
     setPublishing(true);
 
     try {
-      const response = await fetch(directPublishApiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          title: scrapedTitle || generatedPost.productTitle,
-          link: amazonLink,
-          normalizedUrl: dealSnapshot?.normalizedUrl || '',
-          asin: dealSnapshot?.asin || '',
-          sellerType: dealSnapshot?.sellerType || 'FBM',
-          currentPrice,
-          oldPrice: showOldPrice ? oldPrice : '',
-          couponCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '',
-          textByChannel: {
-            telegram: generatedPost.telegramCaption,
+      if (mode === 'direct') {
+        console.log('GENERATOR DIRECT MODE');
+        console.log('GENERATOR USES QUEUE? false');
+        console.log('GENERATOR DIRECT PUBLISH START');
+        console.log('GENERATOR BYPASSES QUEUE');
+      } else {
+        console.log('GENERATOR USES QUEUE? true');
+        console.log('UNEXPECTED GENERATOR QUEUE PATH');
+      }
+
+      const endpoint = mode === 'direct' ? directPublishApiUrl : publishingQueueApiUrl;
+      let response: Response;
+
+      if (mode === 'direct') {
+        const formData = new FormData();
+        formData.append('title', scrapedTitle || generatedPost.productTitle);
+        formData.append('link', amazonLink);
+        formData.append('normalizedUrl', dealSnapshot?.normalizedUrl || '');
+        formData.append('asin', dealSnapshot?.asin || '');
+        formData.append('sellerType', dealSnapshot?.sellerType || 'FBM');
+        formData.append('currentPrice', formattedCurrentPrice);
+        formData.append('oldPrice', showOldPrice ? formattedOldPrice : '');
+        formData.append('couponCode', rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '');
+        formData.append(
+          'textByChannel',
+          JSON.stringify({
+            telegram: finalPostText,
             whatsapp: generatedPost.whatsappText,
             facebook: previewMainPost
+          })
+        );
+        formData.append('generatedImagePath', scrapedImageUrl || '');
+        formData.append('telegramImageSource', effectiveTelegramImageSource);
+        formData.append('whatsappImageSource', effectiveWhatsappImageSource);
+        formData.append('facebookImageSource', effectiveFacebookImageSource);
+        formData.append('enableTelegram', String(telegramEnabled));
+        formData.append('enableWhatsapp', String(whatsappEnabled));
+        formData.append('enableFacebook', String(facebookEnabled));
+
+        if (hasUploadedImage && uploadedImageFile) {
+          console.log('Generator verwendet Upload-Bild im Payload');
+          formData.append('uploadedImageFile', uploadedImageFile);
+        }
+
+        console.log('GENERATOR PAYLOAD TEXT:', finalPostText);
+
+        response = await fetch(endpoint, {
+          method: 'POST',
+          body: formData
+        });
+      } else {
+        const queuePayload = await buildGeneratorPayload();
+        console.log('GENERATOR PAYLOAD TEXT:', queuePayload.textByChannel?.telegram || '');
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
           },
-          generatedImagePath: scrapedImageUrl || '',
-          uploadedImagePath: uploadedImageDataUrl || '',
-          telegramImageSource,
-          whatsappImageSource,
-          facebookImageSource,
-          enableTelegram: telegramEnabled,
-          enableWhatsapp: whatsappEnabled,
-          enableFacebook: facebookEnabled
-        })
-      });
+          body: JSON.stringify(queuePayload)
+        });
+      }
 
       const rawResponse = await response.text();
       let data: { success?: boolean; message?: string; error?: string; code?: string } = {};
@@ -604,9 +820,11 @@ function GeneratorPosterPage() {
       }
 
       showToast(
-        whatsappEnabled || facebookEnabled
-          ? 'Generator-Post direkt gesendet. Weitere Kanaele sind fuer spaetere Direkt-Implementierung vorbereitet.'
-          : 'Generator-Post sofort zu Telegram gesendet',
+        mode === 'direct'
+          ? whatsappEnabled || facebookEnabled
+            ? 'Generator-Post veroeffentlicht. Weitere Kanaele sind fuer spaetere Direkt-Implementierung vorbereitet.'
+            : 'Erfolgreich veroeffentlicht'
+          : 'Generator-Post wurde in die Publishing Queue gelegt.',
         SUCCESS_RESET_DELAY_MS
       );
       resetTimeoutRef.current = window.setTimeout(() => {
@@ -614,11 +832,15 @@ function GeneratorPosterPage() {
         resetTimeoutRef.current = null;
       }, SUCCESS_RESET_DELAY_MS);
     } catch (error) {
-      console.error('Telegram send error:', error);
+      console.error(mode === 'direct' ? 'Direct publish error:' : 'Queue publish error:', error);
       const message =
         error instanceof Error
-          ? `Telegram-Verbindungsfehler: ${error.message}`
-          : 'Telegram-Verbindungsfehler';
+          ? mode === 'direct'
+            ? `Telegram-Verbindungsfehler: ${error.message}`
+            : `Queue-Verbindungsfehler: ${error.message}`
+          : mode === 'direct'
+            ? 'Telegram-Verbindungsfehler'
+            : 'Queue-Verbindungsfehler';
 
       setFormError(message);
       showToast(message);
@@ -649,17 +871,35 @@ function GeneratorPosterPage() {
   const handleUploadImage = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) {
-      setUploadedImageDataUrl('');
+      if (uploadedImagePreviewUrl) {
+        URL.revokeObjectURL(uploadedImagePreviewUrl);
+      }
+      setUploadedImageFile(null);
+      setUploadedImagePreviewUrl('');
       setUploadedImageName('');
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      setUploadedImageDataUrl(typeof reader.result === 'string' ? reader.result : '');
-      setUploadedImageName(file.name);
-    };
-    reader.readAsDataURL(file);
+    if (uploadedImagePreviewUrl) {
+      URL.revokeObjectURL(uploadedImagePreviewUrl);
+    }
+
+    setUploadedImageFile(file);
+    setUploadedImagePreviewUrl(URL.createObjectURL(file));
+    setUploadedImageName(file.name);
+  };
+
+  const handleRemoveUploadedImage = () => {
+    if (uploadedImagePreviewUrl) {
+      URL.revokeObjectURL(uploadedImagePreviewUrl);
+    }
+    setUploadedImageFile(null);
+    setUploadedImagePreviewUrl('');
+    setUploadedImageName('');
+    if (uploadInputRef.current) {
+      uploadInputRef.current.value = '';
+    }
+    console.log('Upload-Bild entfernt');
   };
 
   const formattedLastPostedAt = dealSnapshot ? formatDealDateTime(dealSnapshot.lastPostedAt) : null;
@@ -871,6 +1111,7 @@ function GeneratorPosterPage() {
                             type="text"
                             value={oldPrice}
                             onChange={(e) => setOldPrice(e.target.value)}
+                            onBlur={(e) => setOldPrice(formatPrice(e.target.value))}
                             placeholder="39,99 EUR"
                           />
                         </label>
@@ -895,6 +1136,7 @@ function GeneratorPosterPage() {
                           type="text"
                           value={currentPrice}
                           onChange={(e) => setCurrentPrice(e.target.value)}
+                          onBlur={(e) => setCurrentPrice(formatPrice(e.target.value))}
                           placeholder="24,90 EUR"
                         />
                       </label>
@@ -931,21 +1173,33 @@ function GeneratorPosterPage() {
                 <div style={{ display: 'grid', gap: '1rem' }}>
                   <label className="generator-form-field">
                     <span>Eigener Upload / Screenshot</span>
-                    <input type="file" accept="image/*" onChange={handleUploadImage} />
+                    <input ref={uploadInputRef} type="file" accept="image/*" onChange={handleUploadImage} />
                   </label>
                   <p className="generator-field-hint">
-                    Keine automatische Screenshot-Erstellung. Generator-Posts werden direkt versendet; nur Copybot-Deals laufen ueber Queue und Worker.
+                    Keine automatische Screenshot-Erstellung. Du entscheidest pro Generator-Deal zwischen Direct Publish und Publishing Queue.
                   </p>
-                  {(scrapedImageUrl || uploadedImageDataUrl) && (
-                    <div className="split-row">
-                      <div className="card" style={{ padding: '0.85rem' }}>
-                        <p className="section-title">Standardbild</p>
-                        <strong>{scrapedImageUrl ? 'vorhanden' : 'nicht vorhanden'}</strong>
+                  {generatorPreviewImageUrl && (
+                    <div className="generator-image-preview-card">
+                      <div className="generator-image-preview-meta">
+                        <div>
+                          <p className="section-title">{hasUploadedImage ? 'Aktives Upload-Bild' : 'Aktives Standardbild'}</p>
+                          <strong>{generatorPreviewImageLabel}</strong>
+                        </div>
+                        {hasUploadedImage && (
+                          <button
+                            type="button"
+                            className="generator-action-button secondary compact"
+                            onClick={handleRemoveUploadedImage}
+                          >
+                            Bild entfernen
+                          </button>
+                        )}
                       </div>
-                      <div className="card" style={{ padding: '0.85rem' }}>
-                        <p className="section-title">Eigener Upload</p>
-                        <strong>{uploadedImageName || 'nicht vorhanden'}</strong>
-                      </div>
+                      <img
+                        className="generator-image-preview"
+                        src={generatorPreviewImageUrl}
+                        alt={hasUploadedImage ? 'Hochgeladenes Bild' : 'Standardbild'}
+                      />
                     </div>
                   )}
                   <div className="form-row">
@@ -965,7 +1219,7 @@ function GeneratorPosterPage() {
                   <div className="form-row">
                     <label className="generator-form-field">
                       <span>Telegram Bildquelle</span>
-                      <select value={telegramImageSource} onChange={(e) => setTelegramImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
+                      <select value={effectiveTelegramImageSource} onChange={(e) => setTelegramImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
                         {imageSourceOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
@@ -973,7 +1227,7 @@ function GeneratorPosterPage() {
                     </label>
                     <label className="generator-form-field">
                       <span>WhatsApp Bildquelle</span>
-                      <select value={whatsappImageSource} onChange={(e) => setWhatsappImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
+                      <select value={effectiveWhatsappImageSource} onChange={(e) => setWhatsappImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
                         {imageSourceOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
@@ -981,7 +1235,7 @@ function GeneratorPosterPage() {
                     </label>
                     <label className="generator-form-field">
                       <span>Facebook Bildquelle</span>
-                      <select value={facebookImageSource} onChange={(e) => setFacebookImageSource(e.target.value as 'standard' | 'upload' | 'none' | 'link_preview')}>
+                      <select value={effectiveFacebookImageSource} onChange={(e) => setFacebookImageSource(e.target.value as 'standard' | 'upload' | 'none' | 'link_preview')}>
                         {facebookImageSourceOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
@@ -1010,14 +1264,24 @@ function GeneratorPosterPage() {
 
               <section className="generator-panel generator-submit-panel">
                 {formError && formError !== 'Rabattgutschein fehlt.' && <p className="generator-form-error">{formError}</p>}
-                <button
-                  type="button"
-                  className="generator-action-button primary"
-                  onClick={handlePublish}
-                  disabled={publishing}
-                >
-                  {publishing ? 'Wird direkt gesendet...' : 'Sofort posten'}
-                </button>
+                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="generator-action-button secondary"
+                    onClick={() => void handlePublish('queue')}
+                    disabled={publishing}
+                  >
+                    {publishing ? 'Wird verarbeitet...' : 'In Queue legen'}
+                  </button>
+                  <button
+                    type="button"
+                    className="generator-action-button primary"
+                    onClick={() => void handlePublish('direct')}
+                    disabled={publishing}
+                  >
+                    {publishing ? 'Wird veroeffentlicht...' : 'Veroeffentlichen'}
+                  </button>
+                </div>
               </section>
             </>
           )}

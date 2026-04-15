@@ -3,14 +3,17 @@ import { savePostedDeal } from './dealHistoryService.js';
 
 export async function processTelegramPublishingTarget(target, queuePayload) {
   const imageSource = target.image_source;
+  const uploadedImage =
+    imageSource === 'upload'
+      ? queuePayload.imageVariants?.upload || ''
+      : '';
   const imageUrl =
     imageSource === 'standard'
       ? queuePayload.imageVariants?.standard || ''
-      : imageSource === 'upload'
-        ? queuePayload.imageVariants?.upload || ''
-        : '';
+      : '';
   const result = await sendTelegramPost({
     text: queuePayload.textByChannel?.telegram || queuePayload.title || '',
+    uploadedImage,
     imageUrl,
     rabattgutscheinCode: queuePayload.couponCode
   });

@@ -71,8 +71,65 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function parsePriceValue(value?: string | number): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  const rawValue = cleanText(typeof value === 'string' ? value : '');
+  console.log('FORMAT PRICE INPUT:', rawValue);
+  if (!rawValue) {
+    console.log('FORMAT PRICE OUTPUT:', '');
+    return null;
+  }
+
+  const sanitized = rawValue.replace(/[^\d.,-]/g, '');
+  if (!sanitized) {
+    console.log('FORMAT PRICE OUTPUT:', '');
+    return null;
+  }
+
+  const firstDecimalMatch = sanitized.match(/(\d+)[.,](\d{1,2})(?:[.,].*)?$/);
+  if (firstDecimalMatch) {
+    const parsed = Number.parseFloat(`${firstDecimalMatch[1]}.${firstDecimalMatch[2]}`);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const lastDot = sanitized.lastIndexOf('.');
+  const lastComma = sanitized.lastIndexOf(',');
+  const decimalIndex = Math.max(lastDot, lastComma);
+
+  if (decimalIndex > -1) {
+    const integerPart = sanitized.slice(0, decimalIndex).replace(/[^\d-]/g, '');
+    const decimalPart = sanitized.slice(decimalIndex + 1).replace(/[^\d]/g, '');
+    const normalizedDecimalPart = decimalPart.slice(0, 2);
+    const normalizedNumber = `${integerPart || '0'}${normalizedDecimalPart ? `.${normalizedDecimalPart}` : ''}`;
+    const parsed = Number.parseFloat(normalizedNumber);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const parsed = Number.parseFloat(sanitized.replace(/[^\d-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function formatPrice(value?: string | number): string {
+  const parsedValue = parsePriceValue(value);
+  if (parsedValue === null) {
+    console.log('FORMAT PRICE OUTPUT:', '');
+    return '';
+  }
+
+  const formattedValue = new Intl.NumberFormat('de-DE', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(parsedValue);
+  const finalValue = `${formattedValue}€`;
+  console.log('FORMAT PRICE OUTPUT:', finalValue);
+  return finalValue;
+}
+
 function normalizePrice(value?: string): string {
-  return cleanText(value).replace(/\s+/g, '');
+  return formatPrice(value);
 }
 
 function normalizeFreeText(value?: string): string {

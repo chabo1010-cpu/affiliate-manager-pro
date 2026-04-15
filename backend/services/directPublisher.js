@@ -49,17 +49,29 @@ function insertGeneratorPost(input = {}) {
 
 function getImageForSource(imageSource, input = {}) {
   if (imageSource === 'upload') {
-    return cleanText(input.uploadedImagePath);
+    return {
+      uploadedFile: input.uploadedImageFile || null,
+      uploadedImage: cleanText(input.uploadedImagePath),
+      imageUrl: ''
+    };
   }
 
   if (imageSource === 'standard') {
-    return cleanText(input.generatedImagePath);
+    return {
+      uploadedImage: '',
+      imageUrl: cleanText(input.generatedImagePath)
+    };
   }
 
-  return '';
+  return {
+    uploadedFile: null,
+    uploadedImage: '',
+    imageUrl: ''
+  };
 }
 
 export async function publishGeneratorPostDirect(input = {}) {
+  console.log('GENERATOR BYPASSES QUEUE');
   const generatorPostId = insertGeneratorPost(input);
   const postedAt = nowIso();
   const results = {
@@ -70,10 +82,13 @@ export async function publishGeneratorPostDirect(input = {}) {
   };
 
   if (input.enableTelegram !== false) {
-    const telegramImageUrl = getImageForSource(input.telegramImageSource, input);
+    const telegramImage = getImageForSource(input.telegramImageSource, input);
     const telegramResult = await sendTelegramPost({
       text: input.textByChannel?.telegram || input.title || '',
-      imageUrl: telegramImageUrl,
+      uploadedFile: telegramImage.uploadedFile,
+      uploadedImage: telegramImage.uploadedImage,
+      imageUrl: telegramImage.imageUrl,
+      disableWebPagePreview: !telegramImage.uploadedFile && !telegramImage.uploadedImage && !telegramImage.imageUrl,
       rabattgutscheinCode: input.couponCode
     });
 

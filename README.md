@@ -2,6 +2,18 @@
 
 Mobile-first Affiliate Posting Web-App mit React/Vite im Frontend und Node/Express im Backend.
 
+## Projektdokumentation
+
+Die zentrale technische Systemdokumentation liegt in `README_PROJECT.md`.
+
+Dort sind aktuell dokumentiert:
+
+- Generator
+- Copybot
+- Publishing Queue
+- Worker-System
+- Services, Datenmodell und Systemregeln
+
 ## Start
 
 1. Frontend:
@@ -16,13 +28,13 @@ Mobile-first Affiliate Posting Web-App mit React/Vite im Frontend und Node/Expre
 
 ## Struktur
 
-- `frontend/`: React App mit Routing, mobile-first UI und Formularen.
-- `backend/`: Express API mit vorbereiteten Routen und Mock-Daten.
+- `frontend/`: React-App mit Routing, UI und Workflows fuer Generator, Copybot und Publishing
+- `backend/`: Express-API mit Services, SQLite-Datenbank und Worker-Logik
 
 ## Funktionen
 
 - Login mit Rollen: `admin`, `editor`, `poster`, `viewer`
-- Dashboard für schnelle Einsicht
-- Generator Poster für Telegram/WhatsApp Posting
-- Templates, Scraper, Autobot, Logs, Team, Einstellungen
-- Dunkles, klares Design für Smartphones
+- Generator mit Queue oder Direct Publish
+- Copybot mit Quellen, Review und Regelwerk
+- Publishing Queue mit Worker-System
+- Einstellungen, Historie, Logs und Admin-Bereiche

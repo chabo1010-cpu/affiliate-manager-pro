@@ -421,6 +421,37 @@
   padding-bottom: 1.4rem;
 }
 
+.generator-image-preview-card {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem 1.05rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.generator-image-preview-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.generator-image-preview-meta strong {
+  color: #e6eef7;
+}
+
+.generator-image-preview {
+  width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: #ffffff;
+  padding: 2rem;
+}
+
 .generator-submit-panel .generator-action-button.primary {
   width: 100%;
   min-height: 3.5rem;
