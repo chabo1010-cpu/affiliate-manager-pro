@@ -8,11 +8,11 @@ import TemplatesPage from './pages/Templates';
 import ScraperPage from './pages/Scraper';
 import AutobotPage from './pages/Autobot';
 import LogsPage from './pages/Logs';
-import TeamPage from './pages/Team';
 import SettingsPage from './pages/Settings';
 import DealHistoryAdminPage from './pages/DealHistoryAdmin';
 import CopybotPage from './pages/Copybot';
 import PublishingPage from './pages/Publishing';
+import KeepaPage from './pages/Keepa';
 
 function App() {
   const { user } = useAuth();
@@ -41,8 +41,17 @@ function App() {
               <Route path="publishing/workers" element={<PublishingPage />} />
               <Route path="publishing/facebook" element={<PublishingPage />} />
               <Route path="publishing/logs" element={<PublishingPage />} />
+              <Route path="keepa" element={<KeepaPage />} />
+              <Route path="keepa/manual-search" element={<KeepaPage />} />
+              <Route path="keepa/automatik" element={<KeepaPage />} />
+              <Route path="keepa/ergebnisse" element={<KeepaPage />} />
+              <Route path="keepa/benachrichtigungen" element={<KeepaPage />} />
+              <Route path="keepa/einstellungen" element={<KeepaPage />} />
+              <Route path="keepa/verbrauch-logs" element={<KeepaPage />} />
+              <Route path="keepa/fake-drop-analyse" element={<KeepaPage />} />
+              <Route path="keepa/review-queue" element={<KeepaPage />} />
+              <Route path="keepa/lern-datenbank" element={<KeepaPage />} />
               <Route path="logs" element={<LogsPage />} />
-              <Route path="team" element={<TeamPage />} />
               <Route path="deal-history" element={<DealHistoryAdminPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />

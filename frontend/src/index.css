@@ -1092,7 +1092,7 @@ button.primary.full {
 
 .mobile-nav {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.6rem;
   margin-top: 0.9rem;
 }

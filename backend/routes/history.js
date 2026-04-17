@@ -7,7 +7,14 @@ router.get('/', (req, res) => {
   try {
     return res.json({
       success: true,
-      items: listDealsHistory({ sellerType: req.query?.sellerType || req.query?.marketplaceType })
+      items: listDealsHistory({
+        sellerType: req.query?.sellerType || req.query?.marketplaceType,
+        startDate: req.query?.startDate,
+        endDate: req.query?.endDate,
+        asin: req.query?.asin,
+        url: req.query?.url,
+        title: req.query?.title
+      })
     });
   } catch (error) {
     return res.status(500).json({

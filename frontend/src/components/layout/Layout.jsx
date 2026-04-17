@@ -1,12 +1,7 @@
-import { PropsWithChildren } from 'react';
 import Sidebar from './Sidebar';
 import MobileHeader from './MobileHeader';
 
-interface LayoutProps extends PropsWithChildren {
-  showSidebar?: boolean;
-}
-
-function Layout({ children, showSidebar = true }: LayoutProps) {
+function Layout({ children, showSidebar = true }) {
   return (
     <div className="app-layout">
       <MobileHeader />

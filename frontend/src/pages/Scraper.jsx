@@ -1,15 +1,25 @@
+import { useState } from 'react';
 import Layout from '../components/layout/Layout';
 import { scraperItems } from '../data/mock';
 
 function ScraperPage() {
+  const [status, setStatus] = useState('');
+
   return (
     <Layout>
       <div style={{ display: 'grid', gap: '1rem' }}>
         <section className="card" style={{ padding: '1.25rem' }}>
           <p className="section-title">Scraper</p>
           <h2 style={{ margin: '0.25rem 0 1rem', fontSize: '1.5rem' }}>Gefundene Produkte</h2>
-          <p className="text-muted">Mock-Daten für schnelle Kontrolle.</p>
+          <p className="text-muted">Mock-Daten fuer schnelle Kontrolle.</p>
         </section>
+
+        {status && (
+          <section className="card" style={{ padding: '1rem' }}>
+            <p style={{ margin: 0 }}>{status}</p>
+          </section>
+        )}
+
         <div style={{ display: 'grid', gap: '0.85rem' }}>
           {scraperItems.map((item) => (
             <section key={item.id} className="card" style={{ padding: '1rem', display: 'grid', gap: '0.5rem' }}>
@@ -20,7 +30,17 @@ function ScraperPage() {
                 </div>
                 <span className="badge">{item.price}</span>
               </div>
-              <button className="secondary small">{item.action}</button>
+              <button
+                type="button"
+                className="secondary small"
+                onClick={() =>
+                  setStatus(
+                    `"${item.title}" ist derzeit nur als sichere Vorschau sichtbar, weil fuer den Scraper keine riskante Live-Import-Logik ohne erlaubte Quelle aktiviert wird.`
+                  )
+                }
+              >
+                {item.action}
+              </button>
             </section>
           ))}
         </div>

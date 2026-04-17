@@ -10,16 +10,17 @@ const tabs = [
   { label: 'Worker Status', path: '/publishing/workers' },
   { label: 'Facebook Worker', path: '/publishing/facebook' },
   { label: 'Logs', path: '/publishing/logs' }
-] as const;
+];
 
 function PublishingPage() {
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin';
   const location = useLocation();
-  const [queue, setQueue] = useState<any[]>([]);
-  const [logs, setLogs] = useState<any[]>([]);
-  const [workerStatus, setWorkerStatus] = useState<any>(null);
+  const [queue, setQueue] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [workerStatus, setWorkerStatus] = useState(null);
   const [status, setStatus] = useState('');
+  const [loading, setLoading] = useState(true);
   const [facebookSettings, setFacebookSettings] = useState({
     facebookEnabled: false,
     facebookSessionMode: 'persistent',
@@ -29,7 +30,7 @@ function PublishingPage() {
 
   const currentTab = useMemo(() => tabs.find((item) => item.path === location.pathname)?.path || '/publishing', [location.pathname]);
 
-  async function apiFetch(path: string, options: RequestInit = {}) {
+  async function apiFetch(path, options = {}) {
     const response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
       headers: {
@@ -46,51 +47,78 @@ function PublishingPage() {
   }
 
   async function loadAll() {
-    const [queueData, logsData, workerData] = await Promise.all([
-      apiFetch('/api/publishing/queue'),
-      apiFetch('/api/publishing/logs'),
-      apiFetch('/api/publishing/workers/status')
-    ]);
-    setQueue(queueData.items || []);
-    setLogs(logsData.items || []);
-    setWorkerStatus(workerData);
-    setFacebookSettings({
-      facebookEnabled: Boolean(workerData?.facebook?.enabled),
-      facebookSessionMode: workerData?.facebook?.sessionMode || 'persistent',
-      facebookDefaultRetryLimit: Number(workerData?.facebook?.retryLimit || 3),
-      facebookDefaultTarget: workerData?.facebook?.defaultTarget || ''
-    });
+    setLoading(true);
+    try {
+      const [queueData, logsData, workerData] = await Promise.all([
+        apiFetch('/api/publishing/queue'),
+        apiFetch('/api/publishing/logs'),
+        apiFetch('/api/publishing/workers/status')
+      ]);
+      setQueue(queueData.items || []);
+      setLogs(logsData.items || []);
+      setWorkerStatus(workerData);
+      setFacebookSettings({
+        facebookEnabled: Boolean(workerData?.facebook?.enabled),
+        facebookSessionMode: workerData?.facebook?.sessionMode || 'persistent',
+        facebookDefaultRetryLimit: Number(workerData?.facebook?.retryLimit || 3),
+        facebookDefaultTarget: workerData?.facebook?.defaultTarget || ''
+      });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Publishing-Daten konnten nicht geladen werden.');
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
     void loadAll();
   }, [user?.role]);
 
-  async function runWorkers(channelType?: string) {
-    const data = await apiFetch('/api/publishing/workers/run', {
-      method: 'POST',
-      body: JSON.stringify({ channelType: channelType || null })
-    });
-    setStatus(`${data.items?.length || 0} Worker-Aufgaben verarbeitet.`);
-    void loadAll();
+  async function runWorkers(channelType) {
+    if (!isAdmin) {
+      return;
+    }
+
+    try {
+      const data = await apiFetch('/api/publishing/workers/run', {
+        method: 'POST',
+        body: JSON.stringify({ channelType: channelType || null })
+      });
+      setStatus(`${data.items?.length || 0} Worker-Aufgaben verarbeitet.`);
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Worker konnten nicht gestartet werden.');
+    }
   }
 
-  async function retryQueue(id: number) {
-    await apiFetch(`/api/publishing/queue/${id}/retry`, {
-      method: 'POST',
-      body: JSON.stringify({})
-    });
-    setStatus('Queue-Eintrag fuer Retry markiert.');
-    void loadAll();
+  async function retryQueue(id) {
+    try {
+      await apiFetch(`/api/publishing/queue/${id}/retry`, {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      setStatus('Queue-Eintrag fuer Retry markiert.');
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Queue-Retry fehlgeschlagen.');
+    }
   }
 
   async function saveFacebookWorker() {
-    await apiFetch('/api/publishing/facebook-worker', {
-      method: 'PUT',
-      body: JSON.stringify(facebookSettings)
-    });
-    setStatus('Facebook Worker gespeichert.');
-    void loadAll();
+    if (!isAdmin) {
+      return;
+    }
+
+    try {
+      await apiFetch('/api/publishing/facebook-worker', {
+        method: 'PUT',
+        body: JSON.stringify(facebookSettings)
+      });
+      setStatus('Facebook Worker gespeichert.');
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Facebook Worker konnte nicht gespeichert werden.');
+    }
   }
 
   return (
@@ -108,7 +136,9 @@ function PublishingPage() {
 
         {status && <section className="card" style={{ padding: '1rem' }}><p style={{ margin: 0 }}>{status}</p></section>}
 
-        {currentTab === '/publishing' && (
+        {loading && <section className="card" style={{ padding: '1rem' }}>Publishing-Daten werden geladen...</section>}
+
+        {!loading && currentTab === '/publishing' && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
               <div>
@@ -127,7 +157,7 @@ function PublishingPage() {
                   {item.source_type} · Retry {item.retry_count} · erstellt {new Date(item.created_at).toLocaleString('de-DE')}
                 </p>
                 <p className="text-muted" style={{ margin: 0 }}>
-                  Targets: {(item.targets || []).map((target: any) => `${target.channel_type}:${target.image_source}:${target.status}`).join(' | ')}
+                  Targets: {(item.targets || []).map((target) => `${target.channel_type}:${target.image_source}:${target.status}`).join(' | ')}
                 </p>
                 {isAdmin && <button className="secondary" onClick={() => void retryQueue(item.id)}>Erneut senden</button>}
               </div>
@@ -136,14 +166,14 @@ function PublishingPage() {
           </section>
         )}
 
-        {currentTab === '/publishing/workers' && (
+        {!loading && currentTab === '/publishing/workers' && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>
             <div>
               <p className="section-title">Worker Status</p>
               <h1 className="page-title">Dispatcher und Kanal-Worker</h1>
             </div>
             <div className="responsive-grid">
-              {(workerStatus?.channels || []).map((item: any) => (
+              {(workerStatus?.channels || []).map((item) => (
                 <div key={item.channel_type} className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
                   <strong>{item.channel_type}</strong>
                   <p className="text-muted" style={{ margin: 0 }}>waiting {item.waiting || 0}</p>
@@ -157,7 +187,7 @@ function PublishingPage() {
           </section>
         )}
 
-        {currentTab === '/publishing/facebook' && (
+        {!loading && currentTab === '/publishing/facebook' && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>
             <div>
               <p className="section-title">Facebook Worker</p>
@@ -179,7 +209,7 @@ function PublishingPage() {
           </section>
         )}
 
-        {currentTab === '/publishing/logs' && (
+        {!loading && currentTab === '/publishing/logs' && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>
             <div>
               <p className="section-title">Logs</p>

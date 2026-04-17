@@ -1,22 +1,8 @@
-export interface PostConfig {
-  productTitle?: string;
-  freiText?: string;
-  textBaustein?: string | string[];
-  alterPreis?: string;
-  neuerPreis?: string;
-  alterPreisLabel?: string;
-  neuerPreisLabel?: string;
-  amazonLink?: string;
-  werbung?: boolean;
-  extraOptions?: string[];
-  rabattgutscheinCode?: string;
-}
-
 export const INTERNAL_WITHOUT_OPTIONS = '__WITHOUT_OPTIONS__';
 export const WITHOUT_OPTIONS_LABEL = 'Ohne Optionen';
 export const COUPON_OPTION_LABEL = '\u{1F3F7} Rabattgutschein:';
 export const COUPON_LINE_PREFIX = '\u{1F3F7} Rabattgutschein:';
-export const MASTER_PRIMARY_OPTIONS: readonly string[] = [
+export const MASTER_PRIMARY_OPTIONS = [
   '\u2705 Coupon aktivieren',
   '\u2705 Werbeaktion aktivieren',
   '\u2705 Coupon + Werbeaktion aktivieren',
@@ -25,8 +11,8 @@ export const MASTER_PRIMARY_OPTIONS: readonly string[] = [
   '\u23F0\uFE0F Zeitlich begrenztes Angebot',
   '\u{1F4C9} Spar-Abo einrichten (jederzeit kündbar)',
   '\u2139\uFE0F Ab 4 Stück nochmals 5% Ersparnis'
-] as const;
-export const MASTER_EXTRA_OPTIONS: readonly string[] = [
+];
+export const MASTER_EXTRA_OPTIONS = [
   '\u2139\uFE0F Verschiedene Größen und Farben',
   '\u2139\uFE0F Über ‚Andere Verkäufer‘ in den Warenkorb legen',
   '\u2139\uFE0F Verschiedene Ausführungen',
@@ -35,7 +21,7 @@ export const MASTER_EXTRA_OPTIONS: readonly string[] = [
   COUPON_OPTION_LABEL,
   '\u2139\uFE0F Derzeit vorbestellbar',
   '\u2139\uFE0F Eventuell Verkäufer wechslen'
-] as const;
+];
 const OLD_PRICE_ICON = '\u{1F534}';
 const PRICE_ICON = '\u{1F525}';
 const LINK_ICON = '\u27A1\uFE0F';
@@ -43,26 +29,17 @@ const DEFAULT_PRIMARY_OPTION = INTERNAL_WITHOUT_OPTIONS;
 const DEFAULT_FREE_TEXT = '\u2139\uFE0F';
 const VALID_PRIMARY_OPTIONS = new Set(MASTER_PRIMARY_OPTIONS);
 
-type PostLine =
-  | { kind: 'title'; value: string }
-  | { kind: 'blank' }
-  | { kind: 'oldPrice'; label: string; price: string }
-  | { kind: 'price'; label: string; price: string }
-  | { kind: 'link'; value: string }
-  | { kind: 'text'; value: string }
-  | { kind: 'footer'; value: string };
-
 export const DEAL_IMAGE_RENDER = {
   width: 1200,
   height: 1200,
   fit: 'contain'
-} as const;
+};
 
-function cleanText(value?: string): string {
+function cleanText(value) {
   return value?.trim() || '';
 }
 
-function escapeHtml(value: string): string {
+function escapeHtml(value) {
   return value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -71,21 +48,18 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function parsePriceValue(value?: string | number): number | null {
+function parsePriceValue(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
   }
 
   const rawValue = cleanText(typeof value === 'string' ? value : '');
-  console.log('FORMAT PRICE INPUT:', rawValue);
   if (!rawValue) {
-    console.log('FORMAT PRICE OUTPUT:', '');
     return null;
   }
 
   const sanitized = rawValue.replace(/[^\d.,-]/g, '');
   if (!sanitized) {
-    console.log('FORMAT PRICE OUTPUT:', '');
     return null;
   }
 
@@ -112,10 +86,9 @@ function parsePriceValue(value?: string | number): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export function formatPrice(value?: string | number): string {
+export function formatPrice(value) {
   const parsedValue = parsePriceValue(value);
   if (parsedValue === null) {
-    console.log('FORMAT PRICE OUTPUT:', '');
     return '';
   }
 
@@ -124,15 +97,14 @@ export function formatPrice(value?: string | number): string {
     maximumFractionDigits: 2
   }).format(parsedValue);
   const finalValue = `${formattedValue}€`;
-  console.log('FORMAT PRICE OUTPUT:', finalValue);
   return finalValue;
 }
 
-function normalizePrice(value?: string): string {
+function normalizePrice(value) {
   return formatPrice(value);
 }
 
-function normalizeFreeText(value?: string): string {
+function normalizeFreeText(value) {
   const trimmed = cleanText(value);
   if (!trimmed || trimmed === DEFAULT_FREE_TEXT) {
     return '';
@@ -141,7 +113,7 @@ function normalizeFreeText(value?: string): string {
   return trimmed;
 }
 
-function normalizePrimaryOptions(value?: string | string[]): string[] {
+function normalizePrimaryOptions(value) {
   if (Array.isArray(value)) {
     return value.map(cleanText).filter(Boolean);
   }
@@ -150,26 +122,26 @@ function normalizePrimaryOptions(value?: string | string[]): string[] {
   return trimmed ? [trimmed] : [];
 }
 
-export function hasRealFreeText(value?: string): boolean {
+export function hasRealFreeText(value) {
   return normalizeFreeText(value).length > 0;
 }
 
-export function hasValidPrimaryOption(value?: string | string[]): boolean {
+export function hasValidPrimaryOption(value) {
   return normalizePrimaryOptions(value).some(
     (option) => option === WITHOUT_OPTIONS_LABEL || VALID_PRIMARY_OPTIONS.has(option)
   );
 }
 
-export function hasValidCouponOnlyCase(isCouponActive: boolean, couponCode?: string): boolean {
+export function hasValidCouponOnlyCase(isCouponActive, couponCode) {
   return isCouponActive && cleanText(couponCode).length > 0;
 }
 
 export function hasEffectivePostQualifier(
-  primaryOption?: string | string[],
-  freeText?: string,
+  primaryOption,
+  freeText,
   isCouponActive = false,
-  couponCode?: string
-): boolean {
+  couponCode
+) {
   return (
     hasValidPrimaryOption(primaryOption) ||
     hasRealFreeText(freeText) ||
@@ -177,8 +149,8 @@ export function hasEffectivePostQualifier(
   );
 }
 
-export function getOrderedSelectedOptions(config: PostConfig): string[] {
-  const lines: string[] = [];
+export function getOrderedSelectedOptions(config) {
+  const lines = [];
   const primaryOptions = normalizePrimaryOptions(config.textBaustein);
   const couponCode = cleanText(config.rabattgutscheinCode);
 
@@ -207,7 +179,7 @@ export function getOrderedSelectedOptions(config: PostConfig): string[] {
   return lines;
 }
 
-function buildStructuredPost(config: PostConfig): PostLine[] {
+function buildStructuredPost(config) {
   const title = cleanText(config.productTitle) || 'Amazon Produkt';
   const oldPrice = normalizePrice(config.alterPreis);
   const price = normalizePrice(config.neuerPreis);
@@ -217,7 +189,7 @@ function buildStructuredPost(config: PostConfig): PostLine[] {
   const optionLines = getOrderedSelectedOptions(config);
   const freeText = normalizeFreeText(config.freiText);
 
-  const lines: PostLine[] = [{ kind: 'title', value: title }, { kind: 'blank' }];
+  const lines = [{ kind: 'title', value: title }, { kind: 'blank' }];
 
   if (oldPrice) {
     lines.push({ kind: 'oldPrice', label: oldPriceLabel, price: oldPrice });
@@ -243,7 +215,7 @@ function buildStructuredPost(config: PostConfig): PostLine[] {
   return lines;
 }
 
-export function buildPostLines(config: PostConfig): string[] {
+export function buildPostLines(config) {
   return buildStructuredPost(config).map((line) => {
     switch (line.kind) {
       case 'title':
@@ -261,7 +233,7 @@ export function buildPostLines(config: PostConfig): string[] {
   });
 }
 
-function renderLine(line: PostLine, channel: 'telegram' | 'whatsapp'): string {
+function renderLine(line, channel) {
   if (channel === 'telegram') {
     switch (line.kind) {
       case 'title':
@@ -299,11 +271,11 @@ function renderLine(line: PostLine, channel: 'telegram' | 'whatsapp'): string {
   }
 }
 
-function buildBaseLines(config: PostConfig, channel: 'telegram' | 'whatsapp'): string[] {
+function buildBaseLines(config, channel) {
   return buildStructuredPost(config).map((line) => renderLine(line, channel));
 }
 
-export function generatePostText(config: PostConfig) {
+export function generatePostText(config) {
   const telegramCaption = buildBaseLines(config, 'telegram').join('\n');
   const whatsappText = buildBaseLines(config, 'whatsapp').join('\n');
   const rabattgutscheinCode = cleanText(config.rabattgutscheinCode);
@@ -316,7 +288,7 @@ export function generatePostText(config: PostConfig) {
   };
 }
 
-export function normalizeDealImageUrl(imageUrl?: string): string {
+export function normalizeDealImageUrl(imageUrl) {
   const trimmed = cleanText(imageUrl);
   if (!trimmed) {
     return '';
@@ -329,22 +301,22 @@ export function normalizeDealImageUrl(imageUrl?: string): string {
   return trimmed;
 }
 
-export function copyToClipboard(text: string): Promise<boolean> {
+export function copyToClipboard(text) {
   return navigator.clipboard
     .writeText(text)
     .then(() => true)
     .catch(() => false);
 }
 
-export function formatForTelegram(text: string): string {
+export function formatForTelegram(text) {
   return text;
 }
 
-export function formatForWhatsApp(text: string): string {
+export function formatForWhatsApp(text) {
   return text;
 }
 
-export function downloadAsText(text: string, filename: string = 'post.txt'): void {
+export function downloadAsText(text, filename = 'post.txt') {
   const element = document.createElement('a');
   element.setAttribute('href', `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`);
   element.setAttribute('download', filename);

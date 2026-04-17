@@ -2,10 +2,11 @@ import { NavLink } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 
 const mobileNav = [
-  { label: 'Home', path: '/', icon: '🏠' },
-  { label: 'Generator', path: '/generator', icon: '📝' },
-  { label: 'Copybot', path: '/copybot', icon: '🗂' },
-  { label: 'Publishing', path: '/publishing', icon: '📦' }
+  { label: 'Home', path: '/', icon: '\u{1F3E0}' },
+  { label: 'Generator', path: '/generator', icon: '\u{1F4DD}' },
+  { label: 'Keepa', path: '/keepa', icon: '\u{1F50C}' },
+  { label: 'Copybot', path: '/copybot', icon: '\u{1F5C2}' },
+  { label: 'Publishing', path: '/publishing', icon: '\u{1F4E6}' }
 ];
 
 function MobileHeader() {
@@ -25,6 +26,7 @@ function MobileHeader() {
           <NavLink
             key={item.path}
             to={item.path}
+            end={item.path === '/'}
             className={({ isActive }) => (isActive ? 'mobile-nav-link active' : 'mobile-nav-link')}
           >
             <span>{item.icon}</span>

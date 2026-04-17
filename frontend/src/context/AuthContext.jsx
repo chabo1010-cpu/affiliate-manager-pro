@@ -1,31 +1,20 @@
-import { createContext, PropsWithChildren, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-interface User {
-  username: string;
-  role: string;
-}
+const AuthContext = createContext(null);
 
-interface AuthContextType {
-  user: User | null;
-  login: (username: string) => void;
-  logout: () => void;
-}
-
-const AuthContext = createContext<AuthContextType | null>(null);
-
-const mockUsers: User[] = [
+const mockUsers = [
   { username: 'admin', role: 'admin' },
   { username: 'editor', role: 'editor' },
   { username: 'poster', role: 'poster' },
   { username: 'viewer', role: 'viewer' }
 ];
 
-export function AuthProvider({ children }: PropsWithChildren) {
+export function AuthProvider({ children }) {
   const navigate = useNavigate();
-  const [user, setUser] = useState<User | null>(() => {
+  const [user, setUser] = useState(() => {
     const raw = localStorage.getItem('affiliatemanager-user');
-    return raw ? (JSON.parse(raw) as User) : null;
+    return raw ? JSON.parse(raw) : null;
   });
 
   useEffect(() => {
@@ -36,7 +25,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     }
   }, [user]);
 
-  const login = (username: string) => {
+  const login = (username) => {
     const found = mockUsers.find((item) => item.username === username);
     if (found) {
       setUser(found);
@@ -49,7 +38,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     navigate('/login');
   };
 
-  const value = useMemo(() => ({ user, login, logout }), [user]);
+  const value = useMemo(() => ({ user, login, logout }), [user, navigate]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

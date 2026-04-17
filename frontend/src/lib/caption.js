@@ -1,16 +1,5 @@
-interface CaptionValues {
-  advertising: string | boolean;
-  oldPrice: string;
-  currentPrice: string;
-  oldIcon: string;
-  newIcon: string;
-  textBlock: string;
-  extraText: string;
-  link: string;
-}
-
-export function buildCaption(values: CaptionValues) {
-  const parts: string[] = [];
+export function buildCaption(values) {
+  const parts = [];
   if (values.advertising) {
     parts.push('🔸 Anzeige / Partnerlink');
   }

@@ -1,4 +1,4 @@
-import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '../components/layout/Layout';
 import {
   COUPON_LINE_PREFIX,
@@ -24,11 +24,11 @@ const imageSourceOptions = [
   { value: 'standard', label: 'Standardbild' },
   { value: 'upload', label: 'eigener Upload' },
   { value: 'none', label: 'kein Bild' }
-] as const;
+];
 const facebookImageSourceOptions = [
   ...imageSourceOptions,
   { value: 'link_preview', label: 'nur Link Preview' }
-] as const;
+];
 
 const oldIconOptions = ['Statt', 'Vorher', 'Alt'];
 const newIconOptions = ['Jetzt', 'Deal', 'Neu'];
@@ -40,15 +40,11 @@ const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
 const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
 const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
 
-function parseEnabledFlag(value: unknown) {
+function parseEnabledFlag(value) {
   return value === true || value === 1 || value === '1';
 }
 
-function parseBlockedFlag(value: unknown) {
-  return value === true || value === 1 || value === '1';
-}
-
-function formatDealDateTime(value: string) {
+function formatDealDateTime(value) {
   if (!value) {
     return null;
   }
@@ -67,7 +63,7 @@ function formatDealDateTime(value: string) {
   return `${day}.${month}.${year} ${hours}:${minutes}`;
 }
 
-function parseDealPriceValue(value: unknown) {
+function parseDealPriceValue(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
   }
@@ -80,7 +76,7 @@ function parseDealPriceValue(value: unknown) {
   return null;
 }
 
-function formatPriceRangeValue(value: number | null) {
+function formatPriceRangeValue(value) {
   if (value === null || Number.isNaN(value)) {
     return null;
   }
@@ -93,7 +89,7 @@ function formatPriceRangeValue(value: number | null) {
     .replace(/\s/g, '');
 }
 
-function formatRemainingTime(value: number) {
+function formatRemainingTime(value) {
   if (!value || value <= 0) {
     return '1 Minute';
   }
@@ -116,7 +112,7 @@ function formatRemainingTime(value: number) {
   return `${safeMinutes} ${minuteLabel}`;
 }
 
-function decodeHtmlEntities(text: string) {
+function decodeHtmlEntities(text) {
   if (typeof window === 'undefined' || !window.document) {
     return text;
   }
@@ -126,7 +122,7 @@ function decodeHtmlEntities(text: string) {
   return textarea.value;
 }
 
-function stripHtmlForValidation(text: string) {
+function stripHtmlForValidation(text) {
   const withoutTags = text.replace(/<[^>]*>/g, ' ');
   const decodedOnce = decodeHtmlEntities(withoutTags);
   const decodedTwice = decodeHtmlEntities(decodedOnce);
@@ -140,9 +136,9 @@ function stripHtmlForValidation(text: string) {
 function GeneratorPosterPage() {
   const [amazonLink, setAmazonLink] = useState('');
   const [advertising, setAdvertising] = useState(false);
-  const [selectedPrimaryOptions, setSelectedPrimaryOptions] = useState<string[]>([]);
+  const [selectedPrimaryOptions, setSelectedPrimaryOptions] = useState([]);
   const [expandedAdvanced, setExpandedAdvanced] = useState(false);
-  const [selectedExtras, setSelectedExtras] = useState<string[]>([]);
+  const [selectedExtras, setSelectedExtras] = useState([]);
   const [showOldPrice, setShowOldPrice] = useState(false);
   const [oldPrice, setOldPrice] = useState('');
   const [currentPrice, setCurrentPrice] = useState('');
@@ -153,36 +149,21 @@ function GeneratorPosterPage() {
   const [scraping, setScraping] = useState(false);
   const [hasScraped, setHasScraped] = useState(false);
   const [scrapedImageUrl, setScrapedImageUrl] = useState('');
-  const [uploadedImageFile, setUploadedImageFile] = useState<File | null>(null);
+  const [uploadedImageFile, setUploadedImageFile] = useState(null);
   const [uploadedImagePreviewUrl, setUploadedImagePreviewUrl] = useState('');
   const [uploadedImageName, setUploadedImageName] = useState('');
-  const [telegramImageSource, setTelegramImageSource] = useState<'standard' | 'upload' | 'none'>('standard');
-  const [whatsappImageSource, setWhatsappImageSource] = useState<'standard' | 'upload' | 'none'>('standard');
-  const [facebookImageSource, setFacebookImageSource] = useState<'standard' | 'upload' | 'none' | 'link_preview'>(
-    'link_preview'
-  );
+  const [telegramImageSource, setTelegramImageSource] = useState('standard');
+  const [whatsappImageSource, setWhatsappImageSource] = useState('standard');
+  const [facebookImageSource, setFacebookImageSource] = useState('link_preview');
   const [telegramEnabled, setTelegramEnabled] = useState(true);
   const [whatsappEnabled, setWhatsappEnabled] = useState(false);
   const [facebookEnabled, setFacebookEnabled] = useState(false);
   const [scrapedTitle, setScrapedTitle] = useState('');
   const [rabattgutscheinCode, setRabattgutscheinCode] = useState('');
   const [formError, setFormError] = useState('');
-  const [dealSnapshot, setDealSnapshot] = useState<{
-    asin: string;
-    finalUrl: string;
-    normalizedUrl: string;
-    sellerType: string;
-    lastPostedAt: string;
-    minPrice: number | null;
-    maxPrice: number | null;
-    postingCount: number;
-    blocked: boolean;
-    remainingMs: number;
-    cooldownEnabled: boolean;
-    cooldownHours: number;
-  } | null>(null);
-  const resetTimeoutRef = useRef<number | null>(null);
-  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const [dealSnapshot, setDealSnapshot] = useState(null);
+  const resetTimeoutRef = useRef(null);
+  const uploadInputRef = useRef(null);
   const { toast, showToast } = useToast();
   const rabattgutscheinAktiv = selectedExtras.includes(COUPON_OPTION_LABEL);
 
@@ -299,14 +280,6 @@ function GeneratorPosterPage() {
     return '';
   };
 
-  useEffect(() => {
-    console.log('GENERATOR FINAL TEXT:', finalPostText);
-    console.log('GENERATOR PREVIEW FINAL TEXT:', finalPostText);
-    console.log('GENERATOR VALIDATION RAW TEXT:', finalPostText);
-    console.log('GENERATOR VALIDATION CLEAN TEXT:', cleanValidationText);
-    console.log('GENERATOR VALIDATION RESULT:', isFinalPostTextValid);
-  }, [finalPostText, cleanValidationText, isFinalPostTextValid]);
-
   const resetGeneratorState = () => {
     setAmazonLink('');
     setAdvertising(false);
@@ -352,7 +325,6 @@ function GeneratorPosterPage() {
         return prev;
       }
 
-      console.log('Upload-Bild automatisch aktiviert');
       return 'upload';
     });
   }, [hasUploadedImage]);
@@ -367,7 +339,6 @@ function GeneratorPosterPage() {
         return prev;
       }
 
-      console.log('Bildquelle auf Standardbild zurueckgesetzt');
       return 'standard';
     });
 
@@ -376,7 +347,6 @@ function GeneratorPosterPage() {
         return prev;
       }
 
-      console.log('Bildquelle auf Standardbild zurueckgesetzt');
       return 'standard';
     });
 
@@ -385,12 +355,11 @@ function GeneratorPosterPage() {
         return prev;
       }
 
-      console.log('Bildquelle auf Standardbild zurueckgesetzt');
       return 'standard';
     });
   }, [hasUploadedImage]);
 
-  const handleTogglePrimaryOption = (option: string) => {
+  const handleTogglePrimaryOption = (option) => {
     setSelectedPrimaryOptions((prev) => {
       if (option === WITHOUT_OPTIONS_LABEL) {
         return prev.includes(WITHOUT_OPTIONS_LABEL) ? [] : [WITHOUT_OPTIONS_LABEL];
@@ -410,18 +379,10 @@ function GeneratorPosterPage() {
 
   const handleScrape = async () => {
     if (scraping) {
-      console.log('EARLY RETURN REASON', {
-        blocked: dealSnapshot?.blocked ?? null,
-        lastPostedAt: dealSnapshot?.lastPostedAt ?? null,
-        remainingSeconds: dealSnapshot?.remainingMs ? Math.ceil(dealSnapshot.remainingMs / 1000) : 0,
-        reason: 'already_scraping'
-      });
       return;
     }
 
     const finalAmazonLink = (amazonLink || '').trim();
-    console.log('SCRAPE BUTTON CLICK');
-    console.log('SCRAPE START', finalAmazonLink);
 
     if (!finalAmazonLink) {
       setHasScraped(false);
@@ -430,12 +391,6 @@ function GeneratorPosterPage() {
       setFormError('Link vergessen.');
       setDealSnapshot(null);
       showToast('Link vergessen.');
-      console.log('EARLY RETURN REASON', {
-        blocked: null,
-        lastPostedAt: null,
-        remainingSeconds: 0,
-        reason: 'missing_link'
-      });
       return;
     }
 
@@ -444,7 +399,6 @@ function GeneratorPosterPage() {
     setDealSnapshot(null);
 
     try {
-      console.log('SCRAPE REQUEST START');
       const response = await fetch(amazonScrapeApiUrl, {
         method: 'POST',
         headers: {
@@ -452,38 +406,14 @@ function GeneratorPosterPage() {
         },
         body: JSON.stringify({ url: finalAmazonLink })
       });
-      console.log('SCRAPE RESPONSE STATUS', response.status);
-
       const rawResponse = await response.text();
-      let data: {
-        success?: boolean;
-        error?: string;
-        code?: string;
-        message?: string;
-        image?: string;
-        title?: string;
-        price?: string;
-        oldPrice?: string;
-        link?: string;
-        asin?: string;
-        finalUrl?: string;
-        normalizedUrl?: string;
-        sellerType?: string;
-      } = {};
+      let data = {};
 
       try {
         data = rawResponse ? JSON.parse(rawResponse) : {};
       } catch {
         data = { error: rawResponse || 'Unbekannte Scrape-Antwort' };
       }
-
-      console.log('SCRAPE RESULT', {
-        ok: response.ok,
-        status: response.status,
-        data
-      });
-      console.log('SCRAPE RESPONSE', data);
-      console.log('SCRAPE RESPONSE DATA', data);
 
       if (!response.ok) {
         setHasScraped(false);
@@ -497,12 +427,6 @@ function GeneratorPosterPage() {
             data.code ||
             `Scrape fehlgeschlagen (${response.status}). Bitte Backend pruefen.`
         );
-        console.log('EARLY RETURN REASON', {
-          blocked: null,
-          lastPostedAt: null,
-          remainingSeconds: 0,
-          reason: 'scrape_request_failed'
-        });
         return;
       }
 
@@ -511,8 +435,6 @@ function GeneratorPosterPage() {
         url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
         normalizedUrl: data.normalizedUrl || ''
       };
-      console.log('CHECK PAYLOAD', checkPayload);
-
       const checkResponse = await fetch(dealsCheckApiUrl, {
         method: 'POST',
         headers: {
@@ -522,41 +444,13 @@ function GeneratorPosterPage() {
       });
 
       const checkRawResponse = await checkResponse.text();
-      let checkData: {
-        success?: boolean;
-        error?: string;
-        asin?: string;
-        resolvedFinalUrl?: string | null;
-        normalizedUrl?: string;
-        blocked?: boolean;
-        remainingSeconds?: number | null;
-        repostCooldownEnabled?: boolean;
-        repostCooldownHours?: number;
-        lastPostedAt?: string | null;
-        minPrice?: number | null;
-        maxPrice?: number | null;
-        postingCount?: number;
-        sellerType?: string | null;
-        lastDeal?: {
-          postedAt?: string;
-          sellerType?: string;
-          title?: string;
-          price?: string;
-        } | null;
-      } = {};
+      let checkData = {};
 
       try {
         checkData = checkRawResponse ? JSON.parse(checkRawResponse) : {};
       } catch {
         checkData = { error: checkRawResponse || 'Unbekannte Deal-Check-Antwort' };
       }
-
-      console.log('CHECK RESULT', {
-        status: checkResponse.status,
-        data: checkData
-      });
-      console.log('CHECK RESPONSE', checkData);
-      console.log('CHECK RESULT', checkData);
 
       if (!checkResponse.ok) {
         setHasScraped(false);
@@ -565,17 +459,10 @@ function GeneratorPosterPage() {
         setFormError('');
         setDealSnapshot(null);
         showToast(checkData.error || 'Deal-Check fehlgeschlagen.');
-        console.log('EARLY RETURN REASON', {
-          blocked: checkData?.blocked ?? null,
-          lastPostedAt: checkData?.lastPostedAt || checkData?.lastDeal?.postedAt || null,
-          remainingSeconds: checkData?.remainingSeconds ?? 0,
-          reason: 'deal_check_failed'
-        });
         return;
       }
 
       const isKnownDeal = Boolean(checkData.lastPostedAt || checkData.lastDeal?.postedAt);
-      console.log('KNOWN DEAL?', isKnownDeal);
 
       const nextDealSnapshot = {
         asin: checkData.asin || data.asin || '',
@@ -593,13 +480,6 @@ function GeneratorPosterPage() {
       };
 
       setDealSnapshot(nextDealSnapshot);
-      console.log('GENERATOR HISTORY META STATE', {
-        blocked: nextDealSnapshot.blocked,
-        lastPostedAt: nextDealSnapshot.lastPostedAt,
-        minPrice: nextDealSnapshot.minPrice,
-        maxPrice: nextDealSnapshot.maxPrice,
-        repostCooldownEnabled: nextDealSnapshot.cooldownEnabled
-      });
 
       const normalizedImageUrl = normalizeDealImageUrl(data.image || '');
       setScrapedImageUrl(normalizedImageUrl);
@@ -612,19 +492,11 @@ function GeneratorPosterPage() {
         const formattedBlockMessage = `Link bereits gepostet. Erneut möglich in ${formatRemainingTime(
           Number(checkData.remainingSeconds || 0)
         )}.`;
-        console.log('FORMATTED BLOCK MESSAGE', formattedBlockMessage);
         setFormError(formattedBlockMessage);
         setHasScraped(false);
-        console.log('EARLY RETURN REASON', {
-          blocked: true,
-          lastPostedAt: checkData.lastPostedAt || checkData.lastDeal?.postedAt || null,
-          remainingSeconds: checkData.remainingSeconds ?? 0,
-          reason: 'deal_blocked'
-        });
         return;
       }
 
-      console.log('FORMATTED BLOCK MESSAGE', '');
       setFormError('');
       setHasScraped(true);
       showToast(
@@ -639,7 +511,6 @@ function GeneratorPosterPage() {
     } catch (error) {
       const finalError =
         error instanceof Error ? error.message : 'Unbekannter Scrape-Fehler';
-      console.error('final error', error);
       setHasScraped(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
@@ -650,8 +521,8 @@ function GeneratorPosterPage() {
     }
   };
 
-  async function fileToDataUrl(file: File) {
-    return await new Promise<string>((resolve, reject) => {
+  async function fileToDataUrl(file) {
+    return await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => {
         if (typeof reader.result === 'string') {
@@ -668,10 +539,6 @@ function GeneratorPosterPage() {
 
   const buildGeneratorPayload = async () => {
     const uploadForQueue = hasUploadedImage && uploadedImageFile ? await fileToDataUrl(uploadedImageFile) : '';
-
-    if (hasUploadedImage && effectiveTelegramImageSource === 'upload') {
-      console.log('Generator verwendet Upload-Bild im Payload');
-    }
 
     return {
       title: scrapedTitle || generatedPost.productTitle,
@@ -698,7 +565,7 @@ function GeneratorPosterPage() {
     };
   };
 
-  const handlePublish = async (mode: 'direct' | 'queue') => {
+  const handlePublish = async (mode) => {
     if (publishing) return;
 
     if (!hasScraped) {
@@ -708,31 +575,12 @@ function GeneratorPosterPage() {
 
     const validationError = validateBeforePublish();
     if (validationError) {
-      console.log('GENERATOR VALIDATION RAW TEXT:', finalPostText);
-      console.log('GENERATOR VALIDATION CLEAN TEXT:', cleanValidationText);
-      console.log('GENERATOR VALIDATION RESULT:', isFinalPostTextValid);
-      console.log('GENERATOR VALIDATION FAILED: empty clean text');
-      console.log('GENERATOR VALIDATION FAILED PAYLOAD STATE:', {
-        finalPostText,
-        cleanValidationText,
-        payloadText: finalPostText
-      });
       setFormError(validationError);
       showToast(validationError);
       return;
     }
 
-    console.log('GENERATOR VALIDATION RAW TEXT:', finalPostText);
-    console.log('GENERATOR VALIDATION CLEAN TEXT:', cleanValidationText);
-    console.log('GENERATOR VALIDATION RESULT:', isFinalPostTextValid);
-
     if (!isFinalPostTextValid) {
-      console.log('GENERATOR VALIDATION FAILED: empty clean text');
-      console.log('GENERATOR VALIDATION FAILED PAYLOAD STATE:', {
-        finalPostText,
-        cleanValidationText,
-        payloadText: finalPostText
-      });
       showToast('Text ist erforderlich');
       return;
     }
@@ -741,18 +589,8 @@ function GeneratorPosterPage() {
     setPublishing(true);
 
     try {
-      if (mode === 'direct') {
-        console.log('GENERATOR DIRECT MODE');
-        console.log('GENERATOR USES QUEUE? false');
-        console.log('GENERATOR DIRECT PUBLISH START');
-        console.log('GENERATOR BYPASSES QUEUE');
-      } else {
-        console.log('GENERATOR USES QUEUE? true');
-        console.log('UNEXPECTED GENERATOR QUEUE PATH');
-      }
-
       const endpoint = mode === 'direct' ? directPublishApiUrl : publishingQueueApiUrl;
-      let response: Response;
+      let response;
 
       if (mode === 'direct') {
         const formData = new FormData();
@@ -781,11 +619,8 @@ function GeneratorPosterPage() {
         formData.append('enableFacebook', String(facebookEnabled));
 
         if (hasUploadedImage && uploadedImageFile) {
-          console.log('Generator verwendet Upload-Bild im Payload');
           formData.append('uploadedImageFile', uploadedImageFile);
         }
-
-        console.log('GENERATOR PAYLOAD TEXT:', finalPostText);
 
         response = await fetch(endpoint, {
           method: 'POST',
@@ -793,7 +628,6 @@ function GeneratorPosterPage() {
         });
       } else {
         const queuePayload = await buildGeneratorPayload();
-        console.log('GENERATOR PAYLOAD TEXT:', queuePayload.textByChannel?.telegram || '');
         response = await fetch(endpoint, {
           method: 'POST',
           headers: {
@@ -804,7 +638,7 @@ function GeneratorPosterPage() {
       }
 
       const rawResponse = await response.text();
-      let data: { success?: boolean; message?: string; error?: string; code?: string } = {};
+      let data = {};
 
       try {
         data = rawResponse ? JSON.parse(rawResponse) : {};
@@ -832,7 +666,6 @@ function GeneratorPosterPage() {
         resetTimeoutRef.current = null;
       }, SUCCESS_RESET_DELAY_MS);
     } catch (error) {
-      console.error(mode === 'direct' ? 'Direct publish error:' : 'Queue publish error:', error);
       const message =
         error instanceof Error
           ? mode === 'direct'
@@ -849,7 +682,7 @@ function GeneratorPosterPage() {
     }
   };
 
-  const handleToggleExtra = (option: string) => {
+  const handleToggleExtra = (option) => {
     setSelectedExtras((prev) => {
       const next = prev.includes(option) ? prev.filter((item) => item !== option) : [...prev, option];
       if (!next.includes(COUPON_OPTION_LABEL)) {
@@ -860,7 +693,7 @@ function GeneratorPosterPage() {
     });
   };
 
-  const handleToggleOldPrice = (checked: boolean) => {
+  const handleToggleOldPrice = (checked) => {
     setShowOldPrice(checked);
     if (!checked) {
       setOldPrice('');
@@ -868,7 +701,7 @@ function GeneratorPosterPage() {
     }
   };
 
-  const handleUploadImage = (event: ChangeEvent<HTMLInputElement>) => {
+  const handleUploadImage = (event) => {
     const file = event.target.files?.[0];
     if (!file) {
       if (uploadedImagePreviewUrl) {
@@ -899,7 +732,6 @@ function GeneratorPosterPage() {
     if (uploadInputRef.current) {
       uploadInputRef.current.value = '';
     }
-    console.log('Upload-Bild entfernt');
   };
 
   const formattedLastPostedAt = dealSnapshot ? formatDealDateTime(dealSnapshot.lastPostedAt) : null;
@@ -911,19 +743,6 @@ function GeneratorPosterPage() {
     Boolean(formattedLastPostedAt) &&
     Boolean(formattedMinPrice) &&
     Boolean(formattedMaxPrice);
-  console.log('GENERATOR SHOW HISTORY META', shouldShowHistoryMeta);
-  console.log('SHOW HISTORY META?', {
-    blocked: dealSnapshot?.blocked ?? null,
-    historyLastPostedAt: dealSnapshot?.lastPostedAt ?? null,
-    historyMinPrice: dealSnapshot?.minPrice ?? null,
-    historyMaxPrice: dealSnapshot?.maxPrice ?? null,
-    showHistoryMeta: shouldShowHistoryMeta
-  });
-  console.log('FORMATTED HISTORY META', {
-    formattedDate: formattedLastPostedAt,
-    formattedMinPrice,
-    formattedMaxPrice
-  });
   return (
     <Layout showSidebar>
       <div className="generator-desktop-page">
@@ -1219,7 +1038,7 @@ function GeneratorPosterPage() {
                   <div className="form-row">
                     <label className="generator-form-field">
                       <span>Telegram Bildquelle</span>
-                      <select value={effectiveTelegramImageSource} onChange={(e) => setTelegramImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
+                      <select value={effectiveTelegramImageSource} onChange={(e) => setTelegramImageSource(e.target.value)}>
                         {imageSourceOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
@@ -1227,7 +1046,7 @@ function GeneratorPosterPage() {
                     </label>
                     <label className="generator-form-field">
                       <span>WhatsApp Bildquelle</span>
-                      <select value={effectiveWhatsappImageSource} onChange={(e) => setWhatsappImageSource(e.target.value as 'standard' | 'upload' | 'none')}>
+                      <select value={effectiveWhatsappImageSource} onChange={(e) => setWhatsappImageSource(e.target.value)}>
                         {imageSourceOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
@@ -1235,7 +1054,7 @@ function GeneratorPosterPage() {
                     </label>
                     <label className="generator-form-field">
                       <span>Facebook Bildquelle</span>
-                      <select value={effectiveFacebookImageSource} onChange={(e) => setFacebookImageSource(e.target.value as 'standard' | 'upload' | 'none' | 'link_preview')}>
+                      <select value={effectiveFacebookImageSource} onChange={(e) => setFacebookImageSource(e.target.value)}>
                         {facebookImageSourceOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}

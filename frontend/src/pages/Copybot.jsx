@@ -13,117 +13,9 @@ const copybotTabs = [
   { label: 'Sampling & Qualitaet', path: '/copybot/sampling' },
   { label: 'Review Queue', path: '/copybot/review' },
   { label: 'Logs', path: '/copybot/logs' }
-] as const;
+];
 
-type CopybotTab = (typeof copybotTabs)[number]['path'];
-
-interface CopybotOverview {
-  copybotEnabled: boolean;
-  activeTelegramSources: number;
-  activeWhatsappSources: number;
-  pricingRulesCount: number;
-  reviewCount: number;
-  approvedCount: number;
-  rejectedCount: number;
-  lastProcessedSource: { id: number; name: string; platform: string; last_import_at: string } | null;
-  lastProcessedDeals: Array<{
-    id: number;
-    title: string;
-    status: string;
-    score: number;
-    seller_type: string;
-    detected_discount: number;
-    created_at: string;
-    source_name: string;
-    platform: string;
-  }>;
-}
-
-interface SourceItem {
-  id: number;
-  name: string;
-  platform: 'telegram' | 'whatsapp';
-  source_type: string;
-  is_active: number;
-  priority: number;
-  pricing_rule_id: number;
-  pricing_rule_name: string;
-  sampling_rule_id: number | null;
-  sampling_rule_name: string | null;
-  last_import_at: string | null;
-  success_rate: number | null;
-  notes: string | null;
-}
-
-interface PricingRuleItem {
-  id: number;
-  name: string;
-  is_active: number;
-  keepa_required: number;
-  idealo_required: number;
-  autopost_above_score: number;
-  manual_review_below_score: number;
-  allow_amazon: number;
-  min_discount_amazon: number;
-  min_score_amazon: number;
-  sampling_amazon: number;
-  allow_fba: number;
-  min_discount_fba: number;
-  min_score_fba: number;
-  sampling_fba: number;
-  allow_fbm: number;
-  min_discount_fbm: number;
-  min_score_fbm: number;
-  sampling_fbm: number;
-  fbm_requires_manual_review: number;
-  min_seller_rating_fbm: number | null;
-  fake_drop_filter_enabled: number;
-  coupon_only_penalty: number;
-  variant_switch_penalty: number;
-  marketplace_switch_penalty: number;
-  manual_blacklist_keywords: string[];
-  manual_whitelist_brands: string[];
-}
-
-interface SamplingRuleItem {
-  id: number;
-  name: string;
-  is_active: number;
-  default_sampling: number;
-  sampling_amazon: number;
-  sampling_fba: number;
-  sampling_fbm: number;
-  daily_limit: number | null;
-  min_score: number | null;
-  min_discount: number | null;
-  notes: string | null;
-}
-
-interface ReviewItem {
-  id: number;
-  source_name: string;
-  source_is_active: number;
-  title: string;
-  current_price: number | null;
-  seller_type: string;
-  detected_discount: number;
-  score: number;
-  keepa_result: { status?: string; ok?: boolean } | null;
-  comparison_result: { status?: string; ok?: boolean } | null;
-  decision_reason: string | null;
-  normalized_url: string;
-}
-
-interface LogItem {
-  id: number;
-  level: string;
-  event_type: string;
-  source_name: string | null;
-  message: string;
-  created_at: string;
-}
-
-function formatDateTime(value: string | null) {
+function formatDateTime(value) {
   if (!value) {
     return '-';
   }
@@ -144,17 +36,17 @@ function CopybotPage() {
   const isAdmin = user?.role === 'admin';
   const location = useLocation();
   const navigate = useNavigate();
-  const currentTab = useMemo<CopybotTab>(() => {
+  const currentTab = useMemo(() => {
     const match = copybotTabs.find((item) => item.path === location.pathname);
     return match?.path || '/copybot';
   }, [location.pathname]);
 
-  const [overview, setOverview] = useState<CopybotOverview | null>(null);
-  const [sources, setSources] = useState<SourceItem[]>([]);
-  const [pricingRules, setPricingRules] = useState<PricingRuleItem[]>([]);
-  const [samplingRules, setSamplingRules] = useState<SamplingRuleItem[]>([]);
-  const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
-  const [logs, setLogs] = useState<LogItem[]>([]);
+  const [overview, setOverview] = useState(null);
+  const [sources, setSources] = useState([]);
+  const [pricingRules, setPricingRules] = useState([]);
+  const [samplingRules, setSamplingRules] = useState([]);
+  const [reviewItems, setReviewItems] = useState([]);
+  const [logs, setLogs] = useState([]);
   const [status, setStatus] = useState('');
   const [loading, setLoading] = useState(true);
   const [sourceForm, setSourceForm] = useState({
@@ -212,7 +104,7 @@ function CopybotPage() {
     notes: ''
   });
 
-  async function apiFetch(path: string, options: RequestInit = {}) {
+  async function apiFetch(path, options = {}) {
     const response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
       headers: {
@@ -281,6 +173,17 @@ function CopybotPage() {
     }));
   }, [samplingRules]);
 
+  useEffect(() => {
+    if (sourceForm.id) {
+      return;
+    }
+
+    setSourceForm((prev) => ({
+      ...prev,
+      platform: currentTab === '/copybot/whatsapp-sources' ? 'whatsapp' : 'telegram'
+    }));
+  }, [currentTab, sourceForm.id]);
+
   const filteredSources = useMemo(() => {
     if (currentTab === '/copybot/telegram-sources') {
       return sources.filter((item) => item.platform === 'telegram');
@@ -298,13 +201,17 @@ function CopybotPage() {
       return;
     }
 
-    const data = await apiFetch('/api/copybot/settings', {
-      method: 'PUT',
-      body: JSON.stringify({ copybotEnabled: !overview.copybotEnabled })
-    });
+    try {
+      const data = await apiFetch('/api/copybot/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ copybotEnabled: !overview.copybotEnabled })
+      });
 
-    setOverview((prev) => (prev ? { ...prev, copybotEnabled: Boolean(data.copybotEnabled) } : prev));
-    setStatus(data.copybotEnabled ? 'Copybot global aktiviert.' : 'Copybot global deaktiviert.');
+      setOverview((prev) => (prev ? { ...prev, copybotEnabled: Boolean(data.copybotEnabled) } : prev));
+      setStatus(data.copybotEnabled ? 'Copybot global aktiviert.' : 'Copybot global deaktiviert.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Copybot-Status konnte nicht gespeichert werden.');
+    }
   }
 
   async function handleSaveSource() {
@@ -312,134 +219,178 @@ function CopybotPage() {
       return;
     }
 
-    const path = sourceForm.id ? `/api/copybot/sources/${sourceForm.id}` : '/api/copybot/sources';
-    const method = sourceForm.id ? 'PUT' : 'POST';
-    const data = await apiFetch(path, {
-      method,
-      body: JSON.stringify(sourceForm)
-    });
+    if (!sourceForm.name.trim()) {
+      setStatus('Bitte zuerst einen Quellnamen eintragen.');
+      return;
+    }
 
-    setSources((prev) => {
-      const unchanged = prev.filter((item) => item.platform !== sourceForm.platform);
-      return [...unchanged, ...(data.items || [])];
-    });
-    setStatus(sourceForm.id ? 'Quelle aktualisiert.' : 'Quelle angelegt.');
-    setSourceForm({
-      id: 0,
-      name: '',
-      platform: currentTab === '/copybot/whatsapp-sources' ? 'whatsapp' : 'telegram',
-      source_type: 'manual',
-      is_active: true,
-      priority: 100,
-      pricing_rule_id: pricingRules[0]?.id || 1,
-      sampling_rule_id: samplingRules[0]?.id || 1,
-      success_rate: '',
-      notes: ''
-    });
-    void loadAll();
+    if (!pricingRules.length) {
+      setStatus('Es ist mindestens eine Preispruef-Logik erforderlich.');
+      return;
+    }
+
+    try {
+      const path = sourceForm.id ? `/api/copybot/sources/${sourceForm.id}` : '/api/copybot/sources';
+      const method = sourceForm.id ? 'PUT' : 'POST';
+      await apiFetch(path, {
+        method,
+        body: JSON.stringify(sourceForm)
+      });
+
+      setStatus(sourceForm.id ? 'Quelle aktualisiert.' : 'Quelle angelegt.');
+      setSourceForm({
+        id: 0,
+        name: '',
+        platform: currentTab === '/copybot/whatsapp-sources' ? 'whatsapp' : 'telegram',
+        source_type: 'manual',
+        is_active: true,
+        priority: 100,
+        pricing_rule_id: pricingRules[0]?.id || 1,
+        sampling_rule_id: samplingRules[0]?.id || 1,
+        success_rate: '',
+        notes: ''
+      });
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Quelle konnte nicht gespeichert werden.');
+    }
   }
 
-  async function handleToggleSource(item: SourceItem) {
-    await apiFetch(`/api/copybot/sources/${item.id}/active`, {
-      method: 'PATCH',
-      body: JSON.stringify({ isActive: item.is_active !== 1 })
-    });
-    setStatus(`Quelle ${item.is_active === 1 ? 'deaktiviert' : 'aktiviert'}.`);
-    void loadAll();
+  async function handleToggleSource(item) {
+    try {
+      await apiFetch(`/api/copybot/sources/${item.id}/active`, {
+        method: 'PATCH',
+        body: JSON.stringify({ isActive: item.is_active !== 1 })
+      });
+      setStatus(`Quelle ${item.is_active === 1 ? 'deaktiviert' : 'aktiviert'}.`);
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Quellenstatus konnte nicht aktualisiert werden.');
+    }
   }
 
-  async function handleDeleteSource(item: SourceItem) {
-    await apiFetch(`/api/copybot/sources/${item.id}`, { method: 'DELETE' });
-    setStatus('Quelle deaktiviert.');
-    void loadAll();
+  async function handleDeleteSource(item) {
+    try {
+      await apiFetch(`/api/copybot/sources/${item.id}`, { method: 'DELETE' });
+      setStatus('Quelle deaktiviert.');
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Quelle konnte nicht deaktiviert werden.');
+    }
   }
 
-  async function handleTestSource(item: SourceItem) {
-    await apiFetch(`/api/copybot/sources/${item.id}/test`, {
-      method: 'POST',
-      body: JSON.stringify({})
-    });
-    setStatus('Quellentest ausgefuehrt.');
-    void loadAll();
+  async function handleTestSource(item) {
+    try {
+      await apiFetch(`/api/copybot/sources/${item.id}/test`, {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      setStatus('Quellentest ausgefuehrt.');
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Quellentest fehlgeschlagen.');
+    }
   }
 
   async function handleSavePricingRule() {
+    if (!pricingForm.name.trim()) {
+      setStatus('Bitte zuerst einen Namen fuer die Preispruef-Logik eintragen.');
+      return;
+    }
+
     const path = pricingForm.id
       ? `/api/copybot/pricing-rules/${pricingForm.id}`
       : '/api/copybot/pricing-rules';
     const method = pricingForm.id ? 'PUT' : 'POST';
 
-    await apiFetch(path, {
-      method,
-      body: JSON.stringify(pricingForm)
-    });
-    setStatus(pricingForm.id ? 'Preispruef-Logik aktualisiert.' : 'Preispruef-Logik angelegt.');
-    setPricingForm({
-      id: 0,
-      name: '',
-      is_active: true,
-      keepa_required: false,
-      idealo_required: false,
-      autopost_above_score: 85,
-      manual_review_below_score: 45,
-      allow_amazon: true,
-      min_discount_amazon: 15,
-      min_score_amazon: 70,
-      sampling_amazon: 100,
-      allow_fba: true,
-      min_discount_fba: 20,
-      min_score_fba: 75,
-      sampling_fba: 60,
-      allow_fbm: true,
-      min_discount_fbm: 40,
-      min_score_fbm: 82,
-      sampling_fbm: 20,
-      fbm_requires_manual_review: true,
-      min_seller_rating_fbm: '',
-      fake_drop_filter_enabled: false,
-      coupon_only_penalty: 5,
-      variant_switch_penalty: 8,
-      marketplace_switch_penalty: 6,
-      manual_blacklist_keywords: '',
-      manual_whitelist_brands: ''
-    });
-    void loadAll();
+    try {
+      await apiFetch(path, {
+        method,
+        body: JSON.stringify(pricingForm)
+      });
+      setStatus(pricingForm.id ? 'Preispruef-Logik aktualisiert.' : 'Preispruef-Logik angelegt.');
+      setPricingForm({
+        id: 0,
+        name: '',
+        is_active: true,
+        keepa_required: false,
+        idealo_required: false,
+        autopost_above_score: 85,
+        manual_review_below_score: 45,
+        allow_amazon: true,
+        min_discount_amazon: 15,
+        min_score_amazon: 70,
+        sampling_amazon: 100,
+        allow_fba: true,
+        min_discount_fba: 20,
+        min_score_fba: 75,
+        sampling_fba: 60,
+        allow_fbm: true,
+        min_discount_fbm: 40,
+        min_score_fbm: 82,
+        sampling_fbm: 20,
+        fbm_requires_manual_review: true,
+        min_seller_rating_fbm: '',
+        fake_drop_filter_enabled: false,
+        coupon_only_penalty: 5,
+        variant_switch_penalty: 8,
+        marketplace_switch_penalty: 6,
+        manual_blacklist_keywords: '',
+        manual_whitelist_brands: ''
+      });
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Preispruef-Logik konnte nicht gespeichert werden.');
+    }
   }
 
   async function handleSaveSamplingRule() {
+    if (!samplingForm.name.trim()) {
+      setStatus('Bitte zuerst einen Namen fuer die Sampling-Regel eintragen.');
+      return;
+    }
+
     const path = samplingForm.id
       ? `/api/copybot/sampling-rules/${samplingForm.id}`
       : '/api/copybot/sampling-rules';
     const method = samplingForm.id ? 'PUT' : 'POST';
 
-    await apiFetch(path, {
-      method,
-      body: JSON.stringify(samplingForm)
-    });
-    setStatus(samplingForm.id ? 'Sampling-Regel aktualisiert.' : 'Sampling-Regel angelegt.');
-    setSamplingForm({
-      id: 0,
-      name: '',
-      is_active: true,
-      default_sampling: 100,
-      sampling_amazon: 100,
-      sampling_fba: 100,
-      sampling_fbm: 100,
-      daily_limit: '',
-      min_score: '',
-      min_discount: '',
-      notes: ''
-    });
-    void loadAll();
+    try {
+      await apiFetch(path, {
+        method,
+        body: JSON.stringify(samplingForm)
+      });
+      setStatus(samplingForm.id ? 'Sampling-Regel aktualisiert.' : 'Sampling-Regel angelegt.');
+      setSamplingForm({
+        id: 0,
+        name: '',
+        is_active: true,
+        default_sampling: 100,
+        sampling_amazon: 100,
+        sampling_fba: 100,
+        sampling_fbm: 100,
+        daily_limit: '',
+        min_score: '',
+        min_discount: '',
+        notes: ''
+      });
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Sampling-Regel konnte nicht gespeichert werden.');
+    }
   }
 
-  async function handleReviewAction(id: number, action: 'approve' | 'reject') {
-    await apiFetch(`/api/copybot/review-queue/${id}/${action}`, {
-      method: 'POST',
-      body: JSON.stringify({})
-    });
-    setStatus(action === 'approve' ? 'Deal freigegeben.' : 'Deal verworfen.');
-    void loadAll();
+  async function handleReviewAction(id, action) {
+    try {
+      await apiFetch(`/api/copybot/review-queue/${id}/${action}`, {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      setStatus(action === 'approve' ? 'Deal freigegeben.' : 'Deal verworfen.');
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Review-Aktion fehlgeschlagen.');
+    }
   }
 
   function renderOverview() {
@@ -555,7 +506,7 @@ function CopybotPage() {
               <select
                 value={sourceForm.platform}
                 onChange={(event) =>
-                  setSourceForm((prev) => ({ ...prev, platform: event.target.value as 'telegram' | 'whatsapp' }))
+                  setSourceForm((prev) => ({ ...prev, platform: event.target.value }))
                 }
               >
                 <option value="telegram">telegram</option>
@@ -714,15 +665,15 @@ function CopybotPage() {
                     <span>Erlauben</span>
                     <input
                       type="checkbox"
-                      checked={Boolean(pricingForm[allowKey as keyof typeof pricingForm])}
+                      checked={Boolean(pricingForm[allowKey])}
                       onChange={(event) =>
                         setPricingForm((prev) => ({ ...prev, [allowKey]: event.target.checked }))
                       }
                     />
                   </label>
-                  <input type="number" placeholder="Min Rabatt" value={Number(pricingForm[discountKey as keyof typeof pricingForm])} onChange={(event) => setPricingForm((prev) => ({ ...prev, [discountKey]: Number(event.target.value || 0) }))} />
-                  <input type="number" placeholder="Min Score" value={Number(pricingForm[scoreKey as keyof typeof pricingForm])} onChange={(event) => setPricingForm((prev) => ({ ...prev, [scoreKey]: Number(event.target.value || 0) }))} />
-                  <input type="number" placeholder="Sampling %" value={Number(pricingForm[samplingKey as keyof typeof pricingForm])} onChange={(event) => setPricingForm((prev) => ({ ...prev, [samplingKey]: Number(event.target.value || 0) }))} />
+                  <input type="number" placeholder="Min Rabatt" value={Number(pricingForm[discountKey])} onChange={(event) => setPricingForm((prev) => ({ ...prev, [discountKey]: Number(event.target.value || 0) }))} />
+                  <input type="number" placeholder="Min Score" value={Number(pricingForm[scoreKey])} onChange={(event) => setPricingForm((prev) => ({ ...prev, [scoreKey]: Number(event.target.value || 0) }))} />
+                  <input type="number" placeholder="Sampling %" value={Number(pricingForm[samplingKey])} onChange={(event) => setPricingForm((prev) => ({ ...prev, [samplingKey]: Number(event.target.value || 0) }))} />
                 </div>
               ))}
             </div>

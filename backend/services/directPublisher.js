@@ -71,7 +71,6 @@ function getImageForSource(imageSource, input = {}) {
 }
 
 export async function publishGeneratorPostDirect(input = {}) {
-  console.log('GENERATOR BYPASSES QUEUE');
   const generatorPostId = insertGeneratorPost(input);
   const postedAt = nowIso();
   const results = {

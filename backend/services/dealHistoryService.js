@@ -427,57 +427,79 @@ export function savePostedDeal(input = {}) {
   };
 }
 
-export function listDealsHistory({ sellerType = '' } = {}) {
+export function listDealsHistory({
+  sellerType = '',
+  startDate = '',
+  endDate = '',
+  asin = '',
+  url = '',
+  title = ''
+} = {}) {
   const normalizedSellerType = cleanText(sellerType).toUpperCase();
+  const whereClauses = [];
+  const params = {};
 
-  return normalizedSellerType
-    ? db
-        .prepare(
-          `
-            SELECT
-              id,
-              asin,
-              url,
-              originalUrl,
-              normalizedUrl,
-              title,
-              productTitle,
-              price,
-              currentPrice,
-              oldPrice,
-              sellerType,
-              postedAt,
-              channel,
-              couponCode
-            FROM deals_history
-            WHERE sellerType = ?
-            ORDER BY postedAt DESC
-          `
-        )
-        .all(normalizedSellerType)
-    : db
-        .prepare(
-          `
-            SELECT
-              id,
-              asin,
-              url,
-              originalUrl,
-              normalizedUrl,
-              title,
-              productTitle,
-              price,
-              currentPrice,
-              oldPrice,
-              sellerType,
-              postedAt,
-              channel,
-              couponCode
-            FROM deals_history
-            ORDER BY postedAt DESC
-          `
-        )
-        .all();
+  if (normalizedSellerType) {
+    whereClauses.push(`sellerType = @sellerType`);
+    params.sellerType = normalizedSellerType;
+  }
+
+  const cleanAsin = cleanText(asin).toUpperCase();
+  if (cleanAsin) {
+    whereClauses.push(`asin LIKE @asin`);
+    params.asin = `%${cleanAsin}%`;
+  }
+
+  const cleanUrlValue = cleanText(url);
+  if (cleanUrlValue) {
+    whereClauses.push(`(url LIKE @url OR normalizedUrl LIKE @url OR originalUrl LIKE @url)`);
+    params.url = `%${cleanUrlValue}%`;
+  }
+
+  const cleanTitle = cleanText(title);
+  if (cleanTitle) {
+    whereClauses.push(`(title LIKE @title OR productTitle LIKE @title)`);
+    params.title = `%${cleanTitle}%`;
+  }
+
+  const parsedStartDate = cleanText(startDate) ? new Date(`${cleanText(startDate)}T00:00:00.000`) : null;
+  if (parsedStartDate && !Number.isNaN(parsedStartDate.getTime())) {
+    whereClauses.push(`postedAt >= @startDate`);
+    params.startDate = parsedStartDate.toISOString();
+  }
+
+  const parsedEndDate = cleanText(endDate) ? new Date(`${cleanText(endDate)}T23:59:59.999`) : null;
+  if (parsedEndDate && !Number.isNaN(parsedEndDate.getTime())) {
+    whereClauses.push(`postedAt <= @endDate`);
+    params.endDate = parsedEndDate.toISOString();
+  }
+
+  const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+  return db
+    .prepare(
+      `
+        SELECT
+          id,
+          asin,
+          url,
+          originalUrl,
+          normalizedUrl,
+          title,
+          productTitle,
+          price,
+          currentPrice,
+          oldPrice,
+          sellerType,
+          postedAt,
+          channel,
+          couponCode
+        FROM deals_history
+        ${whereSql}
+        ORDER BY postedAt DESC
+      `
+    )
+    .all(params);
 }
 
 export { cleanText, parseEnabledFlag, parseNumber };

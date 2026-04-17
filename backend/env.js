@@ -45,6 +45,16 @@ export function getTelegramConfig() {
   };
 }
 
+export function getKeepaConfig() {
+  return {
+    key: process.env.KEEPA_API_KEY?.trim() || '',
+    defaultDomainId: Number.parseInt(process.env.KEEPA_DEFAULT_DOMAIN_ID || '3', 10) || 3,
+    timeoutMs: Number.parseInt(process.env.KEEPA_TIMEOUT_MS || '12000', 10) || 12000,
+    retryLimit: Number.parseInt(process.env.KEEPA_RETRY_LIMIT || '2', 10) || 2,
+    requestIntervalMs: Number.parseInt(process.env.KEEPA_REQUEST_INTERVAL_MS || '1200', 10) || 1200
+  };
+}
+
 export function getApiPort() {
   return process.env.PORT || 4000;
 }

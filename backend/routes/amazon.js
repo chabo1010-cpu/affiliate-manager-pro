@@ -108,10 +108,7 @@ function extractSellerInfo(html) {
 
 async function handleScrape(req, res) {
   try {
-    console.log('SCRAPE ROUTE HIT');
-    console.log('REQ BODY:', req.body);
     const { url } = req.body ?? {};
-    console.log('REQ BODY URL:', url);
 
     if (!url || typeof url !== 'string' || !url.trim()) {
       return res.status(400).json({
@@ -160,7 +157,6 @@ async function handleScrape(req, res) {
     const asin = extractAsin(canonicalUrl) || extractAsin(trimmedUrl) || '';
     const normalizedUrl = normalizeAmazonLink(canonicalUrl || trimmedUrl);
     const sellerInfo = extractSellerInfo(html);
-    console.log('EXTRACTED ASIN', asin);
 
     return res.status(200).json({
       success: true,

@@ -74,7 +74,6 @@ function parseUploadedImage(uploadedImage) {
 
   const [metaPart, base64Data] = trimmedUploadedImage.split(',', 2);
   if (!base64Data) {
-    console.error('Uploaded image conversion failed: missing base64 payload');
     throw new Error('Upload-Bild ist unvollstaendig oder leer.');
   }
 
@@ -86,7 +85,6 @@ function parseUploadedImage(uploadedImage) {
     const buffer = Buffer.from(paddedBase64, 'base64');
 
     if (!buffer.length) {
-      console.error('Uploaded image conversion failed: empty buffer');
       throw new Error('Upload-Bild ist leer.');
     }
 
@@ -95,8 +93,7 @@ function parseUploadedImage(uploadedImage) {
       mimeType,
       filename: `upload.${extension}`
     };
-  } catch (error) {
-    console.error('Uploaded image conversion failed:', error);
+  } catch {
     throw new Error('Upload-Bild konnte nicht in ein gueltiges Telegram-Bild umgewandelt werden.');
   }
 }
@@ -107,7 +104,6 @@ function normalizeUploadedFile(uploadedFile) {
   }
 
   if (!Buffer.isBuffer(uploadedFile.buffer) || uploadedFile.buffer.length === 0) {
-    console.error('Uploaded file conversion failed: empty buffer');
     throw new Error('Upload-Bild ist leer oder ungueltig.');
   }
 
@@ -127,8 +123,7 @@ function normalizeUploadedFile(uploadedFile) {
   };
 }
 
-async function normalizeImageForTelegram(inputBuffer, sourceLabel) {
-  console.log('IMAGE NORMALIZATION SOURCE:', sourceLabel);
+async function normalizeImageForTelegram(inputBuffer) {
   const innerWidth = NORMALIZED_POST_IMAGE.width - NORMALIZED_POST_IMAGE.padding * 2;
   const innerHeight = NORMALIZED_POST_IMAGE.height - NORMALIZED_POST_IMAGE.padding * 2;
 
@@ -160,9 +155,6 @@ async function normalizeImageForTelegram(inputBuffer, sourceLabel) {
     ])
     .png()
     .toBuffer();
-
-  console.log('IMAGE NORMALIZATION APPLIED');
-  console.log('WHITE BORDER APPLIED');
 
   return {
     buffer: normalizedBuffer,
@@ -230,9 +222,6 @@ export async function sendTelegramPost({
   let telegramData;
 
   if (parsedUploadedImage) {
-    console.log('GENERATOR SEND MODE: IMAGE_UPLOAD');
-    console.log('GENERATOR TELEGRAM SEND WITH IMAGE');
-    console.log('Upload Bild verwendet');
     const normalizedImage = await normalizeImageForTelegram(parsedUploadedImage.buffer, 'upload');
     const formData = new FormData();
     formData.append('chat_id', finalChatId);
@@ -247,9 +236,6 @@ export async function sendTelegramPost({
 
     ({ telegramResponse, telegramData } = await sendTelegramMultipartRequest(token, telegramMethod, formData));
   } else if (effectiveImageUrl) {
-    console.log('GENERATOR SEND MODE: STANDARD_IMAGE');
-    console.log('GENERATOR TELEGRAM SEND WITH IMAGE');
-    console.log('Fallback Amazon Bild');
     const normalizedImage = await fetchAndNormalizeImageUrl(effectiveImageUrl);
     const formData = new FormData();
     formData.append('chat_id', finalChatId);
@@ -264,9 +250,6 @@ export async function sendTelegramPost({
 
     ({ telegramResponse, telegramData } = await sendTelegramMultipartRequest(token, telegramMethod, formData));
   } else {
-    console.log('GENERATOR SEND MODE: TEXT_ONLY');
-    console.log('GENERATOR TELEGRAM PREVIEW DISABLED');
-    console.log('GENERATOR TELEGRAM SEND TEXT ONLY WITHOUT LINK PREVIEW');
     ({ telegramResponse, telegramData } = await sendTelegramRequest(token, telegramMethod, {
       chat_id: finalChatId,
       text: String(text),

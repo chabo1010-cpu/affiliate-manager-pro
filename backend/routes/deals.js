@@ -4,7 +4,6 @@ import {
   checkDealCooldown,
   extractAsin,
   getRepostSettings,
-  getRepostSettingsRow,
   listDealsHistory,
   normalizeAmazonLink,
   savePostedDeal,
@@ -38,8 +37,6 @@ async function resolveDealIdentity(inputUrl) {
   let asin = extractAsin(rawUrl);
   let normalizedFinalUrl = normalizeAmazonLink(rawUrl);
 
-  console.log('RAW INPUT URL', rawUrl);
-
   if (!rawUrl) {
     return { rawUrl, resolvedFinalUrl, asin, normalizedFinalUrl };
   }
@@ -57,12 +54,9 @@ async function resolveDealIdentity(inputUrl) {
     resolvedFinalUrl = canonicalUrl || response.url || rawUrl;
     asin = extractAsin(resolvedFinalUrl) || extractAsin(response.url || '') || asin;
     normalizedFinalUrl = normalizeAmazonLink(resolvedFinalUrl || rawUrl);
-  } catch (error) {
-    console.log('CHECK RESOLVE FAILED', error instanceof Error ? error.message : error);
+  } catch {
+    return { rawUrl, resolvedFinalUrl, asin, normalizedFinalUrl };
   }
-
-  console.log('RESOLVED FINAL URL', resolvedFinalUrl);
-  console.log('EXTRACTED ASIN', asin);
 
   return { rawUrl, resolvedFinalUrl, asin, normalizedFinalUrl };
 }
@@ -86,7 +80,6 @@ router.get('/', async (req, res) => {
 
 router.post('/check', async (req, res) => {
   const { url = '', asin = '', normalizedUrl = '' } = req.body ?? {};
-  console.log('CHECK REQUEST BODY', req.body);
 
   if (
     (!url || typeof url !== 'string' || !url.trim()) &&
@@ -117,9 +110,6 @@ router.post('/check', async (req, res) => {
     identity.resolvedFinalUrl = identity.resolvedFinalUrl || identity.normalizedFinalUrl || identity.rawUrl;
     identity.normalizedFinalUrl = identity.normalizedFinalUrl || normalizeAmazonLink(identity.resolvedFinalUrl);
     identity.asin = identity.asin || extractAsin(identity.resolvedFinalUrl) || extractAsin(identity.normalizedFinalUrl);
-    console.log('RAW INPUT URL', identity.rawUrl);
-    console.log('RESOLVED FINAL URL', identity.resolvedFinalUrl);
-    console.log('EXTRACTED ASIN', identity.asin);
   }
 
   const result = checkDealCooldown({
@@ -141,17 +131,6 @@ router.post('/check', async (req, res) => {
     resolvedFinalUrl: identity.resolvedFinalUrl || null,
     lastDeal: result.lastDeal || null
   };
-
-  console.log('DEALS CHECK RESPONSE', {
-    blocked: responsePayload.blocked,
-    lastPostedAt: responsePayload.lastPostedAt,
-    minPrice: responsePayload.minPrice,
-    maxPrice: responsePayload.maxPrice,
-    sellerType: responsePayload.sellerType,
-    remainingSeconds: responsePayload.remainingSeconds
-  });
-  console.log('FINAL CHECK RESPONSE', responsePayload);
-  console.log('CHECK FINAL RESPONSE', responsePayload);
 
   return res.status(200).json(responsePayload);
 });
@@ -176,13 +155,19 @@ router.post('/save', (req, res) => {
 router.get('/history', (req, res) => {
   return res.status(200).json({
     success: true,
-    items: listDealsHistory({ sellerType: req.query?.sellerType || req.query?.marketplaceType })
+    items: listDealsHistory({
+      sellerType: req.query?.sellerType || req.query?.marketplaceType,
+      startDate: req.query?.startDate,
+      endDate: req.query?.endDate,
+      asin: req.query?.asin,
+      url: req.query?.url,
+      title: req.query?.title
+    })
   });
 });
 
 router.get('/settings', (req, res) => {
   try {
-    console.log('SETTINGS LOAD ROUTE HIT');
     db.exec(`
       CREATE TABLE IF NOT EXISTS app_settings (
         id INTEGER PRIMARY KEY,
@@ -192,12 +177,7 @@ router.get('/settings', (req, res) => {
       )
     `);
 
-    const row = getRepostSettingsRow();
     const settings = getRepostSettings();
-
-    console.log('SETTINGS LOAD ROW', row);
-    console.log('SETTINGS USED IN DEAL-HISTORY LOAD', row);
-    console.log('SETTINGS LOAD RESPONSE', settings);
 
     return res.json({
       repostCooldownEnabled: settings.repostCooldownEnabled,
@@ -214,9 +194,6 @@ router.get('/settings', (req, res) => {
 
 const saveSettingsHandler = (req, res) => {
   try {
-    console.log('SETTINGS SAVE ROUTE HIT');
-    console.log('SETTINGS SAVE REQUEST BODY', req.body);
-
     const rawEnabled = req.body?.repostCooldownEnabled;
     const rawHours = req.body?.repostCooldownHours;
     const rawTelegramCopyButtonText = req.body?.telegramCopyButtonText;
@@ -250,17 +227,11 @@ const saveSettingsHandler = (req, res) => {
         telegramCopyButtonText TEXT NOT NULL DEFAULT '📋 Zum Kopieren hier klicken'
       )
     `);
-    console.log('SETTINGS SAVE DB BEFORE', db.prepare(`SELECT * FROM app_settings WHERE id = 1`).get());
-
     const saved = saveRepostSettings({
       repostCooldownEnabled: enabled ? 1 : 0,
       repostCooldownHours: hours,
       telegramCopyButtonText: wantsToSaveTelegramCopyButtonText ? rawTelegramCopyButtonText : undefined
     });
-
-    console.log('SETTINGS SAVE FINAL', { enabled, hours });
-    console.log('SETTINGS SAVE DB AFTER', saved);
-    console.log('APP SETTINGS ROW AFTER SAVE', saved);
 
     return res.json({
       success: true,

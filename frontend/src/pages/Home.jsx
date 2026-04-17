@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import { quickLinks, homeCards } from '../data/mock';
 
@@ -27,10 +28,10 @@ function HomePage() {
           <p className="section-title">Schnellzugriffe</p>
           <div style={{ display: 'grid', gap: '0.75rem' }}>
             {quickLinks.map((item) => (
-              <a key={item.title} href={item.path} className="radio-card" style={{ justifyContent: 'space-between' }}>
+              <Link key={item.title} to={item.path} className="radio-card" style={{ justifyContent: 'space-between' }}>
                 <span>{item.title}</span>
                 <span>{item.icon}</span>
-              </a>
+              </Link>
             ))}
           </div>
         </section>

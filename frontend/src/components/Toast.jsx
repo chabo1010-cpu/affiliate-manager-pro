@@ -1,11 +1,6 @@
 import { useEffect, useState } from 'react';
 
-interface ToastProps {
-  message: string;
-  duration?: number;
-}
-
-export function Toast({ message, duration = 2000 }: ToastProps) {
+export function Toast({ message, duration = 2000 }) {
   const [visible, setVisible] = useState(true);
 
   useEffect(() => {
@@ -23,9 +18,9 @@ export function Toast({ message, duration = 2000 }: ToastProps) {
 }
 
 export function useToast() {
-  const [toast, setToast] = useState<ToastProps | null>(null);
+  const [toast, setToast] = useState(null);
 
-  const showToast = (message: string, duration = 2000) => {
+  const showToast = (message, duration = 2000) => {
     setToast({ message, duration });
     setTimeout(() => setToast(null), duration);
   };
