@@ -1,23 +1,30 @@
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 
-const mobileNav = [
+const baseMobileNav = [
   { label: 'Home', path: '/', icon: '\u{1F3E0}' },
   { label: 'Generator', path: '/generator', icon: '\u{1F4DD}' },
-  { label: 'Keepa', path: '/keepa', icon: '\u{1F50C}' },
-  { label: 'Copybot', path: '/copybot', icon: '\u{1F5C2}' },
+  { label: 'Scrapper', path: '/scraper', icon: '\u{1F50D}' },
   { label: 'Publishing', path: '/publishing', icon: '\u{1F4E6}' }
 ];
 
 function MobileHeader() {
   const { user } = useAuth();
+  const mobileNav =
+    user?.role === 'admin'
+      ? [
+          ...baseMobileNav.slice(0, 3),
+          { label: 'Logik-Zentrale', path: '/learning', icon: '\u{1F50C}' },
+          ...baseMobileNav.slice(3)
+        ]
+      : baseMobileNav;
 
   return (
     <header className="mobile-header">
       <div className="top-line">
         <div className="title-block">
           <h1>Affiliate Manager</h1>
-          <p>Willkommen, {user?.username}</p>
+          <p>Dashboard, Arbeitsbereiche und Output klar getrennt</p>
         </div>
         <span className="user-chip">{user?.role}</span>
       </div>

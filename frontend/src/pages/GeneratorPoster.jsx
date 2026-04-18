@@ -430,10 +430,15 @@ function GeneratorPosterPage() {
         return;
       }
 
+      const normalizedDealImageUrl = normalizeDealImageUrl(data.image || '');
       const checkPayload = {
         asin: data.asin || '',
         url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
-        normalizedUrl: data.normalizedUrl || ''
+        normalizedUrl: data.normalizedUrl || '',
+        sellerType: data.sellerType || '',
+        currentPrice: data.price || '',
+        title: data.title || '',
+        imageUrl: normalizedDealImageUrl || data.image || ''
       };
       const checkResponse = await fetch(dealsCheckApiUrl, {
         method: 'POST',
@@ -462,8 +467,6 @@ function GeneratorPosterPage() {
         return;
       }
 
-      const isKnownDeal = Boolean(checkData.lastPostedAt || checkData.lastDeal?.postedAt);
-
       const nextDealSnapshot = {
         asin: checkData.asin || data.asin || '',
         finalUrl: data.finalUrl || checkData.resolvedFinalUrl || data.normalizedUrl || '',
@@ -476,12 +479,13 @@ function GeneratorPosterPage() {
         blocked: checkData.blocked === true,
         remainingMs: Number(checkData.remainingSeconds || 0) * 1000,
         cooldownEnabled: parseEnabledFlag(checkData.repostCooldownEnabled),
-        cooldownHours: Number(checkData.repostCooldownHours ?? 12)
+        cooldownHours: Number(checkData.repostCooldownHours ?? 12),
+        generatorContext: checkData.generatorContext || null
       };
 
       setDealSnapshot(nextDealSnapshot);
 
-      const normalizedImageUrl = normalizeDealImageUrl(data.image || '');
+      const normalizedImageUrl = normalizedDealImageUrl;
       setScrapedImageUrl(normalizedImageUrl);
       setScrapedTitle(data.title || '');
       setOldPrice(formatPrice(data.oldPrice || ''));
@@ -509,8 +513,12 @@ function GeneratorPosterPage() {
         showToast('Produkttitel konnte nicht gelesen werden. Fallback wird verwendet.', 2600);
       }
     } catch (error) {
-      const finalError =
-        error instanceof Error ? error.message : 'Unbekannter Scrape-Fehler';
+      const rawErrorMessage = error instanceof Error ? error.message : 'Unbekannter Scrape-Fehler';
+      const isBackendConnectionError =
+        error instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(String(rawErrorMessage));
+      const finalError = isBackendConnectionError
+        ? `Backend nicht erreichbar unter ${amazonScrapeApiUrl}. Bitte Backend auf Port 4000 starten.`
+        : rawErrorMessage;
       setHasScraped(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
@@ -582,6 +590,13 @@ function GeneratorPosterPage() {
 
     if (!isFinalPostTextValid) {
       showToast('Text ist erforderlich');
+      return;
+    }
+
+    if (mode === 'direct' && !telegramEnabled) {
+      const message = 'Direct Publish ist aktuell nur mit aktiviertem Telegram-Kanal verfuegbar.';
+      setFormError(message);
+      showToast(message);
       return;
     }
 

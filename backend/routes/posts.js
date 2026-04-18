@@ -1,63 +1,21 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { publishGeneratorPostDirect } from '../services/directPublisher.js';
+import {
+  buildGeneratorDebugPayload,
+  getGeneratorValidationError,
+  logGeneratorDebug,
+  normalizeGeneratorInput
+} from '../services/generatorFlowService.js';
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
-function parseBoolean(value, fallback = false) {
-  if (value === undefined) {
-    return fallback;
-  }
-
-  return value === true || value === 'true' || value === 1 || value === '1';
-}
-
-function parseJsonObject(value, fallback = {}) {
-  if (!value) {
-    return fallback;
-  }
-
-  if (typeof value === 'object') {
-    return value;
-  }
-
-  if (typeof value !== 'string') {
-    return fallback;
-  }
-
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 function normalizeDirectPublishInput(req) {
-  const body = req.body ?? {};
-
-  const normalizedInput = {
-    title: body.title || '',
-    link: body.link || '',
-    normalizedUrl: body.normalizedUrl || '',
-    asin: body.asin || '',
-    sellerType: body.sellerType || 'FBM',
-    currentPrice: body.currentPrice || '',
-    oldPrice: body.oldPrice || '',
-    couponCode: body.couponCode || '',
-    textByChannel: parseJsonObject(body.textByChannel, {}),
-    generatedImagePath: body.generatedImagePath || '',
-    uploadedImagePath: req.file?.originalname || body.uploadedImagePath || '',
-    uploadedImageFile: req.file || null,
-    telegramImageSource: body.telegramImageSource || 'standard',
-    whatsappImageSource: body.whatsappImageSource || 'standard',
-    facebookImageSource: body.facebookImageSource || 'link_preview',
-    enableTelegram: parseBoolean(body.enableTelegram, true),
-    enableWhatsapp: parseBoolean(body.enableWhatsapp, false),
-    enableFacebook: parseBoolean(body.enableFacebook, false)
-  };
-
-  return normalizedInput;
+  return normalizeGeneratorInput({
+    ...(req.body ?? {}),
+    uploadedImagePath: req.file?.originalname || req.body?.uploadedImagePath || '',
+    uploadedImageFile: req.file || null
+  });
 }
 
 const posts = [
@@ -80,10 +38,34 @@ router.post('/', (req, res) => {
 });
 
 router.post('/direct', upload.single('uploadedImageFile'), async (req, res) => {
+  const normalizedInput = normalizeDirectPublishInput(req);
+  const debugPayload = buildGeneratorDebugPayload(normalizedInput);
+  logGeneratorDebug('api.posts.direct.request', debugPayload);
+
+  const validationError = getGeneratorValidationError(normalizedInput, { mode: 'direct' });
+  if (validationError) {
+    logGeneratorDebug('api.posts.direct.rejected', {
+      error: validationError,
+      ...debugPayload
+    });
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
   try {
-    const result = await publishGeneratorPostDirect(normalizeDirectPublishInput(req));
+    const result = await publishGeneratorPostDirect(normalizedInput);
+    logGeneratorDebug('api.posts.direct.success', {
+      result,
+      ...debugPayload
+    });
     return res.status(200).json(result);
   } catch (error) {
+    logGeneratorDebug('api.posts.direct.error', {
+      error: error instanceof Error ? error.message : 'Direkt-Posting fehlgeschlagen',
+      ...debugPayload
+    });
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Direkt-Posting fehlgeschlagen'

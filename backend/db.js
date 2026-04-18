@@ -7,6 +7,65 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const dataDir = path.join(__dirname, 'data');
 const dbPath = path.join(dataDir, 'deals.db');
+const DEFAULT_KEEPA_DRAWER_CONFIGS_JSON = JSON.stringify({
+  AMAZON: {
+    active: true,
+    sellerType: 'AMAZON',
+    trendInterval: 'week',
+    minDiscount: 20,
+    minPrice: null,
+    maxPrice: null,
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'require',
+    singleVariantOnly: false,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: true,
+    testGroupPostingAllowed: true
+  },
+  FBA: {
+    active: true,
+    sellerType: 'FBA',
+    trendInterval: 'week',
+    minDiscount: 25,
+    minPrice: null,
+    maxPrice: null,
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'exclude',
+    singleVariantOnly: false,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: true,
+    testGroupPostingAllowed: true
+  },
+  FBM: {
+    active: true,
+    sellerType: 'FBM',
+    trendInterval: 'month',
+    minDiscount: 35,
+    minPrice: null,
+    maxPrice: null,
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'exclude',
+    singleVariantOnly: true,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: true,
+    testGroupPostingAllowed: true
+  }
+});
 const DEFAULT_TELEGRAM_COPY_BUTTON_TEXT = '📋 Zum Kopieren hier klicken';
 
 if (!fs.existsSync(dataDir)) {
@@ -238,6 +297,7 @@ db.exec(`
     alert_max_per_product INTEGER NOT NULL DEFAULT 2,
     telegram_message_prefix TEXT,
     comparison_source_config_json TEXT NOT NULL DEFAULT '{}',
+    drawer_configs_json TEXT NOT NULL DEFAULT '${DEFAULT_KEEPA_DRAWER_CONFIGS_JSON}',
     logging_enabled INTEGER NOT NULL DEFAULT 1,
     estimated_tokens_per_manual_run INTEGER NOT NULL DEFAULT 8,
     created_at TEXT NOT NULL,
@@ -340,6 +400,13 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action TEXT NOT NULL,
     module TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'manual',
+    drawer_key TEXT,
+    timestamp_start TEXT,
+    timestamp_end TEXT,
+    tokens_before INTEGER,
+    tokens_after INTEGER,
+    tokens_used REAL NOT NULL DEFAULT 0,
     filters_json TEXT,
     result_count INTEGER,
     duration_ms INTEGER,
@@ -359,6 +426,23 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_action_created_at ON keepa_usage_logs (action, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_status_created_at ON keepa_usage_logs (request_status, created_at DESC);
 
+  CREATE TABLE IF NOT EXISTS amazon_api_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level TEXT NOT NULL DEFAULT 'info',
+    event_type TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    asin TEXT,
+    status TEXT NOT NULL DEFAULT 'info',
+    message TEXT NOT NULL,
+    request_meta_json TEXT,
+    response_meta_json TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_amazon_api_logs_created_at ON amazon_api_logs (created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_amazon_api_logs_status_created_at ON amazon_api_logs (status, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_amazon_api_logs_operation_created_at ON amazon_api_logs (operation, created_at DESC);
+
   CREATE TABLE IF NOT EXISTS keepa_usage_daily (
     usage_date TEXT NOT NULL,
     module TEXT NOT NULL,
@@ -367,6 +451,7 @@ db.exec(`
     result_count INTEGER NOT NULL DEFAULT 0,
     estimated_usage REAL NOT NULL DEFAULT 0,
     official_usage_value REAL,
+    tokens_used_total REAL NOT NULL DEFAULT 0,
     success_count INTEGER NOT NULL DEFAULT 0,
     error_count INTEGER NOT NULL DEFAULT 0,
     total_duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -577,6 +662,11 @@ ensureColumn(
   'comparison_source_config_json',
   `comparison_source_config_json TEXT NOT NULL DEFAULT '{}'`
 );
+ensureColumn(
+  'keepa_settings',
+  'drawer_configs_json',
+  `drawer_configs_json TEXT NOT NULL DEFAULT '${DEFAULT_KEEPA_DRAWER_CONFIGS_JSON}'`
+);
 ensureColumn('keepa_settings', 'logging_enabled', `logging_enabled INTEGER NOT NULL DEFAULT 1`);
 ensureColumn(
   'keepa_settings',
@@ -646,6 +736,15 @@ ensureColumn('keepa_review_items', 'chart_snapshot_json', `chart_snapshot_json T
 ensureColumn('keepa_review_items', 'example_bucket', `example_bucket TEXT`);
 ensureColumn('keepa_review_items', 'label_count', `label_count INTEGER NOT NULL DEFAULT 0`);
 ensureColumn('keepa_review_items', 'last_reviewed_at', `last_reviewed_at TEXT`);
+ensureColumn('imported_deals', 'learning_context_json', `learning_context_json TEXT`);
+ensureColumn('imported_deals', 'learning_decision', `learning_decision TEXT`);
+ensureColumn('generator_posts', 'asin', `asin TEXT`);
+ensureColumn('generator_posts', 'normalized_url', `normalized_url TEXT`);
+ensureColumn('generator_posts', 'seller_type', `seller_type TEXT NOT NULL DEFAULT 'FBM'`);
+ensureColumn('generator_posts', 'keepa_result_id', `keepa_result_id INTEGER`);
+ensureColumn('generator_posts', 'generator_context_json', `generator_context_json TEXT`);
+ensureColumn('generator_posts', 'telegram_message_id', `telegram_message_id TEXT`);
+ensureColumn('generator_posts', 'posted_channels_json', `posted_channels_json TEXT`);
 
 ensureColumn('keepa_review_labels', 'asin', `asin TEXT`);
 ensureColumn('keepa_review_labels', 'seller_type', `seller_type TEXT NOT NULL DEFAULT 'UNKNOWN'`);
@@ -687,6 +786,13 @@ db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_keepa_alerts_dedupe_key ON keepa_
 
 ensureColumn('keepa_usage_logs', 'action', `action TEXT NOT NULL DEFAULT 'manual-search'`);
 ensureColumn('keepa_usage_logs', 'module', `module TEXT NOT NULL DEFAULT 'manual-search'`);
+ensureColumn('keepa_usage_logs', 'mode', `mode TEXT NOT NULL DEFAULT 'manual'`);
+ensureColumn('keepa_usage_logs', 'drawer_key', `drawer_key TEXT`);
+ensureColumn('keepa_usage_logs', 'timestamp_start', `timestamp_start TEXT`);
+ensureColumn('keepa_usage_logs', 'timestamp_end', `timestamp_end TEXT`);
+ensureColumn('keepa_usage_logs', 'tokens_before', `tokens_before INTEGER`);
+ensureColumn('keepa_usage_logs', 'tokens_after', `tokens_after INTEGER`);
+ensureColumn('keepa_usage_logs', 'tokens_used', `tokens_used REAL NOT NULL DEFAULT 0`);
 ensureColumn('keepa_usage_logs', 'filters_json', `filters_json TEXT`);
 ensureColumn('keepa_usage_logs', 'result_count', `result_count INTEGER`);
 ensureColumn('keepa_usage_logs', 'duration_ms', `duration_ms INTEGER`);
@@ -701,6 +807,9 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_created_at ON keepa_usa
 db.exec(`CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_module_created_at ON keepa_usage_logs (module, created_at DESC)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_action_created_at ON keepa_usage_logs (action, created_at DESC)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_status_created_at ON keepa_usage_logs (request_status, created_at DESC)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_mode_created_at ON keepa_usage_logs (mode, created_at DESC)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_keepa_usage_logs_drawer_created_at ON keepa_usage_logs (drawer_key, created_at DESC)`);
+ensureColumn('keepa_usage_daily', 'tokens_used_total', `tokens_used_total REAL NOT NULL DEFAULT 0`);
 
 ensureColumn('deals_history', 'originalUrl', 'originalUrl TEXT');
 ensureColumn('deals_history', 'productTitle', 'productTitle TEXT');
@@ -837,6 +946,7 @@ db.prepare(
       alert_max_per_product,
       telegram_message_prefix,
       comparison_source_config_json,
+      drawer_configs_json,
       logging_enabled,
       estimated_tokens_per_manual_run,
       created_at,
@@ -863,6 +973,7 @@ db.prepare(
       2,
       'Keepa Alert',
       '{"manual-source":{"enabled":1},"idealo":{"enabled":0},"custom-api":{"enabled":0}}',
+      '${DEFAULT_KEEPA_DRAWER_CONFIGS_JSON}',
       1,
       8,
       @now,
@@ -892,6 +1003,7 @@ db.prepare(
         alert_max_per_product = COALESCE(alert_max_per_product, 2),
         telegram_message_prefix = COALESCE(telegram_message_prefix, 'Keepa Alert'),
         comparison_source_config_json = COALESCE(comparison_source_config_json, '{}'),
+        drawer_configs_json = COALESCE(drawer_configs_json, '${DEFAULT_KEEPA_DRAWER_CONFIGS_JSON}'),
         logging_enabled = COALESCE(logging_enabled, 1),
         estimated_tokens_per_manual_run = COALESCE(estimated_tokens_per_manual_run, 8),
         updated_at = @now

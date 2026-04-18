@@ -1,18 +1,36 @@
 import { getDb } from '../db.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
 
 const db = getDb();
 
 const ENGINE_VERSION = 'keepa-fake-drop-v1';
 const KEEPA_EPOCH_MS = Date.UTC(2011, 0, 1, 0, 0, 0, 0);
 const REVIEW_LABEL_CATALOG = [
-  { id: 'ja', label: 'Ja' },
-  { id: 'nein', label: 'Nein' },
-  { id: 'eventuell_gut', label: 'Eventuell gut' },
-  { id: 'ueberspringen', label: 'Ueberspringen' }
+  { id: 'approved', label: 'Good' },
+  { id: 'strong_deal', label: 'Strong Deal' },
+  { id: 'rejected', label: 'Rejected' },
+  { id: 'fake_drop', label: 'Fake' },
+  { id: 'weak_deal', label: 'Weak' },
+  { id: 'eventuell_gut', label: 'Review' },
+  { id: 'ueberspringen', label: 'Skip' },
+  { id: 'ja', label: 'Ja (Legacy)' },
+  { id: 'nein', label: 'Nein (Legacy)' }
 ];
+const REVIEW_LABEL_ALIASES = {
+  good: 'approved',
+  fake: 'fake_drop',
+  weak: 'weak_deal',
+  review: 'eventuell_gut'
+};
 const REVIEW_TAG_CATALOG = [
   { id: 'echter_deal', label: 'echter Deal' },
   { id: 'fake_drop', label: 'Fake-Drop' },
+  { id: 'strong_deal', label: 'Strong Deal' },
+  { id: 'weak_deal', label: 'Weak Deal' },
+  { id: 'amazon_ok', label: 'Amazon ok' },
+  { id: 'fba_ok', label: 'FBA ok' },
+  { id: 'fbm_bad', label: 'FBM schlecht' },
+  { id: 'testgruppe_freigabe', label: 'Testgruppe freigegeben' },
   { id: 'coupon_verdacht', label: 'Coupon-Verdacht' },
   { id: 'fba_fbm_trick', label: 'FBA/FBM-Trick' },
   { id: 'amazon_sauber', label: 'Amazon sauber' },
@@ -135,7 +153,8 @@ function normalizeClassification(value) {
 
 function normalizeReviewLabel(value) {
   const normalized = cleanText(String(value || '')).toLowerCase();
-  return REVIEW_LABEL_CATALOG.some((item) => item.id === normalized) ? normalized : 'ueberspringen';
+  const mapped = REVIEW_LABEL_ALIASES[normalized] || normalized;
+  return REVIEW_LABEL_CATALOG.some((item) => item.id === mapped) ? mapped : 'ueberspringen';
 }
 
 function normalizeReviewStatus(value) {
@@ -148,6 +167,46 @@ function normalizeTags(values) {
   return [...new Set(sourceValues.map((item) => cleanText(item).toLowerCase()))].filter((item) =>
     REVIEW_TAG_CATALOG.some((tag) => tag.id === item)
   );
+}
+
+function normalizeLearningSource(value) {
+  const normalized = cleanText(String(value || '')).toLowerCase();
+
+  if (!normalized) {
+    return 'keepa';
+  }
+
+  if (normalized.includes('generator')) {
+    return 'generator';
+  }
+
+  if (normalized.includes('scrapp') || normalized.includes('copybot') || normalized.includes('import')) {
+    return 'scrapper';
+  }
+
+  if (normalized.includes('amazon')) {
+    return 'amazon';
+  }
+
+  return 'keepa';
+}
+
+function getLearningSourceLabel(value) {
+  const sourceType = normalizeLearningSource(value);
+
+  if (sourceType === 'generator') {
+    return 'Generator';
+  }
+
+  if (sourceType === 'scrapper') {
+    return 'Scrapper';
+  }
+
+  if (sourceType === 'amazon') {
+    return 'Amazon API';
+  }
+
+  return 'Keepa';
 }
 
 function normalizeWeights(input) {
@@ -540,9 +599,9 @@ function getFeedbackAdjustments() {
       `
         SELECT
           seller_type,
-          SUM(CASE WHEN label = 'ja' THEN 1 ELSE 0 END) AS positive_count,
-          SUM(CASE WHEN label = 'nein' THEN 1 ELSE 0 END) AS negative_count,
-          SUM(CASE WHEN label = 'eventuell_gut' THEN 1 ELSE 0 END) AS uncertain_count
+          SUM(CASE WHEN label IN ('ja', 'approved', 'strong_deal') THEN 1 ELSE 0 END) AS positive_count,
+          SUM(CASE WHEN label IN ('nein', 'rejected', 'fake_drop', 'weak_deal') THEN 1 ELSE 0 END) AS negative_count,
+          SUM(CASE WHEN label IN ('eventuell_gut', 'ueberspringen') THEN 1 ELSE 0 END) AS uncertain_count
         FROM keepa_review_labels
         GROUP BY seller_type
       `
@@ -1257,10 +1316,28 @@ export function persistFakeDropAnalysis(resultInput, options = {}) {
   const snapshotId = upsertFeatureSnapshot(result, analysis);
   const scoreId = upsertScore(result, analysis);
   const reviewItemId = upsertReviewItem(result, analysis, scoreId, snapshotId);
+  const storedSnapshot = getFakeDropSnapshotForResult(result.id);
+
+  logGeneratorDebug('LEARNING CASE STORED', {
+    keepaResultId: result.id,
+    reviewItemId,
+    asin: result.asin,
+    sellerType: result.sellerType,
+    classification: analysis.classification,
+    sourceType: normalizeLearningSource(resultInput.origin || resultInput.sourceType)
+  });
+  logGeneratorDebug('PRICE HISTORY ATTACHED TO CASE', {
+    keepaResultId: result.id,
+    reviewItemId,
+    asin: result.asin,
+    sellerType: result.sellerType,
+    chartPointCount: Array.isArray(analysis.chartPoints) ? analysis.chartPoints.length : 0,
+    priceSeriesCount: Array.isArray(analysis.priceSeries) ? analysis.priceSeries.length : 0
+  });
 
   return {
     reviewItemId,
-    ...getFakeDropSnapshotForResult(result.id)
+    ...storedSnapshot
   };
 }
 
@@ -1591,6 +1668,257 @@ export function getFakeDropHistory(filters = {}) {
   };
 }
 
+function getReviewLabelPolarity(label) {
+  const normalized = normalizeReviewLabel(label);
+
+  if (['approved', 'strong_deal', 'ja'].includes(normalized)) {
+    return 'positive';
+  }
+
+  if (['rejected', 'fake_drop', 'weak_deal', 'nein'].includes(normalized)) {
+    return 'negative';
+  }
+
+  return 'uncertain';
+}
+
+function normalizeSimilarityFeatures(value) {
+  const source = value && typeof value === 'object' ? value : {};
+
+  return {
+    volatilityPct: parseNumber(source.volatilityPct, null),
+    referenceGapPct: parseNumber(source.referenceGapPct, null),
+    stableTailDays: parseNumber(source.stableTailDays, null),
+    historySpanDays: parseNumber(source.historySpanDays, null),
+    distanceToHistoricalLowPct: parseNumber(source.distanceToHistoricalLowPct, null),
+    spikeCount: parseInteger(source.spikeCount, 0),
+    reboundCount: parseInteger(source.reboundCount, 0),
+    zigZagCount: parseInteger(source.zigZagCount, 0),
+    offerSwitchCount: parseInteger(source.offerSwitchCount, 0),
+    historySparse: parseBool(source.historySparse, false)
+  };
+}
+
+function buildSimilarityReference(input = {}) {
+  return {
+    reviewItemId: parseInteger(input.reviewItemId ?? input.id, 0),
+    keepaResultId: parseInteger(input.keepaResultId, 0),
+    asin: cleanText(input.asin).toUpperCase(),
+    sellerType: normalizeSellerType(input.sellerType),
+    categoryName: cleanText(input.categoryName),
+    sourceType: normalizeLearningSource(input.sourceType || input.origin),
+    currentPrice: parseNumber(input.currentPrice, null),
+    keepaDiscount: parseNumber(input.keepaDiscount, null),
+    fakeDropRisk: parseNumber(input.fakeDropRisk, null),
+    classification: normalizeClassification(input.classification),
+    features: normalizeSimilarityFeatures(input.features)
+  };
+}
+
+function buildSimilarityCandidate(row) {
+  const features = normalizeSimilarityFeatures(fromJson(row.feature_json, {}));
+  const label = normalizeReviewLabel(row.current_label);
+
+  return {
+    reviewItemId: parseInteger(row.review_item_id, 0),
+    keepaResultId: parseInteger(row.keepa_result_id, 0),
+    asin: cleanText(row.asin).toUpperCase(),
+    title: row.title || '',
+    sellerType: normalizeSellerType(row.seller_type),
+    categoryName: cleanText(row.category_name),
+    sourceType: normalizeLearningSource(row.origin),
+    sourceLabel: getLearningSourceLabel(row.origin),
+    currentPrice: parseNumber(row.current_price, null),
+    keepaDiscount: parseNumber(row.keepa_discount, null),
+    fakeDropRisk: parseNumber(row.fake_drop_risk, null),
+    classification: normalizeClassification(row.classification),
+    label,
+    labelLabel: REVIEW_LABEL_CATALOG.find((item) => item.id === label)?.label || label,
+    note: row.note || '',
+    tags: fromJson(row.tags_json, []),
+    lastReviewedAt: row.last_reviewed_at || null,
+    features
+  };
+}
+
+function measureNumericDistance(left, right, weight, cap) {
+  if (left === null || right === null) {
+    return 0;
+  }
+
+  return Math.min(cap, Math.abs(left - right) * weight);
+}
+
+function measureRelativeDistance(left, right, weight, cap) {
+  if (left === null || right === null) {
+    return 0;
+  }
+
+  const reference = Math.max(Math.abs(left), Math.abs(right), 1);
+  return Math.min(cap, (Math.abs(left - right) / reference) * 100 * weight);
+}
+
+function computeSimilarityScore(reference, candidate) {
+  let score = 100;
+
+  score -= measureRelativeDistance(reference.currentPrice, candidate.currentPrice, 0.45, 24);
+  score -= measureNumericDistance(reference.keepaDiscount, candidate.keepaDiscount, 0.8, 18);
+  score -= measureNumericDistance(reference.fakeDropRisk, candidate.fakeDropRisk, 0.45, 22);
+  score -= measureNumericDistance(reference.features.volatilityPct, candidate.features.volatilityPct, 0.35, 12);
+  score -= measureNumericDistance(reference.features.referenceGapPct, candidate.features.referenceGapPct, 0.3, 10);
+  score -= measureNumericDistance(reference.features.distanceToHistoricalLowPct, candidate.features.distanceToHistoricalLowPct, 0.2, 10);
+  score -= measureNumericDistance(reference.features.stableTailDays, candidate.features.stableTailDays, 0.35, 9);
+  score -= measureNumericDistance(reference.features.historySpanDays, candidate.features.historySpanDays, 0.08, 8);
+  score -= measureNumericDistance(reference.features.spikeCount, candidate.features.spikeCount, 7, 10);
+  score -= measureNumericDistance(reference.features.reboundCount, candidate.features.reboundCount, 8, 10);
+  score -= measureNumericDistance(reference.features.zigZagCount, candidate.features.zigZagCount, 3.5, 8);
+  score -= measureNumericDistance(reference.features.offerSwitchCount, candidate.features.offerSwitchCount, 3.5, 8);
+
+  if (reference.classification === candidate.classification) {
+    score += 6;
+  }
+
+  if (reference.categoryName && candidate.categoryName && reference.categoryName === candidate.categoryName) {
+    score += 4;
+  }
+
+  if (reference.sourceType === candidate.sourceType) {
+    score += 2;
+  }
+
+  if (reference.features.historySparse === candidate.features.historySparse) {
+    score += 2;
+  }
+
+  return Math.round(clamp(score, 0, 100));
+}
+
+function buildSimilarCaseSummary(cases = []) {
+  const summary = cases.reduce(
+    (accumulator, item) => {
+      const bucket = getReviewLabelPolarity(item.label);
+      accumulator[`${bucket}Count`] += 1;
+      accumulator.total += 1;
+      accumulator.labelCounts[item.label] = (accumulator.labelCounts[item.label] || 0) + 1;
+      return accumulator;
+    },
+    {
+      total: 0,
+      positiveCount: 0,
+      negativeCount: 0,
+      uncertainCount: 0,
+      labelCounts: {}
+    }
+  );
+
+  const dominantLabel =
+    Object.entries(summary.labelCounts).sort((left, right) => right[1] - left[1])[0]?.[0] || null;
+  const rawRiskAdjustment =
+    summary.total >= 2 ? ((summary.negativeCount - summary.positiveCount) / Math.max(summary.total, 1)) * 12 : 0;
+  const riskAdjustment = Math.round(clamp(rawRiskAdjustment, -10, 10) * 10) / 10;
+  const scoreAdjustment = Math.round(clamp(-riskAdjustment * 0.9, -12, 12) * 10) / 10;
+
+  return {
+    ...summary,
+    dominantLabel,
+    dominantLabelLabel: dominantLabel
+      ? REVIEW_LABEL_CATALOG.find((item) => item.id === dominantLabel)?.label || dominantLabel
+      : null,
+    riskAdjustment,
+    scoreAdjustment
+  };
+}
+
+export function getSimilarCaseSignals(input = {}, options = {}) {
+  const reference = buildSimilarityReference(input);
+  if (!reference.sellerType || reference.sellerType === 'UNKNOWN') {
+    return {
+      sellerType: 'UNKNOWN',
+      consideredCount: 0,
+      matchedCount: 0,
+      cases: [],
+      summary: buildSimilarCaseSummary([])
+    };
+  }
+
+  const minSimilarityScore = clamp(parseInteger(options.minSimilarityScore, 56), 30, 95);
+  const limit = clamp(parseInteger(options.limit, 4), 1, 8);
+  const scanLimit = clamp(parseInteger(options.scanLimit, 60), 8, 120);
+  const rows = db
+    .prepare(
+      `
+        SELECT
+          kri.id AS review_item_id,
+          kri.keepa_result_id,
+          kri.current_label,
+          kri.tags_json,
+          kri.note,
+          kri.last_reviewed_at,
+          kr.asin,
+          kr.title,
+          kr.seller_type,
+          kr.category_name,
+          kr.current_price,
+          kr.keepa_discount,
+          kr.origin,
+          kfds.fake_drop_risk,
+          kfds.classification,
+          kfs.feature_json
+        FROM keepa_review_items kri
+        JOIN keepa_results kr ON kr.id = kri.keepa_result_id
+        LEFT JOIN keepa_fake_drop_scores kfds ON kfds.keepa_result_id = kri.keepa_result_id
+        LEFT JOIN keepa_feature_snapshots kfs ON kfs.keepa_result_id = kri.keepa_result_id
+        WHERE kr.seller_type = @sellerType
+          AND kri.current_label IS NOT NULL
+          AND kri.current_label != ''
+          AND (@excludeReviewItemId = 0 OR kri.id != @excludeReviewItemId)
+        ORDER BY COALESCE(kri.last_reviewed_at, kri.updated_at, kri.created_at) DESC
+        LIMIT @scanLimit
+      `
+    )
+    .all({
+      sellerType: reference.sellerType,
+      excludeReviewItemId: reference.reviewItemId || 0,
+      scanLimit
+    });
+  const similarCases = rows
+    .map((row) => {
+      const candidate = buildSimilarityCandidate(row);
+      return {
+        ...candidate,
+        similarityScore: computeSimilarityScore(reference, candidate)
+      };
+    })
+    .filter((item) => item.similarityScore >= minSimilarityScore)
+    .sort(
+      (left, right) =>
+        right.similarityScore - left.similarityScore || String(right.lastReviewedAt || '').localeCompare(String(left.lastReviewedAt || ''))
+    )
+    .slice(0, limit);
+  const summary = buildSimilarCaseSummary(similarCases);
+
+  if (options.skipLog !== true) {
+    logGeneratorDebug('SIMILAR CASES CHECKED', {
+      sellerType: reference.sellerType,
+      sourceType: reference.sourceType,
+      referenceAsin: reference.asin,
+      consideredCount: rows.length,
+      matchedCount: similarCases.length,
+      positiveCount: summary.positiveCount,
+      negativeCount: summary.negativeCount,
+      uncertainCount: summary.uncertainCount
+    });
+  }
+
+  return {
+    sellerType: reference.sellerType,
+    consideredCount: rows.length,
+    matchedCount: similarCases.length,
+    cases: similarCases,
+    summary
+  };
+}
+
 function buildReviewQueueWhere(filters) {
   const clauses = [];
   const params = {};
@@ -1621,6 +1949,57 @@ function buildReviewQueueWhere(filters) {
 }
 
 function mapReviewQueueItem(row) {
+  const fakeDrop = mapFakeDropSnapshot(
+    {
+      id: row.score_id,
+      classification: row.classification,
+      stability_score: row.stability_score,
+      manipulation_score: row.manipulation_score,
+      trust_score: row.trust_score,
+      amazon_confidence: row.amazon_confidence,
+      fake_drop_risk: row.fake_drop_risk,
+      review_priority: row.review_priority,
+      reasoning_json: row.reasoning_json,
+      engine_version: row.engine_version
+    },
+    {
+      feature_json: row.feature_json,
+      chart_points_json: row.chart_points_json
+    },
+    {
+      id: row.review_item_id,
+      review_status: row.review_status,
+      current_label: row.current_label,
+      tags_json: row.tags_json,
+      note: row.note,
+      label_count: row.label_count,
+      last_reviewed_at: row.last_reviewed_at,
+      analysis_reason: row.analysis_reason,
+      chart_snapshot_json: row.chart_snapshot_json
+    }
+  );
+  const similarCaseSignals = getSimilarCaseSignals(
+    {
+      reviewItemId: row.review_item_id,
+      keepaResultId: row.keepa_result_id,
+      asin: row.asin,
+      sellerType: row.seller_type,
+      categoryName: row.category_name,
+      sourceType: row.origin,
+      currentPrice: row.current_price,
+      keepaDiscount: row.keepa_discount,
+      fakeDropRisk: fakeDrop?.fakeDropRisk ?? row.fake_drop_risk,
+      classification: fakeDrop?.classification || row.classification,
+      features: fakeDrop?.features || fromJson(row.feature_json, {})
+    },
+    {
+      limit: 3,
+      minSimilarityScore: 58,
+      scanLimit: 48,
+      skipLog: true
+    }
+  );
+
   return {
     id: row.review_item_id,
     keepaResultId: row.keepa_result_id,
@@ -1628,39 +2007,15 @@ function mapReviewQueueItem(row) {
     title: row.title,
     imageUrl: row.image_url,
     sellerType: normalizeSellerType(row.seller_type),
+    sourceType: normalizeLearningSource(row.origin),
+    sourceLabel: getLearningSourceLabel(row.origin),
     categoryName: row.category_name,
     currentPrice: parseNumber(row.current_price, null),
     keepaDiscount: parseNumber(row.keepa_discount, null),
     dealScore: parseNumber(row.deal_score, null),
-    fakeDrop: mapFakeDropSnapshot(
-      {
-        id: row.score_id,
-        classification: row.classification,
-        stability_score: row.stability_score,
-        manipulation_score: row.manipulation_score,
-        trust_score: row.trust_score,
-        amazon_confidence: row.amazon_confidence,
-        fake_drop_risk: row.fake_drop_risk,
-        review_priority: row.review_priority,
-        reasoning_json: row.reasoning_json,
-        engine_version: row.engine_version
-      },
-      {
-        feature_json: row.feature_json,
-        chart_points_json: row.chart_points_json
-      },
-      {
-        id: row.review_item_id,
-        review_status: row.review_status,
-        current_label: row.current_label,
-        tags_json: row.tags_json,
-        note: row.note,
-        label_count: row.label_count,
-        last_reviewed_at: row.last_reviewed_at,
-        analysis_reason: row.analysis_reason,
-        chart_snapshot_json: row.chart_snapshot_json
-      }
-    ),
+    fakeDrop,
+    similarCaseSummary: similarCaseSignals.summary,
+    similarCases: similarCaseSignals.cases,
     lastLabel: mapReviewLabel({
       id: row.last_label_id,
       label: row.last_label,
@@ -1691,6 +2046,7 @@ function getMappedReviewQueueItemById(id) {
           kr.image_url,
           kr.seller_type,
           kr.category_name,
+          kr.origin,
           kr.current_price,
           kr.keepa_discount,
           kr.deal_score,
@@ -1770,6 +2126,7 @@ export function listFakeDropReviewQueue(filters = {}) {
           kr.image_url,
           kr.seller_type,
           kr.category_name,
+          kr.origin,
           kr.current_price,
           kr.keepa_discount,
           kr.deal_score,
@@ -1829,11 +2186,11 @@ function mapExampleBucket(label, explicitBucket = '') {
     return explicitBucket;
   }
 
-  if (label === 'ja') {
+  if (['ja', 'approved', 'strong_deal'].includes(label)) {
     return 'positive';
   }
 
-  if (label === 'nein') {
+  if (['nein', 'rejected', 'fake_drop', 'weak_deal'].includes(label)) {
     return 'negative';
   }
 
@@ -1845,6 +2202,8 @@ function buildExampleSnapshot(reviewItem, resultRow, fakeDropSnapshot, label, ta
     asin: resultRow.asin,
     title: resultRow.title,
     sellerType: resultRow.seller_type,
+    sourceType: normalizeLearningSource(resultRow.origin),
+    sourceLabel: getLearningSourceLabel(resultRow.origin),
     categoryName: resultRow.category_name,
     currentPrice: parseNumber(resultRow.current_price, null),
     keepaDiscount: parseNumber(resultRow.keepa_discount, null),
@@ -1872,7 +2231,8 @@ function getReviewItemJoined(id) {
           kr.deal_score,
           kr.seller_type,
           kr.category_name,
-          kr.asin
+          kr.asin,
+          kr.origin
         FROM keepa_review_items kri
         JOIN keepa_results kr ON kr.id = kri.keepa_result_id
         WHERE kri.id = ?
@@ -2002,6 +2362,25 @@ export function submitFakeDropReview(id, input = {}) {
     });
   }
 
+  logGeneratorDebug('FEEDBACK LABEL SAVED', {
+    reviewItemId: reviewItem.id,
+    keepaResultId: reviewItem.keepa_result_id,
+    asin: reviewItem.asin,
+    sellerType: reviewItem.seller_type,
+    label,
+    tags,
+    saveAsExample
+  });
+  logGeneratorDebug('LEARNING FEEDBACK SAVED', {
+    reviewItemId: reviewItem.id,
+    keepaResultId: reviewItem.keepa_result_id,
+    asin: reviewItem.asin,
+    sellerType: reviewItem.seller_type,
+    label,
+    sourceType: normalizeLearningSource(reviewItem.origin),
+    saveAsExample
+  });
+
   return getMappedReviewQueueItemById(id);
 }
 
@@ -2035,47 +2414,25 @@ function buildExamplesWhere(filters) {
   };
 }
 
-function findSimilarExamples(exampleId, sellerType, categoryName) {
-  return db
-    .prepare(
-      `
-        SELECT
-          kel.id,
-          kel.asin,
-          kel.bucket,
-          kel.label,
-          kr.title,
-          kr.category_name,
-          kfds.fake_drop_risk,
-          kfds.classification
-        FROM keepa_example_library kel
-        JOIN keepa_results kr ON kr.id = kel.keepa_result_id
-        LEFT JOIN keepa_fake_drop_scores kfds ON kfds.keepa_result_id = kel.keepa_result_id
-        WHERE kel.id != @exampleId
-          AND kel.seller_type = @sellerType
-          AND (@categoryName = '' OR COALESCE(kel.category_name, '') = @categoryName)
-        ORDER BY kel.created_at DESC
-        LIMIT 3
-      `
-    )
-    .all({
-      exampleId,
-      sellerType,
-      categoryName: cleanText(categoryName)
-    })
-    .map((row) => ({
-      id: row.id,
-      asin: row.asin,
-      title: row.title,
-      bucket: row.bucket,
-      bucketLabel: EXAMPLE_BUCKET_LABELS[row.bucket] || row.bucket,
-      label: row.label,
-      labelLabel: REVIEW_LABEL_CATALOG.find((item) => item.id === normalizeReviewLabel(row.label))?.label || row.label,
-      categoryName: row.category_name,
-      fakeDropRisk: Math.round((parseNumber(row.fake_drop_risk, 0) || 0) * 10) / 10,
-      classification: normalizeClassification(row.classification),
-      classificationLabel: CLASSIFICATION_LABELS[normalizeClassification(row.classification)]
-    }));
+function findSimilarExamples(referenceInput = {}) {
+  return getSimilarCaseSignals(referenceInput, {
+    limit: 3,
+    minSimilarityScore: 58,
+    scanLimit: 48,
+    skipLog: true
+  }).cases.map((row) => ({
+    id: row.reviewItemId,
+    asin: row.asin,
+    title: row.title,
+    label: row.label,
+    labelLabel: row.labelLabel,
+    categoryName: row.categoryName,
+    sourceLabel: row.sourceLabel,
+    fakeDropRisk: row.fakeDropRisk === null ? null : Math.round(row.fakeDropRisk * 10) / 10,
+    classification: row.classification,
+    classificationLabel: CLASSIFICATION_LABELS[normalizeClassification(row.classification)],
+    similarityScore: row.similarityScore
+  }));
 }
 
 export function listFakeDropExamples(filters = {}) {
@@ -2107,6 +2464,7 @@ export function listFakeDropExamples(filters = {}) {
           kr.image_url,
           kr.current_price,
           kr.keepa_discount,
+          kr.origin,
           kfds.classification,
           kfds.fake_drop_risk,
           kfds.stability_score,
@@ -2143,31 +2501,50 @@ export function listFakeDropExamples(filters = {}) {
     );
 
   return {
-    items: rows.map((row) => ({
-      id: row.id,
-      reviewItemId: row.review_item_id,
-      keepaResultId: row.keepa_result_id,
-      asin: row.asin,
-      title: row.title,
-      imageUrl: row.image_url,
-      sellerType: normalizeSellerType(row.seller_type),
-      categoryName: row.category_name,
-      bucket: row.bucket,
-      bucketLabel: EXAMPLE_BUCKET_LABELS[row.bucket] || row.bucket,
-      label: normalizeReviewLabel(row.label),
-      labelLabel: REVIEW_LABEL_CATALOG.find((item) => item.id === normalizeReviewLabel(row.label))?.label || row.label,
-      tags: fromJson(row.tags_json, []),
-      note: row.note || '',
-      currentPrice: parseNumber(row.current_price, null),
-      keepaDiscount: parseNumber(row.keepa_discount, null),
-      classification: normalizeClassification(row.classification),
-      classificationLabel: CLASSIFICATION_LABELS[normalizeClassification(row.classification)],
-      fakeDropRisk: Math.round((parseNumber(row.fake_drop_risk, 0) || 0) * 10) / 10,
-      stabilityScore: Math.round((parseNumber(row.stability_score, 0) || 0) * 10) / 10,
-      chartPoints: fromJson(row.chart_points_json, []),
-      createdAt: row.created_at,
-      similarCases: findSimilarExamples(row.id, row.seller_type, row.category_name)
-    })),
+    items: rows.map((row) => {
+      const snapshot = fromJson(row.snapshot_json, {});
+      const similarCases = findSimilarExamples({
+        reviewItemId: row.review_item_id,
+        keepaResultId: row.keepa_result_id,
+        asin: row.asin,
+        sellerType: row.seller_type,
+        categoryName: row.category_name,
+        sourceType: row.origin || snapshot.sourceType,
+        currentPrice: row.current_price,
+        keepaDiscount: row.keepa_discount,
+        fakeDropRisk: row.fake_drop_risk,
+        classification: row.classification,
+        features: snapshot.fakeDrop?.features || {}
+      });
+
+      return {
+        id: row.id,
+        reviewItemId: row.review_item_id,
+        keepaResultId: row.keepa_result_id,
+        asin: row.asin,
+        title: row.title,
+        imageUrl: row.image_url,
+        sellerType: normalizeSellerType(row.seller_type),
+        sourceType: normalizeLearningSource(row.origin || snapshot.sourceType),
+        sourceLabel: getLearningSourceLabel(row.origin || snapshot.sourceType),
+        categoryName: row.category_name,
+        bucket: row.bucket,
+        bucketLabel: EXAMPLE_BUCKET_LABELS[row.bucket] || row.bucket,
+        label: normalizeReviewLabel(row.label),
+        labelLabel: REVIEW_LABEL_CATALOG.find((item) => item.id === normalizeReviewLabel(row.label))?.label || row.label,
+        tags: fromJson(row.tags_json, []),
+        note: row.note || '',
+        currentPrice: parseNumber(row.current_price, null),
+        keepaDiscount: parseNumber(row.keepa_discount, null),
+        classification: normalizeClassification(row.classification),
+        classificationLabel: CLASSIFICATION_LABELS[normalizeClassification(row.classification)],
+        fakeDropRisk: Math.round((parseNumber(row.fake_drop_risk, 0) || 0) * 10) / 10,
+        stabilityScore: Math.round((parseNumber(row.stability_score, 0) || 0) * 10) / 10,
+        chartPoints: fromJson(row.chart_points_json, []),
+        createdAt: row.created_at,
+        similarCases
+      };
+    }),
     pagination: {
       page,
       limit,

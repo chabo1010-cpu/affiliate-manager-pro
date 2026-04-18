@@ -1,5 +1,6 @@
 import { getDb } from '../db.js';
 import {
+  buildAmazonAffiliateLinkRecord,
   checkDealCooldown,
   classifySellerType,
   cleanText,
@@ -8,6 +9,9 @@ import {
   normalizeSellerType,
   parseNumber
 } from './dealHistoryService.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
+import { getKeepaDrawerControlConfig, loadKeepaProductContext } from './keepaService.js';
+import { evaluateLearningRoute } from './learningLogicService.js';
 import { enqueueCopybotPublishing } from './publisherService.js';
 
 const db = getDb();
@@ -177,6 +181,43 @@ function logEvent({ level = 'info', eventType, sourceId = null, importedDealId =
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `
   ).run(level, eventType, sourceId, importedDealId, message, payload ? stringifyJson(payload) : null, nowIso());
+}
+
+function safeUrl(value) {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function isAmazonShortLink(value = '') {
+  const hostname = safeUrl(cleanText(value))?.hostname?.toLowerCase().replace(/^www\./, '') || '';
+  return hostname === 'amzn.to';
+}
+
+async function resolveAmazonShortLink(value = '') {
+  const trimmed = cleanText(value);
+  if (!trimmed || !isAmazonShortLink(trimmed)) {
+    return trimmed;
+  }
+
+  for (const method of ['HEAD', 'GET']) {
+    try {
+      const response = await fetch(trimmed, {
+        method,
+        redirect: 'follow'
+      });
+
+      if (response?.url) {
+        return response.url;
+      }
+    } catch {
+      // Fallback keeps the raw short URL if the redirect cannot be resolved.
+    }
+  }
+
+  return trimmed;
 }
 
 function mapPricingRuleInput(input = {}) {
@@ -624,7 +665,7 @@ function decideStatus({
   };
 }
 
-export function processImportedDeal(sourceId, input = {}) {
+export async function processImportedDeal(sourceId, input = {}) {
   const source = loadSourceById(sourceId);
   if (!source) {
     throw new Error('Quelle nicht gefunden.');
@@ -662,10 +703,19 @@ export function processImportedDeal(sourceId, input = {}) {
   }
 
   const originalUrl = cleanText(input.originalUrl || input.url);
-  const normalizedUrl = normalizeAmazonLink(input.normalizedUrl || originalUrl);
-  const asin = cleanText(input.asin).toUpperCase() || extractAsin(normalizedUrl || originalUrl);
+  const resolvedOriginalUrl = await resolveAmazonShortLink(originalUrl);
+  const linkRecord = buildAmazonAffiliateLinkRecord(input.normalizedUrl || resolvedOriginalUrl || originalUrl || input.asin, {
+    resolvedUrl: resolvedOriginalUrl,
+    asin: input.asin
+  });
+  const normalizedUrl = linkRecord.valid
+    ? linkRecord.normalizedUrl
+    : normalizeAmazonLink(input.normalizedUrl || resolvedOriginalUrl || originalUrl);
+  const affiliateUrl = linkRecord.valid ? linkRecord.affiliateUrl : '';
+  const asin =
+    cleanText(input.asin).toUpperCase() || linkRecord.asin || extractAsin(normalizedUrl || resolvedOriginalUrl || originalUrl);
   const sellerType = detectSellerType(input);
-  const title = cleanText(input.title) || asin || normalizedUrl || 'Unbenannter Deal';
+  const title = cleanText(input.title) || asin || normalizedUrl || originalUrl || 'Unbenannter Deal';
   const currentPrice = parseNumber(input.currentPrice ?? input.price);
   const oldPrice = parseNumber(input.oldPrice);
   const detectedDiscount =
@@ -696,7 +746,7 @@ export function processImportedDeal(sourceId, input = {}) {
   const score = applyPenalties(baseScore, input, pricingRule);
   const sellerRating =
     input.sellerRating === undefined || input.sellerRating === null ? null : Number(input.sellerRating);
-  const decision = decideStatus({
+  const baseDecision = decideStatus({
     score,
     discount: detectedDiscount,
     source,
@@ -708,7 +758,55 @@ export function processImportedDeal(sourceId, input = {}) {
     sellerRating,
     title
   });
+  const keepaContext = await loadKeepaProductContext({
+    asin,
+    sellerType,
+    currentPrice,
+    title,
+    productUrl: affiliateUrl || normalizedUrl || resolvedOriginalUrl || originalUrl,
+    imageUrl: cleanText(input.imageUrl),
+    source: 'scrapper_import'
+  });
+
+  logGeneratorDebug('SCRAPPER CONNECTED TO LEARNING LOGIC', {
+    sourceId,
+    asin,
+    sellerType,
+    keepaStatus: keepaContext?.status || 'missing'
+  });
+
+  const learningContext = evaluateLearningRoute({
+    sourceType: 'scrapper',
+    enforceDecision: true,
+    keepaRequired: true,
+    asin,
+    sellerType,
+    currentPrice,
+    keepaContext,
+    patternSupportEnabled: getKeepaDrawerControlConfig(sellerType).patternSupportEnabled === true
+  });
   const timestamp = nowIso();
+  const learningDecision = learningContext?.learning?.routingDecision || 'review';
+  let finalStatus = baseDecision.status;
+  let finalReason = baseDecision.reason;
+
+  if (originalUrl && !linkRecord.valid) {
+    finalStatus = 'review';
+    finalReason = 'Amazon-Link konnte nicht normalisiert werden oder ASIN fehlt.';
+  }
+
+  if (learningDecision === 'block') {
+    finalStatus = 'rejected';
+    finalReason = learningContext.learning.reason || 'Lern-Logik hat den Deal blockiert.';
+  } else if (learningDecision === 'review') {
+    finalStatus = 'review';
+    finalReason = learningContext.learning.reason || 'Lern-Logik verlangt manuelle Review.';
+  }
+
+  if (history.blocked && finalStatus === 'posted') {
+    finalStatus = 'review';
+    finalReason = 'Repost-Sperre blockiert Auto-Post.';
+  }
 
   const result = db
     .prepare(
@@ -726,6 +824,8 @@ export function processImportedDeal(sourceId, input = {}) {
           score,
           keepa_result_json,
           comparison_result_json,
+          learning_context_json,
+          learning_decision,
           status,
           review_reason,
           decision_reason,
@@ -745,6 +845,8 @@ export function processImportedDeal(sourceId, input = {}) {
           @score,
           @keepa_result_json,
           @comparison_result_json,
+          @learning_context_json,
+          @learning_decision,
           @status,
           @review_reason,
           @decision_reason,
@@ -767,14 +869,12 @@ export function processImportedDeal(sourceId, input = {}) {
       score,
       keepa_result_json: stringifyJson(keepaResult),
       comparison_result_json: stringifyJson(comparisonResult),
-      status: decision.status === 'posted' && history.blocked ? 'review' : decision.status,
-      review_reason: history.blocked
-        ? 'Repost-Sperre aktiv. Deal wurde nicht auto-gepostet.'
-        : decision.status === 'review'
-          ? decision.reason
-          : null,
-      decision_reason: history.blocked ? 'Repost-Sperre blockiert Auto-Post.' : decision.reason,
-      posted_at: decision.status === 'posted' && !history.blocked ? timestamp : null,
+      learning_context_json: stringifyJson(learningContext),
+      learning_decision: learningDecision,
+      status: finalStatus,
+      review_reason: finalStatus === 'review' ? finalReason : null,
+      decision_reason: finalReason,
+      posted_at: finalStatus === 'posted' ? timestamp : null,
       created_at: timestamp,
       updated_at: timestamp
     });
@@ -784,12 +884,12 @@ export function processImportedDeal(sourceId, input = {}) {
   db.prepare(`UPDATE sources SET last_import_at = ?, updated_at = ? WHERE id = ?`).run(timestamp, timestamp, sourceId);
 
   let queueEntryId = null;
-  if (decision.status === 'posted' && !history.blocked) {
+  if (finalStatus === 'posted') {
     const queueEntry = enqueueCopybotPublishing({
       sourceId: importedDealId,
       payload: {
         title,
-        link: originalUrl,
+        link: affiliateUrl || normalizedUrl || resolvedOriginalUrl || originalUrl,
         normalizedUrl,
         asin,
         currentPrice: currentPrice === null ? '' : String(currentPrice),
@@ -820,29 +920,34 @@ export function processImportedDeal(sourceId, input = {}) {
   }
 
   logEvent({
-    level: decision.status === 'rejected' ? 'warning' : 'info',
-    eventType: `deal.${decision.status}`,
+    level: finalStatus === 'rejected' ? 'warning' : 'info',
+    eventType: `deal.${finalStatus}`,
     sourceId,
     importedDealId,
-    message: decision.reason,
+    message: finalReason,
     payload: {
       score,
       sellerType,
       detectedDiscount,
       historyBlocked: history.blocked,
-      queueEntryId
+      queueEntryId,
+      learningDecision,
+      learningReason: learningContext?.learning?.reason || '',
+      keepaStatus: learningContext?.keepa?.status || 'missing'
     }
   });
 
   return {
     id: importedDealId,
-    status: decision.status === 'posted' && history.blocked ? 'review' : decision.status,
-    reason: history.blocked ? 'Repost-Sperre blockiert Auto-Post.' : decision.reason,
+    status: finalStatus,
+    reason: finalReason,
     sellerType,
     score,
     detectedDiscount,
     asin,
-    normalizedUrl
+    normalizedUrl,
+    affiliateUrl,
+    learningContext
   };
 }
 
@@ -865,7 +970,8 @@ export function listReviewQueue() {
     .map((row) => ({
       ...row,
       keepa_result: row.keepa_result_json ? JSON.parse(row.keepa_result_json) : null,
-      comparison_result: row.comparison_result_json ? JSON.parse(row.comparison_result_json) : null
+      comparison_result: row.comparison_result_json ? JSON.parse(row.comparison_result_json) : null,
+      learning_context: row.learning_context_json ? JSON.parse(row.learning_context_json) : null
     }));
 }
 
@@ -880,13 +986,17 @@ export function updateReviewDecision(id, action) {
 
   if (action === 'approve') {
     const source = loadSourceById(deal.source_id);
+    const linkRecord = buildAmazonAffiliateLinkRecord(deal.normalized_url || deal.original_url || deal.asin, {
+      resolvedUrl: deal.normalized_url,
+      asin: deal.asin
+    });
     enqueueCopybotPublishing({
       sourceId: deal.id,
       payload: {
         title: deal.title,
-        link: deal.original_url,
-        normalizedUrl: deal.normalized_url,
-        asin: deal.asin,
+        link: linkRecord.valid ? linkRecord.affiliateUrl : deal.original_url,
+        normalizedUrl: linkRecord.valid ? linkRecord.normalizedUrl : deal.normalized_url,
+        asin: deal.asin || linkRecord.asin,
         currentPrice: deal.current_price === null ? '' : String(deal.current_price),
         oldPrice: deal.old_price === null ? '' : String(deal.old_price),
         sellerType: deal.seller_type,
@@ -1004,7 +1114,7 @@ export function listCopybotLogs() {
     }));
 }
 
-export function testSource(sourceId, sampleInput = {}) {
+export async function testSource(sourceId, sampleInput = {}) {
   return processImportedDeal(sourceId, {
     title: sampleInput.title || 'Testdeal',
     url: sampleInput.url || 'https://www.amazon.de/dp/B000TEST00',

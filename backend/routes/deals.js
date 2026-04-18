@@ -1,5 +1,6 @@
 import express from 'express';
 import { getDb } from '../db.js';
+import { logGeneratorDebug } from '../services/generatorFlowService.js';
 import {
   checkDealCooldown,
   extractAsin,
@@ -9,6 +10,7 @@ import {
   savePostedDeal,
   saveRepostSettings
 } from '../services/dealHistoryService.js';
+import { buildGeneratorDealContext } from '../services/generatorDealScoringService.js';
 
 const router = express.Router();
 const db = getDb();
@@ -79,7 +81,18 @@ router.get('/', async (req, res) => {
 });
 
 router.post('/check', async (req, res) => {
-  const { url = '', asin = '', normalizedUrl = '' } = req.body ?? {};
+  const { url = '', asin = '', normalizedUrl = '', sellerType = '', currentPrice = '', title = '', imageUrl = '' } = req.body ?? {};
+  const requestPayload = {
+    url: typeof url === 'string' ? url.trim() : '',
+    asin: typeof asin === 'string' ? asin.trim() : '',
+    normalizedUrl: typeof normalizedUrl === 'string' ? normalizedUrl.trim() : '',
+    sellerType: typeof sellerType === 'string' ? sellerType.trim() : '',
+    currentPrice,
+    title: typeof title === 'string' ? title.trim() : '',
+    imageUrl: typeof imageUrl === 'string' ? imageUrl.trim() : ''
+  };
+
+  logGeneratorDebug('api.deals.check.request', requestPayload);
 
   if (
     (!url || typeof url !== 'string' || !url.trim()) &&
@@ -132,6 +145,40 @@ router.post('/check', async (req, res) => {
     lastDeal: result.lastDeal || null
   };
 
+  try {
+    responsePayload.generatorContext = await buildGeneratorDealContext({
+      asin: responsePayload.asin || identity.asin || '',
+      sellerType: requestPayload.sellerType || responsePayload.sellerType || 'FBM',
+      currentPrice: requestPayload.currentPrice || result.lastDeal?.currentPrice || '',
+      title: requestPayload.title || result.lastDeal?.title || '',
+      productUrl: responsePayload.resolvedFinalUrl || responsePayload.normalizedUrl || requestPayload.url,
+      imageUrl: requestPayload.imageUrl || '',
+      source: 'generator_check'
+    });
+  } catch (error) {
+    responsePayload.generatorContext = {
+      asin: responsePayload.asin || identity.asin || '',
+      sellerType: responsePayload.sellerType || 'FBM',
+      keepa: {
+        available: false,
+        status: 'error',
+        reason: error instanceof Error ? error.message : 'Generator-Kontext konnte nicht aufgebaut werden.'
+      },
+      evaluation: null,
+      review: null
+    };
+  }
+
+  logGeneratorDebug('api.deals.check.response', {
+    blocked: responsePayload.blocked,
+    asin: responsePayload.asin,
+    normalizedUrl: responsePayload.normalizedUrl,
+    postingCount: responsePayload.postingCount,
+    remainingSeconds: responsePayload.remainingSeconds,
+    keepaStatus: responsePayload.generatorContext?.keepa?.status || 'missing',
+    sellerTypeDecision: responsePayload.generatorContext?.evaluation?.decision || 'unavailable'
+  });
+
   return res.status(200).json(responsePayload);
 });
 
@@ -178,6 +225,10 @@ router.get('/settings', (req, res) => {
     `);
 
     const settings = getRepostSettings();
+    logGeneratorDebug('REPOST LOCK LOAD SUCCESS', {
+      repostCooldownEnabled: settings.repostCooldownEnabled,
+      repostCooldownHours: settings.repostCooldownHours
+    });
 
     return res.json({
       repostCooldownEnabled: settings.repostCooldownEnabled,
@@ -186,6 +237,9 @@ router.get('/settings', (req, res) => {
     });
   } catch (error) {
     console.error('SETTINGS LOAD ERROR', error);
+    logGeneratorDebug('REPOST LOCK LOAD FAILED', {
+      error: error instanceof Error ? error.message : 'Settings-Laden fehlgeschlagen.'
+    });
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Settings-Laden fehlgeschlagen.'
     });
@@ -200,8 +254,17 @@ const saveSettingsHandler = (req, res) => {
     const requesterRole = String(req.headers['x-user-role'] || '').trim().toLowerCase();
     const wantsToSaveTelegramCopyButtonText = rawTelegramCopyButtonText !== undefined;
     const currentSettings = getRepostSettings();
+    logGeneratorDebug('REPOST LOCK SAVE START', {
+      requesterRole,
+      repostCooldownEnabled: rawEnabled,
+      repostCooldownHours: rawHours
+    });
 
     if (wantsToSaveTelegramCopyButtonText && requesterRole !== 'admin') {
+      logGeneratorDebug('REPOST LOCK SAVE FAILED', {
+        error: 'Nicht autorisiert fuer Telegram Copy-Button Text.',
+        requesterRole
+      });
       return res.status(403).json({ error: 'Nur Admin darf den Telegram Copy-Button Text speichern.' });
     }
 
@@ -215,7 +278,19 @@ const saveSettingsHandler = (req, res) => {
         ? currentSettings.repostCooldownHours
         : Number(rawHours);
 
+    if (!Number.isFinite(hours) || hours < 1) {
+      logGeneratorDebug('REPOST LOCK SAVE FAILED', {
+        error: 'Ungueltige Sperrzeit.',
+        repostCooldownHours: rawHours
+      });
+      return res.status(400).json({ error: 'Ungueltige Sperrzeit.' });
+    }
+
     if (Number.isNaN(hours)) {
+      logGeneratorDebug('REPOST LOCK SAVE FAILED', {
+        error: 'Ungueltige Sperrzeit.',
+        repostCooldownHours: rawHours
+      });
       return res.status(400).json({ error: 'Ungültige Sperrzeit.' });
     }
 
@@ -232,6 +307,10 @@ const saveSettingsHandler = (req, res) => {
       repostCooldownHours: hours,
       telegramCopyButtonText: wantsToSaveTelegramCopyButtonText ? rawTelegramCopyButtonText : undefined
     });
+    logGeneratorDebug('REPOST LOCK SAVE SUCCESS', {
+      repostCooldownEnabled: saved.repostCooldownEnabled,
+      repostCooldownHours: saved.repostCooldownHours
+    });
 
     return res.json({
       success: true,
@@ -241,6 +320,9 @@ const saveSettingsHandler = (req, res) => {
     });
   } catch (error) {
     console.error('SETTINGS SAVE ERROR', error);
+    logGeneratorDebug('REPOST LOCK SAVE FAILED', {
+      error: error instanceof Error ? error.message : 'Settings-Speichern fehlgeschlagen.'
+    });
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Settings-Speichern fehlgeschlagen.'
     });

@@ -9,6 +9,7 @@ import {
   listKeepaResults,
   listKeepaRules,
   listKeepaUsageLogs,
+  runKeepaApiTest,
   runKeepaManualSearch,
   saveKeepaSettings,
   sendKeepaTestAlert,
@@ -51,6 +52,24 @@ router.get('/status', async (req, res) => {
   }
 });
 
+router.get('/test', async (req, res) => {
+  try {
+    return res.json(
+      await runKeepaApiTest({
+        asin: req.query.asin,
+        domainId: req.query.domainId
+      })
+    );
+  } catch (error) {
+    return res
+      .status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 500)
+      .json({
+        error: error instanceof Error ? error.message : 'Keepa-Test konnte nicht ausgefuehrt werden.',
+        code: error instanceof Error ? error.code || 'KEEPA_API_TEST_FAILED' : 'KEEPA_API_TEST_FAILED'
+      });
+  }
+});
+
 router.get('/settings', (req, res) => {
   res.json(getKeepaSettingsView());
 });
@@ -77,11 +96,15 @@ router.post('/test-connection', requireAdmin, async (req, res) => {
 
 router.post('/manual-search', async (req, res) => {
   try {
-    res.json(await runKeepaManualSearch(req.body ?? {}));
+    return res.json(await runKeepaManualSearch(req.body ?? {}));
   } catch (error) {
-    res.status(400).json({
-      error: error instanceof Error ? error.message : 'Manuelle Keepa-Suche fehlgeschlagen.'
-    });
+    return res
+      .status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 400)
+      .json({
+        error: error instanceof Error ? error.message : 'Manuelle Keepa-Suche fehlgeschlagen.',
+        code: error instanceof Error ? error.code || 'KEEPA_MANUAL_SEARCH_FAILED' : 'KEEPA_MANUAL_SEARCH_FAILED',
+        protection: error?.details?.protection || null
+      });
   }
 });
 

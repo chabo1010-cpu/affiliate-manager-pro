@@ -124,6 +124,20 @@ function PublishingPage() {
   return (
     <Layout>
       <div style={{ display: 'grid', gap: '1rem' }}>
+        <section className="card" style={{ padding: '1rem', display: 'grid', gap: '0.65rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
+            <div>
+              <p className="section-title">Publishing / Output</p>
+              <h1 className="page-title">Versand, Queue und Worker getrennt vom Generator</h1>
+              <p className="text-muted" style={{ margin: '0.35rem 0 0' }}>
+                Dieser Bereich ist fuer Ausgabe, Versandstatus und Worker gedacht. Generator und Logik-Zentrale
+                liefern Inhalte und Entscheidungen, Publishing uebernimmt den eigentlichen Output.
+              </p>
+            </div>
+            <span className="badge">Entscheidung -&gt; Queue -&gt; Worker -&gt; Zielkanal</span>
+          </div>
+        </section>
+
         <section className="card" style={{ padding: '1rem' }}>
           <nav style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
             {tabs.map((item) => (

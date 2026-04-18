@@ -245,6 +245,93 @@
   line-height: 1.35;
 }
 
+.generator-context-panel {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem 1.05rem;
+  border: 1px solid rgba(45, 212, 191, 0.18);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at top right, rgba(45, 212, 191, 0.1), transparent 38%),
+    rgba(255, 255, 255, 0.03);
+}
+
+.generator-context-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.generator-context-header strong {
+  color: #e6eef7;
+}
+
+.generator-context-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  padding: 0.25rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.generator-context-pill.is-success {
+  background: rgba(34, 197, 94, 0.14);
+  color: #bbf7d0;
+}
+
+.generator-context-pill.is-warning {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fde68a;
+}
+
+.generator-context-pill.is-danger {
+  background: rgba(248, 113, 113, 0.14);
+  color: #fecaca;
+}
+
+.generator-context-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.generator-context-card {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.85rem 0.95rem;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.generator-context-card span {
+  font-size: 0.76rem;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.generator-context-card strong {
+  color: #f8fafc;
+  line-height: 1.4;
+}
+
+.generator-context-meta {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.generator-context-meta p {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
 .generator-post-preview {
   display: grid;
   gap: 0.9rem;

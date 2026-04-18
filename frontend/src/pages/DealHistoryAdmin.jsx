@@ -26,6 +26,44 @@ function formatAdminDate(value) {
   }).format(parsed);
 }
 
+async function requestJson(url, options = {}) {
+  let response;
+
+  try {
+    response = await fetch(url, {
+      ...options,
+      headers: {
+        Accept: 'application/json',
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(options.headers || {})
+      }
+    });
+  } catch (error) {
+    throw new Error(
+      error instanceof Error && error.message
+        ? `Backend nicht erreichbar: ${error.message}`
+        : 'Backend nicht erreichbar.'
+    );
+  }
+
+  const rawText = await response.text();
+  let data = null;
+
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      throw new Error(`Unerwartete Antwort vom Server (${response.status}).`);
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.error || `Request fehlgeschlagen (${response.status})`);
+  }
+
+  return data;
+}
+
 function DealHistoryAdminPage() {
   const [settings, setSettings] = useState({
     repostCooldownEnabled: true,
@@ -54,19 +92,13 @@ function DealHistoryAdminPage() {
           : 'custom';
   const loadSettings = async () => {
     try {
-      const response = await fetch(adminSettingsApiUrl);
-      const data = await response.json();
-
-      if (response.ok) {
-        setSettings({
-          repostCooldownEnabled: Boolean(data?.repostCooldownEnabled),
-          repostCooldownHours: Number(data?.repostCooldownHours)
-        });
-      } else {
-        showToast(data?.error || 'Repost-Einstellungen konnten nicht geladen werden');
-      }
-    } catch {
-      showToast('Repost-Einstellungen konnten nicht geladen werden');
+      const data = await requestJson(adminSettingsApiUrl);
+      setSettings({
+        repostCooldownEnabled: Boolean(data?.repostCooldownEnabled),
+        repostCooldownHours: Number(data?.repostCooldownHours)
+      });
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Repost-Einstellungen konnten nicht geladen werden');
     }
   };
 
@@ -90,17 +122,10 @@ function DealHistoryAdminPage() {
         }
       });
 
-      const response = await fetch(`${adminHistoryApiUrl}?${params.toString()}`);
-      const data = await response.json();
-
-      if (!response.ok) {
-        showToast(data?.error || 'Deal-Historie konnte nicht geladen werden');
-        return;
-      }
-
+      const data = await requestJson(`${adminHistoryApiUrl}?${params.toString()}`);
       setItems(Array.isArray(data?.items) ? data.items : []);
-    } catch {
-      showToast('Deal-Historie konnte nicht geladen werden');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Deal-Historie konnte nicht geladen werden');
     } finally {
       setLoading(false);
     }
@@ -114,28 +139,23 @@ function DealHistoryAdminPage() {
 
   const saveSettings = async () => {
     setSavingSettings(true);
+    setSettingsSaveStatus(null);
     try {
       const payload = { ...settings };
-      const response = await fetch(adminSettingsApiUrl, {
+      const data = await requestJson(adminSettingsApiUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
         body: JSON.stringify(payload)
       });
-      const data = await response.json().catch(() => null);
+      const confirmed = await requestJson(adminSettingsApiUrl);
+      const safeHours = Number(confirmed?.repostCooldownHours ?? data?.repostCooldownHours);
 
-      if (!response.ok) {
-        throw new Error(data?.error || 'Senden fehlgeschlagen');
-      }
-
-      if (!data) {
-        throw new Error('Leere Antwort vom Settings-Speichern');
+      if (Number.isNaN(safeHours)) {
+        throw new Error('Ungueltige Antwort vom Settings-Speichern');
       }
 
       const nextSettings = {
-        repostCooldownEnabled: Boolean(data?.repostCooldownEnabled),
-        repostCooldownHours: Number(data?.repostCooldownHours)
+        repostCooldownEnabled: Boolean(confirmed?.repostCooldownEnabled ?? data?.repostCooldownEnabled),
+        repostCooldownHours: safeHours
       };
 
       if (Number.isNaN(nextSettings.repostCooldownHours)) {

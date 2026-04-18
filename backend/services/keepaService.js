@@ -1,7 +1,9 @@
-import crypto from 'crypto';
 import { getDb } from '../db.js';
 import { getKeepaConfig, getTelegramConfig } from '../env.js';
-import { sendTelegramPost } from './telegramSenderService.js';
+import { publishAutoDealToTelegramTestGroup } from './autoDealPublisher.js';
+import { loadAmazonAffiliateContext } from './amazonAffiliateService.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
+import { evaluateLearningRoute } from './learningLogicService.js';
 import { getComparisonAdapterCatalog, resolveComparisonFromAdapters } from './keepaComparisonAdapters.js';
 import {
   evaluateFakeDropAlertEligibility,
@@ -45,6 +47,97 @@ const DEFAULT_COMPARISON_SOURCE_CONFIG = {
   'custom-api': { enabled: false }
 };
 
+const KEEPA_DRAWER_CATALOG = [
+  { key: 'AMAZON', label: 'Amazon' },
+  { key: 'FBA', label: 'FBA' },
+  { key: 'FBM', label: 'FBM' }
+];
+
+const KEEPA_TREND_INTERVAL_OPTIONS = [
+  { value: 'day', label: 'Tag', days: 1 },
+  { value: 'week', label: 'Woche', days: 7 },
+  { value: 'month', label: 'Monat', days: 30 },
+  { value: 'three_months', label: '3 Monate', days: 90 },
+  { value: 'all', label: 'Alle', days: 365 }
+];
+
+const KEEPA_SORT_OPTIONS = [
+  { value: 'percent', label: 'Prozent' },
+  { value: 'price_drop', label: 'Preissturz' },
+  { value: 'price', label: 'Preis' },
+  { value: 'newest', label: 'Neueste' },
+  { value: 'sales_rank', label: 'Sales Rank' }
+];
+
+const KEEPA_AMAZON_OFFER_OPTIONS = [
+  { value: 'all', label: 'egal' },
+  { value: 'require', label: 'nur mit Amazon-Angebot' },
+  { value: 'exclude', label: 'kein Amazon-Angebot' }
+];
+
+const DEFAULT_DRAWER_CONFIGS = {
+  AMAZON: {
+    active: true,
+    sellerType: 'AMAZON',
+    patternSupportEnabled: true,
+    trendInterval: 'week',
+    minDiscount: 20,
+    minPrice: null,
+    maxPrice: null,
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'require',
+    singleVariantOnly: false,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: false,
+    testGroupPostingAllowed: true
+  },
+  FBA: {
+    active: true,
+    sellerType: 'FBA',
+    patternSupportEnabled: true,
+    trendInterval: 'week',
+    minDiscount: 25,
+    minPrice: null,
+    maxPrice: null,
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'exclude',
+    singleVariantOnly: false,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: false,
+    testGroupPostingAllowed: true
+  },
+  FBM: {
+    active: true,
+    sellerType: 'FBM',
+    patternSupportEnabled: true,
+    trendInterval: 'month',
+    minDiscount: 35,
+    minPrice: null,
+    maxPrice: null,
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'exclude',
+    singleVariantOnly: true,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: false,
+    testGroupPostingAllowed: true
+  }
+};
+
 const CATEGORY_ID_SET = new Set(CATEGORY_CATALOG.map((item) => item.id));
 const COMPARISON_SOURCE_IDS = new Set(Object.keys(DEFAULT_COMPARISON_SOURCE_CONFIG));
 const USAGE_MODULE_CATALOG = [
@@ -81,7 +174,7 @@ const USAGE_LOG_MODULE_MAP = {
 
 const DEFAULT_SETTINGS = {
   keepaEnabled: true,
-  schedulerEnabled: true,
+  schedulerEnabled: false,
   domainId: 3,
   defaultCategories: [],
   defaultDiscount: 40,
@@ -100,6 +193,7 @@ const DEFAULT_SETTINGS = {
   alertMaxPerProduct: 2,
   telegramMessagePrefix: 'Keepa Alert',
   comparisonSourceConfig: DEFAULT_COMPARISON_SOURCE_CONFIG,
+  drawerConfigs: DEFAULT_DRAWER_CONFIGS,
   loggingEnabled: true,
   estimatedTokensPerManualRun: 8
 };
@@ -108,12 +202,40 @@ const MAX_MANUAL_PAGE_SIZE = 48;
 const MAX_MANUAL_PAGE = 10;
 const SEARCH_DATE_RANGE_DAYS = 7;
 const SCHEDULER_INTERVAL_MS = 60 * 1000;
+const DEFAULT_KEEPA_TEST_ASIN = 'B0DDKZBYK6';
+const KEEPA_HARD_STOP_MIN_TOKENS = 150;
+const KEEPA_AUTO_HARD_STOP_MIN_TOKENS = 220;
+const KEEPA_MANUAL_COOLDOWN_MS = 45 * 1000;
+const KEEPA_MANUAL_CONFIRM_TTL_MS = 3 * 60 * 1000;
+const KEEPA_MANUAL_RESULT_LIMIT_CAP = 12;
+const KEEPA_MANUAL_TOKEN_BUFFER = 30;
+const KEEPA_REQUEST_WINDOW_60S_MS = 60 * 1000;
+const KEEPA_REQUEST_WINDOW_5M_MS = 5 * 60 * 1000;
+const KEEPA_MAX_REQUESTS_PER_60S = 6;
+const KEEPA_MAX_REQUESTS_PER_5M = 16;
+const KEEPA_MAX_TOKENS_PER_60S = 70;
+const KEEPA_MAX_TOKENS_PER_5M = 180;
+const KEEPA_EXPENSIVE_REQUEST_TOKENS = 20;
 
 let keepaQueue = Promise.resolve();
 let lastKeepaRequestStartedAt = 0;
 let schedulerStarted = false;
 let schedulerRunning = false;
 let keepaConnectionCache = null;
+let keepaApiKeyLogWritten = false;
+let keepaSearchExecutionState = {
+  active: false,
+  source: '',
+  drawerKey: '',
+  startedAt: null
+};
+let keepaManualProtectionState = {
+  cooldownUntil: 0,
+  lastFinishedAt: null,
+  lastBlockedAt: null,
+  lastBlockedReason: '',
+  pendingConfirmation: null
+};
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -165,6 +287,19 @@ function parseInteger(value, fallback = 0) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function ensureKeepaApiKeyLog(key) {
+  if (!key || keepaApiKeyLogWritten) {
+    return;
+  }
+
+  keepaApiKeyLogWritten = true;
+  logGeneratorDebug('KEEPA API KEY LOADED', {
+    configured: true,
+    keyPresent: true,
+    keyLength: key.length
+  });
 }
 
 function toJson(value) {
@@ -337,6 +472,80 @@ function normalizeUsageStatus(value, fallback = 'success') {
   return ['success', 'error', 'warning', 'partial', 'skipped'].includes(normalized) ? normalized : fallback;
 }
 
+function normalizeKeepaUsageMode(value, fallback = 'manual') {
+  const normalized = cleanText(String(value || ''))
+    .toLowerCase()
+    .replace(/[^a-z]/g, '');
+  return ['manual', 'auto', 'test'].includes(normalized) ? normalized : fallback;
+}
+
+function resolveKeepaUsageMode(entry = {}, action = 'manual-search', module = 'manual-search') {
+  const explicitMode = normalizeKeepaUsageMode(entry.mode, '');
+  if (explicitMode) {
+    return explicitMode;
+  }
+
+  if (action === 'automation-run' || module === 'automation-run') {
+    return 'auto';
+  }
+
+  if (action === 'test-connection' || module === 'test-connection' || module === 'status-check') {
+    return 'test';
+  }
+
+  return 'manual';
+}
+
+function sanitizeUsageDrawerKey(value, fallback = '') {
+  const normalized = cleanText(String(value || '')).toUpperCase();
+  return ['AMAZON', 'FBA', 'FBM'].includes(normalized) ? normalized : fallback;
+}
+
+function deriveUsageDrawerKey(entry = {}) {
+  const explicitDrawer = sanitizeUsageDrawerKey(entry.drawerKey, '');
+  if (explicitDrawer) {
+    return explicitDrawer;
+  }
+
+  const filterDrawer = sanitizeUsageDrawerKey(entry.filters?.drawerKey, '');
+  if (filterDrawer) {
+    return filterDrawer;
+  }
+
+  const metaDrawer = sanitizeUsageDrawerKey(entry.meta?.drawerKey, '');
+  if (metaDrawer) {
+    return metaDrawer;
+  }
+
+  const sellerDrawer = sanitizeUsageDrawerKey(entry.filters?.sellerType || entry.meta?.sellerType, '');
+  return sellerDrawer || '';
+}
+
+function resolveKeepaTokensUsedValue(source = {}) {
+  const direct = parseNumber(source.tokensUsed, null);
+  if (direct !== null && direct >= 0) {
+    return Math.round(direct * 10) / 10;
+  }
+
+  const before = parseInteger(source.tokensBefore, null);
+  const after = parseInteger(source.tokensAfter ?? source.officialTokensLeft, null);
+  if (before !== null && after !== null && before >= after) {
+    return Math.round((before - after) * 10) / 10;
+  }
+
+  const official = parseNumber(source.officialUsageValue, null);
+  if (official !== null && official >= 0) {
+    return Math.round(official * 10) / 10;
+  }
+
+  const estimated = parseNumber(source.estimatedUsage, null);
+  if (estimated !== null && estimated >= 0) {
+    return Math.round(estimated * 10) / 10;
+  }
+
+  return 0;
+}
+
 function sanitizeUsageFilters(filters) {
   if (!filters || typeof filters !== 'object') {
     return null;
@@ -345,13 +554,20 @@ function sanitizeUsageFilters(filters) {
   const allowedKeys = [
     'page',
     'limit',
+    'drawerKey',
     'sellerType',
     'minDiscount',
     'minPrice',
     'maxPrice',
+    'trendInterval',
+    'sortBy',
     'onlyPrime',
     'onlyInStock',
     'onlyGoodRating',
+    'onlyWithReviews',
+    'amazonOfferMode',
+    'singleVariantOnly',
+    'recentPriceChangeOnly',
     'domainId',
     'categoryId',
     'categories',
@@ -435,17 +651,617 @@ function estimateSearchUsage(filters, settings, meta = {}) {
   return clamp(base + categoryFactor + limitFactor + priceFactor + qualityFactor + automationFactor + Math.max(0, requestCount - 2), 1, 250);
 }
 
+function createKeepaProtectionError(message, code = 'KEEPA_PROTECTION_BLOCKED', statusCode = 429, details = null) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = statusCode;
+  error.details = details;
+  return error;
+}
+
+function buildKeepaManualConfirmationToken() {
+  return `keepa-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildKeepaManualSearchFingerprint(filters = {}) {
+  return JSON.stringify({
+    drawerKey: normalizeDrawerKey(filters.drawerKey || inferDrawerKeyFromSellerType(filters.sellerType)),
+    page: clamp(parseInteger(filters.page, 1), 1, MAX_MANUAL_PAGE),
+    limit: clamp(parseInteger(filters.limit, DEFAULT_SETTINGS.defaultPageSize), 1, KEEPA_MANUAL_RESULT_LIMIT_CAP),
+    sellerType: normalizeSellerType(filters.sellerType),
+    categories: normalizeCategoryIds(filters.categories, []),
+    minDiscount: clamp(parseNumber(filters.minDiscount, 0), 0, 95),
+    minPrice: sanitizePriceBoundary(filters.minPrice),
+    maxPrice: sanitizePriceBoundary(filters.maxPrice),
+    trendInterval: normalizeTrendInterval(filters.trendInterval),
+    sortBy: normalizeSortBy(filters.sortBy),
+    onlyPrime: parseBool(filters.onlyPrime, false),
+    onlyInStock: parseBool(filters.onlyInStock, false),
+    onlyGoodRating: parseBool(filters.onlyGoodRating, false),
+    onlyWithReviews: parseBool(filters.onlyWithReviews, false),
+    amazonOfferMode: normalizeAmazonOfferMode(filters.amazonOfferMode),
+    singleVariantOnly: parseBool(filters.singleVariantOnly, false),
+    recentPriceChangeOnly: parseBool(filters.recentPriceChangeOnly, false),
+    domainId: parseInteger(filters.domainId, DEFAULT_SETTINGS.domainId)
+  });
+}
+
+function estimateProtectedManualTokenCost(filters, settings) {
+  const cappedLimit = clamp(parseInteger(filters.limit, settings?.defaultPageSize || DEFAULT_SETTINGS.defaultPageSize), 1, KEEPA_MANUAL_RESULT_LIMIT_CAP);
+  let estimate = Math.max(estimateSearchUsage({ ...filters, limit: cappedLimit }, settings, { requestCount: 2 }), 18 + cappedLimit * 4);
+
+  if (!normalizeCategoryIds(filters.categories, []).length) {
+    estimate += 10;
+  }
+
+  if (filters.minPrice === null && filters.maxPrice === null) {
+    estimate += 6;
+  }
+
+  if (filters.amazonOfferMode === 'all') {
+    estimate += 8;
+  }
+
+  if (!filters.onlyWithReviews) {
+    estimate += 8;
+  }
+
+  if (filters.trendInterval === 'month') {
+    estimate += 8;
+  }
+
+  if (filters.trendInterval === 'three_months') {
+    estimate += 14;
+  }
+
+  if (filters.trendInterval === 'all') {
+    estimate += 20;
+  }
+
+  if (filters.minDiscount < 25) {
+    estimate += 12;
+  } else if (filters.minDiscount < 40) {
+    estimate += 6;
+  }
+
+  return clamp(Math.round(estimate), 12, 220);
+}
+
+function analyzeKeepaManualQueryRisk(filters, settings) {
+  const categories = normalizeCategoryIds(filters.categories, []);
+  const cappedLimit = clamp(parseInteger(filters.limit, settings?.defaultPageSize || DEFAULT_SETTINGS.defaultPageSize), 1, KEEPA_MANUAL_RESULT_LIMIT_CAP);
+  const warnings = [];
+  const blockingReasons = [];
+  let riskScore = 0;
+
+  if (parseInteger(filters.limit, cappedLimit) > KEEPA_MANUAL_RESULT_LIMIT_CAP) {
+    warnings.push(`Trefferlimit wurde auf ${KEEPA_MANUAL_RESULT_LIMIT_CAP} Ergebnisse begrenzt.`);
+    riskScore += 1;
+  }
+
+  if (!categories.length) {
+    warnings.push('Keine Kategorie gesetzt: die Query bleibt dadurch breiter.');
+    riskScore += 2;
+  }
+
+  if (filters.minPrice === null && filters.maxPrice === null) {
+    warnings.push('Keine Preisgrenze gesetzt: die Query bleibt preislich offen.');
+    riskScore += 1;
+  }
+
+  if (!filters.onlyWithReviews) {
+    warnings.push('Ohne Bewertungsfilter koennen deutlich mehr Rohdeals entstehen.');
+    riskScore += 1;
+  }
+
+  if (filters.amazonOfferMode === 'all') {
+    warnings.push('Amazon-Angebot ist nicht eingegrenzt.');
+    riskScore += 1;
+  }
+
+  if (filters.trendInterval === 'month') {
+    warnings.push('Monatsintervall erzeugt mehr Rohdeals als Tag/Woche.');
+    riskScore += 1;
+  }
+
+  if (filters.trendInterval === 'three_months') {
+    warnings.push('3-Monats-Intervall ist fuer Live-Suchen deutlich breiter.');
+    riskScore += 2;
+  }
+
+  if (filters.trendInterval === 'all') {
+    blockingReasons.push('Intervall "Alle" ist fuer manuelle Live-Abfragen gesperrt.');
+  }
+
+  if (filters.trendInterval === 'three_months' && !categories.length && filters.minDiscount < 40) {
+    blockingReasons.push('3 Monate ohne Kategorie und mit niedrigem Mindest-Rabatt ist zu breit.');
+  }
+
+  if (!categories.length && filters.minDiscount < 25 && filters.minPrice === null && filters.maxPrice === null) {
+    blockingReasons.push('Die Query ist ohne Kategorie, ohne Preisgrenzen und mit sehr niedrigem Mindest-Rabatt zu breit.');
+  }
+
+  const riskLevel = blockingReasons.length ? 'blocked' : riskScore >= 4 ? 'high' : riskScore >= 2 ? 'medium' : 'low';
+
+  return {
+    cappedLimit,
+    estimatedTokenCost: estimateProtectedManualTokenCost(filters, settings),
+    estimatedRiskScore: riskScore,
+    estimatedRawHitsRisk: riskLevel,
+    warnings,
+    blockingReasons
+  };
+}
+
+function getKeepaRequestWindowMetrics(windowMs = KEEPA_REQUEST_WINDOW_60S_MS) {
+  const startedAt = new Date(Date.now() - windowMs).toISOString();
+  const row =
+    db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS requestCount,
+            COALESCE(SUM(COALESCE(tokens_used, official_usage_value, estimated_usage, 0)), 0) AS tokensUsed,
+            COALESCE(SUM(result_count), 0) AS resultCount,
+            MAX(created_at) AS lastRequestAt
+          FROM keepa_usage_logs
+          WHERE action = 'keepa-request'
+            AND created_at >= ?
+        `
+      )
+      .get(startedAt) || {};
+  const requestCount = parseInteger(row.requestCount, 0);
+  const tokensUsed = Math.round((parseNumber(row.tokensUsed, 0) || 0) * 10) / 10;
+  const resultCount = parseInteger(row.resultCount, 0);
+  const windowMinutes = Math.max(windowMs / 60000, 1);
+
+  return {
+    windowMs,
+    windowSeconds: Math.round(windowMs / 1000),
+    requestCount,
+    tokensUsed,
+    resultCount,
+    requestsPerMinute: Math.round(((requestCount / windowMinutes) * 10)) / 10,
+    avgTokensPerRequest: requestCount ? Math.round(((tokensUsed / requestCount) * 10)) / 10 : 0,
+    avgTokensPerResult: resultCount ? Math.round(((tokensUsed / resultCount) * 10)) / 10 : 0,
+    lastRequestAt: row.lastRequestAt || null
+  };
+}
+
+function getLatestKeepaApiRequest() {
+  const row = db
+    .prepare(
+      `
+        SELECT *
+        FROM keepa_usage_logs
+        WHERE action = 'keepa-request'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `
+    )
+    .get();
+
+  return row ? mapUsageLogRow(row) : null;
+}
+
+function getMostExpensiveKeepaApiRequest() {
+  const row = db
+    .prepare(
+      `
+        SELECT *
+        FROM keepa_usage_logs
+        WHERE action = 'keepa-request'
+        ORDER BY COALESCE(tokens_used, official_usage_value, estimated_usage, 0) DESC, created_at DESC
+        LIMIT 1
+      `
+    )
+    .get();
+
+  return row ? mapUsageLogRow(row) : null;
+}
+
+function buildKeepaTrackingWarnings({ recent60s, recent5m, lastRequest, expensiveRequest, hardStopActive = false } = {}) {
+  const warnings = [];
+
+  if (hardStopActive) {
+    warnings.push({
+      code: 'HARD_STOP_ACTIVE',
+      level: 'danger',
+      title: 'Hard Stop aktiv',
+      message: 'Neue Keepa-Requests werden aktuell durch die Schutzschicht blockiert.'
+    });
+  }
+
+  if ((recent60s?.tokensUsed ?? 0) >= KEEPA_MAX_TOKENS_PER_60S || (recent5m?.tokensUsed ?? 0) >= KEEPA_MAX_TOKENS_PER_5M) {
+    warnings.push({
+      code: 'HIGH_TOKEN_USAGE',
+      level: 'warning',
+      title: 'High Token Usage',
+      message: `${recent60s?.tokensUsed ?? 0} Tokens in 60s / ${recent5m?.tokensUsed ?? 0} Tokens in 5m.`,
+      value: recent60s?.tokensUsed ?? 0
+    });
+  }
+
+  if ((recent60s?.requestCount ?? 0) >= KEEPA_MAX_REQUESTS_PER_60S || (recent5m?.requestCount ?? 0) >= KEEPA_MAX_REQUESTS_PER_5M) {
+    warnings.push({
+      code: 'TOO_MANY_REQUESTS',
+      level: 'warning',
+      title: 'Too Many Requests',
+      message: `${recent60s?.requestCount ?? 0} Requests in 60s / ${recent5m?.requestCount ?? 0} Requests in 5m.`,
+      value: recent60s?.requestCount ?? 0
+    });
+  }
+
+  if ((lastRequest?.tokensUsed ?? 0) >= KEEPA_EXPENSIVE_REQUEST_TOKENS || (expensiveRequest?.tokensUsed ?? 0) >= KEEPA_EXPENSIVE_REQUEST_TOKENS) {
+    warnings.push({
+      code: 'EXPENSIVE_QUERY',
+      level: 'warning',
+      title: 'Expensive Query',
+      message: `Teuerster Request bisher: ${expensiveRequest?.tokensUsed ?? lastRequest?.tokensUsed ?? 0} Tokens.`,
+      value: expensiveRequest?.tokensUsed ?? lastRequest?.tokensUsed ?? 0
+    });
+  }
+
+  return warnings;
+}
+
+async function getKeepaProtectionConnection(reason = 'status-check') {
+  const keepaConfig = getKeepaConfig();
+
+  if (!keepaConfig.key) {
+    return {
+      configured: false,
+      connected: false,
+      tokensLeft: null,
+      checkedAt: null,
+      refillRate: null,
+      refillInMs: null,
+      errorMessage: 'KEEPA_API_KEY fehlt im Backend.'
+    };
+  }
+
+  try {
+    const connection = await loadKeepaConnectionStatus(true, reason);
+    return {
+      ...connection,
+      configured: true,
+      errorMessage: ''
+    };
+  } catch (error) {
+    return {
+      configured: true,
+      connected: false,
+      tokensLeft: keepaConnectionCache?.tokensLeft ?? null,
+      checkedAt: keepaConnectionCache?.checkedAt || null,
+      refillRate: keepaConnectionCache?.refillRate ?? null,
+      refillInMs: keepaConnectionCache?.refillInMs ?? null,
+      errorMessage: buildKeepaRequestError(error, 'Keepa-Verbindung konnte nicht geprueft werden.')
+    };
+  }
+}
+
+function buildKeepaProtectionState({
+  origin = 'manual',
+  drawerKey = '',
+  connection = null,
+  risk = null
+} = {}) {
+  const now = Date.now();
+  const cooldownRemainingMs = Math.max(0, keepaManualProtectionState.cooldownUntil - now);
+  const recent60s = getKeepaRequestWindowMetrics(KEEPA_REQUEST_WINDOW_60S_MS);
+  const recent5m = getKeepaRequestWindowMetrics(KEEPA_REQUEST_WINDOW_5M_MS);
+  const activeRequest =
+    keepaSearchExecutionState.active
+      ? {
+          source: keepaSearchExecutionState.source,
+          drawerKey: keepaSearchExecutionState.drawerKey,
+          startedAt: keepaSearchExecutionState.startedAt
+        }
+      : null;
+  const estimatedTokenCost = risk?.estimatedTokenCost ?? 0;
+  const minTokensRequired = origin === 'automatic'
+    ? Math.max(KEEPA_AUTO_HARD_STOP_MIN_TOKENS, estimatedTokenCost + KEEPA_MANUAL_TOKEN_BUFFER)
+    : Math.max(KEEPA_HARD_STOP_MIN_TOKENS, estimatedTokenCost + KEEPA_MANUAL_TOKEN_BUFFER);
+  const lowTokens =
+    connection?.tokensLeft !== null &&
+    connection?.tokensLeft !== undefined &&
+    Number(connection.tokensLeft) < minTokensRequired;
+
+  return {
+    origin,
+    drawerKey,
+    tokensLeft: connection?.tokensLeft ?? null,
+    tokensCheckedAt: connection?.checkedAt || null,
+    connectionError: !connection?.configured
+      ? 'KEEPA_API_KEY fehlt im Backend.'
+      : connection?.connected
+        ? ''
+        : connection?.errorMessage || 'Keepa-Verbindung konnte nicht geprueft werden.',
+    minTokensRequired,
+    estimatedTokenCost,
+    hardStopActive: Boolean(lowTokens),
+    cooldownActive: cooldownRemainingMs > 0,
+    cooldownRemainingMs,
+    recentUsage: {
+      last60s: recent60s,
+      last5m: recent5m
+    },
+    tooManyRequestsActive:
+      recent60s.requestCount >= KEEPA_MAX_REQUESTS_PER_60S || recent5m.requestCount >= KEEPA_MAX_REQUESTS_PER_5M,
+    highUsageActive: recent60s.tokensUsed >= KEEPA_MAX_TOKENS_PER_60S || recent5m.tokensUsed >= KEEPA_MAX_TOKENS_PER_5M,
+    requestActive: Boolean(activeRequest),
+    currentRequest: activeRequest,
+    blocked: false,
+    blockCode: '',
+    blockReason: '',
+    riskLevel: risk?.estimatedRawHitsRisk || 'low',
+    riskScore: risk?.estimatedRiskScore ?? 0,
+    warnings: risk?.warnings || [],
+    blockingReasons: risk?.blockingReasons || [],
+    cappedLimit: risk?.cappedLimit ?? null,
+    lastFinishedAt: keepaManualProtectionState.lastFinishedAt || null,
+    lastBlockedAt: keepaManualProtectionState.lastBlockedAt || null,
+    lastBlockedReason: keepaManualProtectionState.lastBlockedReason || '',
+    confirmationPending: Boolean(
+      keepaManualProtectionState.pendingConfirmation &&
+      keepaManualProtectionState.pendingConfirmation.expiresAt > now
+    ),
+    confirmationExpiresAt:
+      keepaManualProtectionState.pendingConfirmation?.expiresAt
+        ? new Date(keepaManualProtectionState.pendingConfirmation.expiresAt).toISOString()
+        : null
+  };
+}
+
+function finalizeKeepaProtectionDecision(protection) {
+  const next = { ...protection };
+
+  if (protection.requestActive) {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_REQUEST_ACTIVE';
+    next.blockReason = 'Es laeuft bereits eine Keepa-Abfrage. Bitte warte bis der aktuelle Run beendet ist.';
+    return next;
+  }
+
+  if (protection.cooldownActive && protection.origin === 'manual') {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_REQUEST_COOLDOWN';
+    next.blockReason = `Keepa-Cooldown aktiv. Bitte warte noch ${Math.ceil(protection.cooldownRemainingMs / 1000)} Sekunden.`;
+    return next;
+  }
+
+  if (protection.connectionError) {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_NOT_CONNECTED';
+    next.blockReason = protection.connectionError;
+    return next;
+  }
+
+  if (protection.hardStopActive) {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_LOW_TOKENS';
+    next.blockReason = `Keepa-Schutz aktiv – zu wenig Credits. Verfuegbar: ${protection.tokensLeft ?? '-'}, benoetigt: ${protection.minTokensRequired}.`;
+    return next;
+  }
+
+  if (protection.tooManyRequestsActive) {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_TOO_MANY_REQUESTS';
+    next.blockReason = `Keepa-Schutz aktiv: zu viele Requests in kurzer Zeit (${protection.recentUsage?.last60s?.requestCount ?? 0} in 60s).`;
+    return next;
+  }
+
+  if (protection.highUsageActive) {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_HIGH_USAGE_WINDOW';
+    next.blockReason = `Keepa-Schutz aktiv: hoher Verbrauch in kurzer Zeit (${protection.recentUsage?.last60s?.tokensUsed ?? 0} Tokens in 60s).`;
+    return next;
+  }
+
+  if (protection.blockingReasons?.length) {
+    next.blocked = true;
+    next.blockCode = 'KEEPA_QUERY_TOO_BROAD';
+    next.blockReason = protection.blockingReasons[0];
+    return next;
+  }
+
+  return next;
+}
+
+async function buildKeepaManualDryRun(filters, options = {}) {
+  const isConfirmed = options.confirmed === true;
+  const settings = getKeepaSettings();
+  const connection = await getKeepaProtectionConnection('status-check');
+  const risk = analyzeKeepaManualQueryRisk(filters, settings);
+  const effectiveFilters = {
+    ...filters,
+    limit: risk.cappedLimit
+  };
+  const protection = finalizeKeepaProtectionDecision(
+    buildKeepaProtectionState({
+      origin: 'manual',
+      drawerKey: filters.drawerKey,
+      connection,
+      risk
+    })
+  );
+
+  protection.connectionError = !connection.configured
+    ? 'KEEPA_API_KEY fehlt im Backend.'
+    : connection.connected
+      ? ''
+      : connection.errorMessage || 'Keepa-Verbindung konnte nicht geprueft werden.';
+
+  const blocked = protection.blocked || Boolean(protection.connectionError);
+  const confirmationToken = blocked || isConfirmed ? '' : buildKeepaManualConfirmationToken();
+  const createdAt = nowIso();
+  const expiresAt = Date.now() + KEEPA_MANUAL_CONFIRM_TTL_MS;
+
+  if (blocked) {
+    keepaManualProtectionState.lastBlockedAt = createdAt;
+    keepaManualProtectionState.lastBlockedReason = protection.blockReason || protection.connectionError || 'Keepa-Schutz aktiv.';
+    keepaManualProtectionState.pendingConfirmation = null;
+
+    logGeneratorDebug('KEEPA REQUEST BLOCKED', {
+      drawerKey: filters.drawerKey,
+      blockCode: protection.blockCode || 'KEEPA_PROTECTION_BLOCKED',
+      blockReason: protection.blockReason || protection.connectionError || 'Keepa-Schutz aktiv.'
+    });
+
+    if (protection.blockCode === 'KEEPA_LOW_TOKENS') {
+      logGeneratorDebug('KEEPA REQUEST BLOCKED LOW TOKENS', {
+        drawerKey: filters.drawerKey,
+        tokensLeft: protection.tokensLeft,
+        minTokensRequired: protection.minTokensRequired
+      });
+      logGeneratorDebug('KEEPA HARD STOP ACTIVE', {
+        drawerKey: filters.drawerKey,
+        tokensLeft: protection.tokensLeft,
+        minTokensRequired: protection.minTokensRequired
+      });
+    } else if (protection.blockCode === 'KEEPA_QUERY_TOO_BROAD') {
+      logGeneratorDebug('KEEPA REQUEST BLOCKED QUERY TOO BROAD', {
+        drawerKey: filters.drawerKey,
+        warnings: protection.warnings,
+        blockingReasons: protection.blockingReasons
+      });
+    } else if (protection.blockCode === 'KEEPA_REQUEST_COOLDOWN') {
+      logGeneratorDebug('KEEPA REQUEST SKIPPED COOLDOWN', {
+        drawerKey: filters.drawerKey,
+        cooldownRemainingMs: protection.cooldownRemainingMs
+      });
+    } else if (protection.blockCode === 'KEEPA_TOO_MANY_REQUESTS' || protection.blockCode === 'KEEPA_HIGH_USAGE_WINDOW') {
+      logGeneratorDebug('KEEPA HIGH USAGE DETECTED', {
+        drawerKey: filters.drawerKey,
+        blockCode: protection.blockCode,
+        requestCount60s: protection.recentUsage?.last60s?.requestCount ?? 0,
+        tokensUsed60s: protection.recentUsage?.last60s?.tokensUsed ?? 0,
+        requestCount5m: protection.recentUsage?.last5m?.requestCount ?? 0,
+        tokensUsed5m: protection.recentUsage?.last5m?.tokensUsed ?? 0
+      });
+    }
+  } else if (!isConfirmed) {
+    keepaManualProtectionState.pendingConfirmation = {
+      token: confirmationToken,
+      fingerprint: buildKeepaManualSearchFingerprint(effectiveFilters),
+      expiresAt,
+      filters: effectiveFilters
+    };
+
+    logGeneratorDebug('KEEPA DRY RUN CREATED', {
+      drawerKey: filters.drawerKey,
+      estimatedTokenCost: risk.estimatedTokenCost,
+      tokensLeft: protection.tokensLeft,
+      riskLevel: protection.riskLevel,
+      cappedLimit: risk.cappedLimit
+    });
+    logGeneratorDebug('KEEPA USER CONFIRMATION REQUIRED', {
+      drawerKey: filters.drawerKey,
+      confirmationExpiresAt: new Date(expiresAt).toISOString()
+    });
+  }
+
+  return {
+    blocked,
+    confirmationRequired: !blocked && !isConfirmed,
+    confirmationToken: !blocked && !isConfirmed ? confirmationToken : null,
+    createdAt,
+    expiresAt: new Date(expiresAt).toISOString(),
+    effectiveFilters,
+    protection: {
+      ...protection,
+      connectionError: protection.connectionError || ''
+    }
+  };
+}
+
+function validateKeepaManualConfirmation(filters, confirmationToken) {
+  const pending = keepaManualProtectionState.pendingConfirmation;
+  if (!pending || pending.expiresAt <= Date.now()) {
+    keepaManualProtectionState.pendingConfirmation = null;
+    throw createKeepaProtectionError(
+      'Bitte zuerst einen aktuellen Dry-Run erzeugen und danach bewusst bestaetigen.',
+      'KEEPA_CONFIRMATION_REQUIRED',
+      409
+    );
+  }
+
+  if (cleanText(confirmationToken) !== pending.token) {
+    throw createKeepaProtectionError(
+      'Die bestaetigte Keepa-Abfrage ist abgelaufen oder passt nicht mehr zu den aktuellen Filtern.',
+      'KEEPA_CONFIRMATION_INVALID',
+      409
+    );
+  }
+
+  if (pending.fingerprint !== buildKeepaManualSearchFingerprint(filters)) {
+    throw createKeepaProtectionError(
+      'Die Filter wurden nach dem Dry-Run geaendert. Bitte zuerst eine neue Vorschau erzeugen.',
+      'KEEPA_CONFIRMATION_STALE',
+      409
+    );
+  }
+
+  return pending.filters || filters;
+}
+
+function beginKeepaSearchExecution(source, drawerKey) {
+  if (keepaSearchExecutionState.active) {
+    throw createKeepaProtectionError(
+      'Es laeuft bereits eine Keepa-Abfrage. Bitte warte bis der aktuelle Run beendet ist.',
+      'KEEPA_REQUEST_ACTIVE',
+      429
+    );
+  }
+
+  keepaSearchExecutionState = {
+    active: true,
+    source,
+    drawerKey,
+    startedAt: nowIso()
+  };
+}
+
+function finishKeepaSearchExecution(source = 'manual') {
+  keepaSearchExecutionState = {
+    active: false,
+    source: '',
+    drawerKey: '',
+    startedAt: null
+  };
+
+  if (source === 'manual') {
+    keepaManualProtectionState.cooldownUntil = Date.now() + KEEPA_MANUAL_COOLDOWN_MS;
+    keepaManualProtectionState.lastFinishedAt = nowIso();
+    keepaManualProtectionState.pendingConfirmation = null;
+  }
+}
+
 function recordKeepaUsage(entry = {}) {
   const createdAt = cleanText(entry.createdAt) || nowIso();
   const usageDate = toLocalDateKey(createdAt);
   const action = normalizeUsageAction(entry.action, 'manual-search');
   const module = normalizeUsageModule(entry.module || entry.source, 'manual-search');
+  const mode = resolveKeepaUsageMode(entry, action, module);
+  const drawerKey = deriveUsageDrawerKey(entry);
   const requestStatus = normalizeUsageStatus(entry.requestStatus, 'success');
   const resultCount = parseInteger(entry.resultCount, 0);
+  const timestampStart = cleanText(entry.timestampStart) || createdAt;
+  const timestampEnd = cleanText(entry.timestampEnd) || createdAt;
   const durationMs = clamp(parseInteger(entry.durationMs, 0), 0, 24 * 60 * 60 * 1000);
   const estimatedUsage = Math.max(0, parseNumber(entry.estimatedUsage, 0) ?? 0);
+  const tokensBefore = parseInteger(entry.tokensBefore, null);
   const officialUsageValue = parseNumber(entry.officialUsageValue, null);
   const officialTokensLeft = parseInteger(entry.officialTokensLeft, null);
+  const tokensAfter = parseInteger(entry.tokensAfter ?? officialTokensLeft, null);
+  const tokensUsed = resolveKeepaTokensUsedValue({
+    tokensUsed: entry.tokensUsed,
+    tokensBefore,
+    tokensAfter,
+    officialTokensLeft,
+    officialUsageValue,
+    estimatedUsage
+  });
   const ruleId = parseInteger(entry.ruleId, null);
   const errorMessage = cleanText(entry.errorMessage) || null;
   const filtersJson = toJson(sanitizeUsageFilters(entry.filters));
@@ -456,6 +1272,13 @@ function recordKeepaUsage(entry = {}) {
       INSERT INTO keepa_usage_logs (
         action,
         module,
+        mode,
+        drawer_key,
+        timestamp_start,
+        timestamp_end,
+        tokens_before,
+        tokens_after,
+        tokens_used,
         filters_json,
         result_count,
         duration_ms,
@@ -470,6 +1293,13 @@ function recordKeepaUsage(entry = {}) {
       ) VALUES (
         @action,
         @module,
+        @mode,
+        @drawerKey,
+        @timestampStart,
+        @timestampEnd,
+        @tokensBefore,
+        @tokensAfter,
+        @tokensUsed,
         @filtersJson,
         @resultCount,
         @durationMs,
@@ -486,6 +1316,13 @@ function recordKeepaUsage(entry = {}) {
   ).run({
     action,
     module,
+    mode,
+    drawerKey,
+    timestampStart,
+    timestampEnd,
+    tokensBefore,
+    tokensAfter,
+    tokensUsed,
     filtersJson,
     resultCount,
     durationMs,
@@ -509,6 +1346,7 @@ function recordKeepaUsage(entry = {}) {
         result_count,
         estimated_usage,
         official_usage_value,
+        tokens_used_total,
         success_count,
         error_count,
         total_duration_ms,
@@ -521,6 +1359,7 @@ function recordKeepaUsage(entry = {}) {
         @resultCount,
         @estimatedUsage,
         @officialUsageValue,
+        @tokensUsed,
         @successCount,
         @errorCount,
         @durationMs,
@@ -532,6 +1371,7 @@ function recordKeepaUsage(entry = {}) {
         result_count = result_count + @resultCount,
         estimated_usage = estimated_usage + @estimatedUsage,
         official_usage_value = COALESCE(official_usage_value, 0) + COALESCE(@officialUsageValue, 0),
+        tokens_used_total = COALESCE(tokens_used_total, 0) + @tokensUsed,
         success_count = success_count + @successCount,
         error_count = error_count + @errorCount,
         total_duration_ms = total_duration_ms + @durationMs,
@@ -547,20 +1387,44 @@ function recordKeepaUsage(entry = {}) {
     resultCount,
     estimatedUsage,
     officialUsageValue,
+    tokensUsed,
     successCount: requestStatus === 'success' ? 1 : 0,
     errorCount: requestStatus === 'error' ? 1 : 0,
     durationMs,
     createdAt
   });
 
+  logGeneratorDebug('KEEPA TOKEN/CREDIT TRACK UPDATED', {
+    action,
+    module,
+    mode,
+    drawerKey,
+    requestStatus,
+    estimatedUsage,
+    officialUsageValue,
+    tokensBefore,
+    tokensAfter,
+    tokensUsed,
+    officialTokensLeft,
+    resultCount,
+    createdAt
+  });
+
   return {
     action,
     module,
+    mode,
+    drawerKey,
     requestStatus,
+    timestampStart,
+    timestampEnd,
     resultCount,
     durationMs,
     estimatedUsage,
     officialUsageValue,
+    tokensBefore,
+    tokensAfter,
+    tokensUsed,
     officialTokensLeft,
     ruleId,
     createdAt
@@ -570,6 +1434,224 @@ function recordKeepaUsage(entry = {}) {
 function normalizeSellerType(value) {
   const normalized = cleanText(String(value || '')).toUpperCase();
   return ['ALL', 'AMAZON', 'FBA', 'FBM'].includes(normalized) ? normalized : 'ALL';
+}
+
+function normalizeDrawerKey(value, fallback = 'AMAZON') {
+  const normalized = cleanText(String(value || '')).toUpperCase();
+  return KEEPA_DRAWER_CATALOG.some((item) => item.key === normalized) ? normalized : fallback;
+}
+
+function normalizeTrendInterval(value, fallback = 'week') {
+  const normalized = cleanText(String(value || '')).toLowerCase();
+  return KEEPA_TREND_INTERVAL_OPTIONS.some((item) => item.value === normalized) ? normalized : fallback;
+}
+
+function normalizeSortBy(value, fallback = 'percent') {
+  const normalized = cleanText(String(value || '')).toLowerCase();
+  return KEEPA_SORT_OPTIONS.some((item) => item.value === normalized) ? normalized : fallback;
+}
+
+function normalizeAmazonOfferMode(value, fallback = 'all') {
+  const normalized = cleanText(String(value || '')).toLowerCase();
+  return KEEPA_AMAZON_OFFER_OPTIONS.some((item) => item.value === normalized) ? normalized : fallback;
+}
+
+function normalizeDrawerConfig(drawerKey, config = {}, fallback = DEFAULT_DRAWER_CONFIGS[drawerKey]) {
+  const fallbackConfig = fallback || DEFAULT_DRAWER_CONFIGS[normalizeDrawerKey(drawerKey)];
+  const minPrice = sanitizePriceBoundary(config?.minPrice ?? fallbackConfig.minPrice);
+  const maxPrice = sanitizePriceBoundary(config?.maxPrice ?? fallbackConfig.maxPrice);
+
+  return {
+    active: parseBool(config?.active, fallbackConfig.active),
+    sellerType: normalizeSellerType(config?.sellerType || fallbackConfig.sellerType),
+    patternSupportEnabled: parseBool(config?.patternSupportEnabled, fallbackConfig.patternSupportEnabled),
+    trendInterval: normalizeTrendInterval(config?.trendInterval, fallbackConfig.trendInterval),
+    minDiscount: clamp(parseNumber(config?.minDiscount, fallbackConfig.minDiscount), 0, 95),
+    minPrice,
+    maxPrice,
+    categories: normalizeCategoryIds(config?.categories, fallbackConfig.categories),
+    onlyPrime: parseBool(config?.onlyPrime, fallbackConfig.onlyPrime),
+    onlyInStock: parseBool(config?.onlyInStock, fallbackConfig.onlyInStock),
+    onlyGoodRating: parseBool(config?.onlyGoodRating, fallbackConfig.onlyGoodRating),
+    onlyWithReviews: parseBool(config?.onlyWithReviews, fallbackConfig.onlyWithReviews),
+    amazonOfferMode: normalizeAmazonOfferMode(config?.amazonOfferMode, fallbackConfig.amazonOfferMode),
+    singleVariantOnly: parseBool(config?.singleVariantOnly, fallbackConfig.singleVariantOnly),
+    recentPriceChangeOnly: parseBool(config?.recentPriceChangeOnly, fallbackConfig.recentPriceChangeOnly),
+    sortBy: normalizeSortBy(config?.sortBy, fallbackConfig.sortBy),
+    autoModeAllowed: parseBool(config?.autoModeAllowed, fallbackConfig.autoModeAllowed),
+    testGroupPostingAllowed: parseBool(config?.testGroupPostingAllowed, fallbackConfig.testGroupPostingAllowed)
+  };
+}
+
+function normalizeDrawerConfigs(config = {}, fallback = DEFAULT_DRAWER_CONFIGS) {
+  return Object.fromEntries(
+    KEEPA_DRAWER_CATALOG.map((item) => [
+      item.key,
+      normalizeDrawerConfig(item.key, config?.[item.key], fallback?.[item.key] || DEFAULT_DRAWER_CONFIGS[item.key])
+    ])
+  );
+}
+
+function inferDrawerKeyFromSellerType(value) {
+  const sellerType = normalizeSellerType(value);
+  if (sellerType === 'AMAZON' || sellerType === 'FBA' || sellerType === 'FBM') {
+    return sellerType;
+  }
+
+  return 'AMAZON';
+}
+
+function getDrawerConfig(settings, drawerKey) {
+  const resolvedDrawerKey = normalizeDrawerKey(drawerKey, 'AMAZON');
+  return normalizeDrawerConfig(
+    resolvedDrawerKey,
+    settings?.drawerConfigs?.[resolvedDrawerKey],
+    DEFAULT_DRAWER_CONFIGS[resolvedDrawerKey]
+  );
+}
+
+export function getKeepaDrawerControlConfig(value) {
+  const settings = getKeepaSettings();
+  const drawerKey = inferDrawerKeyFromSellerType(value);
+  return getDrawerConfig(settings, drawerKey);
+}
+
+function resolveKeepaDealDateRangeCode(trendInterval) {
+  const normalized = normalizeTrendInterval(trendInterval, 'week');
+  return (
+    {
+      day: 0,
+      week: 1,
+      month: 2,
+      three_months: 3,
+      all: 4
+    }[normalized] ?? 1
+  );
+}
+
+function resolveKeepaDealSortType(sortBy) {
+  switch (normalizeSortBy(sortBy, 'percent')) {
+    case 'newest':
+      return 1;
+    case 'price_drop':
+      return 2;
+    case 'sales_rank':
+      return 3;
+    case 'price':
+      return 5;
+    case 'percent':
+    default:
+      return 4;
+  }
+}
+
+function resolveKeepaDealPriceTypes(sellerType) {
+  switch (normalizeSellerType(sellerType)) {
+    case 'AMAZON':
+      return [0];
+    case 'FBA':
+      return [10];
+    case 'FBM':
+      return [7];
+    default:
+      return [1];
+  }
+}
+
+function sanitizeKeepaDealSelection(selection = {}) {
+  const sanitized = {};
+
+  Object.entries(selection).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      if (!value.length && !['includeCategories', 'excludeCategories'].includes(key)) {
+        return;
+      }
+
+      sanitized[key] = value;
+      return;
+    }
+
+    sanitized[key] = value;
+  });
+
+  return sanitized;
+}
+
+function buildKeepaManualSelection(filters, settings, rawPageSize) {
+  const dateRange = resolveKeepaDealDateRangeCode(filters.trendInterval);
+  const sortType = resolveKeepaDealSortType(filters.sortBy);
+  const priceTypes = resolveKeepaDealPriceTypes(filters.sellerType);
+  const includeCategories = normalizeCategoryIds(filters.categories, []);
+  const mustHaveAmazonOffer = filters.amazonOfferMode === 'require';
+  const mustNotHaveAmazonOffer = filters.amazonOfferMode === 'exclude';
+
+  const selection = sanitizeKeepaDealSelection({
+    page: Math.max(0, filters.page - 1),
+    domainId: filters.domainId,
+    includeCategories,
+    excludeCategories: [],
+    priceTypes,
+    currentRange: [
+      filters.minPrice !== null ? toMinorUnits(filters.minPrice) : 0,
+      filters.maxPrice !== null ? toMinorUnits(filters.maxPrice) : 2147483647
+    ],
+    deltaRange: [0, 1000000],
+    deltaPercentRange: [filters.minDiscount, 95],
+    salesRankRange: [-1, -1],
+    minRating: filters.onlyGoodRating ? Math.round(settings.goodRatingThreshold * 10) : -1,
+    hasReviews: Boolean(filters.onlyWithReviews || filters.onlyGoodRating),
+    isOutOfStock: filters.onlyInStock ? false : undefined,
+    isLowest: false,
+    isLowest90: false,
+    isLowestOffer: false,
+    titleSearch: '',
+    isRangeEnabled: true,
+    isFilterEnabled: true,
+    filterErotic: true,
+    singleVariation: Boolean(filters.singleVariantOnly),
+    mustHaveAmazonOffer,
+    mustNotHaveAmazonOffer,
+    isPrimeExclusive: false,
+    sortType,
+    dateRange,
+    perPage: rawPageSize
+  });
+
+  return {
+    selection,
+    diagnostics: {
+      localOnlyFields: ['drawerKey', 'onlyPrime', 'recentPriceChangeOnly'],
+      mappedFields: {
+        sellerType: { from: filters.sellerType, to: priceTypes },
+        trendInterval: { from: filters.trendInterval, to: dateRange },
+        sortBy: { from: filters.sortBy, to: sortType },
+        amazonOfferMode: {
+          from: filters.amazonOfferMode,
+          to: { mustHaveAmazonOffer, mustNotHaveAmazonOffer }
+        },
+        singleVariantOnly: {
+          from: filters.singleVariantOnly,
+          to: selection.singleVariation
+        }
+      }
+    }
+  };
+}
+
+function extractKeepaDealRows(data) {
+  if (Array.isArray(data?.deals?.dr)) {
+    return data.deals.dr;
+  }
+
+  if (Array.isArray(data?.dr)) {
+    return data.dr;
+  }
+
+  return [];
 }
 
 function normalizeWorkflowStatus(value) {
@@ -613,6 +1695,10 @@ function normalizeSettingsRow(row) {
     fromJson(row.comparison_source_config_json, {}),
     DEFAULT_COMPARISON_SOURCE_CONFIG
   );
+  const drawerConfigs = normalizeDrawerConfigs(
+    fromJson(row.drawer_configs_json, {}),
+    DEFAULT_SETTINGS.drawerConfigs
+  );
 
   return {
     keepaEnabled: parseBool(row.keepa_enabled, DEFAULT_SETTINGS.keepaEnabled),
@@ -654,6 +1740,7 @@ function normalizeSettingsRow(row) {
     alertMaxPerProduct: clamp(parseInteger(row.alert_max_per_product, DEFAULT_SETTINGS.alertMaxPerProduct), 1, 20),
     telegramMessagePrefix: cleanText(row.telegram_message_prefix) || DEFAULT_SETTINGS.telegramMessagePrefix,
     comparisonSourceConfig,
+    drawerConfigs,
     loggingEnabled: parseBool(row.logging_enabled, DEFAULT_SETTINGS.loggingEnabled),
     estimatedTokensPerManualRun: clamp(
       parseInteger(row.estimated_tokens_per_manual_run, DEFAULT_SETTINGS.estimatedTokensPerManualRun),
@@ -728,6 +1815,10 @@ export function getKeepaSettingsView() {
     domainLabel: domainInfo.label,
     domainOptions: DOMAIN_OPTIONS,
     categoryCatalog: CATEGORY_CATALOG,
+    drawerCatalog: KEEPA_DRAWER_CATALOG,
+    trendIntervalOptions: KEEPA_TREND_INTERVAL_OPTIONS,
+    sortOptions: KEEPA_SORT_OPTIONS,
+    amazonOfferOptions: KEEPA_AMAZON_OFFER_OPTIONS,
     comparisonAdapters: getComparisonAdapterCatalog(settings.comparisonSourceConfig),
     keepaKeyStatus: keepaConfig.key
       ? {
@@ -799,6 +1890,13 @@ function buildKeepaRequestError(error, fallbackMessage) {
   }
 
   return fallbackMessage;
+}
+
+function createKeepaApiTestError(message, code = 'KEEPA_API_TEST_FAILED', statusCode = 500) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = statusCode;
+  return error;
 }
 
 function pickNumericField(source, keys = []) {
@@ -901,6 +1999,59 @@ function getOfferSummary(product) {
     isPrime: bestOffer.isPrime,
     inStock: bestOffer.stock === null ? true : bestOffer.stock > 0
   };
+}
+
+function extractSalesRank(product, deal) {
+  const directRank = pickNumericField(deal, ['salesRank', 'salesrank']) ?? pickNumericField(product, ['salesRank']);
+  if (directRank !== null) {
+    return Math.round(directRank);
+  }
+
+  const stats = product?.stats || {};
+  const statsRank = pickNumericField(stats, ['salesRank', 'currentSalesRank']);
+  if (statsRank !== null) {
+    return Math.round(statsRank);
+  }
+
+  const salesRanks = product?.salesRanks;
+  if (salesRanks && typeof salesRanks === 'object') {
+    const firstRank = Object.values(salesRanks)
+      .flatMap((value) => (Array.isArray(value) ? value : [value]))
+      .map((value) => parseInteger(value, null))
+      .find((value) => value !== null && value >= 0);
+
+    if (firstRank !== undefined) {
+      return firstRank;
+    }
+  }
+
+  return null;
+}
+
+function hasAmazonOffer(product, sellerType) {
+  const offers = Array.isArray(product?.offers) ? product.offers : [];
+  if (offers.some((offer) => Boolean(offer?.isAmazon))) {
+    return true;
+  }
+
+  return sellerType === 'AMAZON';
+}
+
+function hasMultipleVariations(product) {
+  const variations = Array.isArray(product?.variations) ? product.variations : [];
+  if (variations.length > 1) {
+    return true;
+  }
+
+  const variationCsv = cleanText(product?.variationCSV || product?.variationsCSV || '');
+  if (!variationCsv) {
+    return false;
+  }
+
+  return variationCsv
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean).length > 1;
 }
 
 function normalizeCategory(product, deal) {
@@ -1058,6 +2209,10 @@ function applyManualFilters(items, filters, settings) {
       return false;
     }
 
+    if (filters.onlyWithReviews && (!item.reviewCount || Number(item.reviewCount) <= 0)) {
+      return false;
+    }
+
     if (filters.minPrice !== null && item.currentPrice !== null && item.currentPrice < filters.minPrice) {
       return false;
     }
@@ -1066,8 +2221,76 @@ function applyManualFilters(items, filters, settings) {
       return false;
     }
 
+    if (filters.amazonOfferMode === 'require' && !item.hasAmazonOffer) {
+      return false;
+    }
+
+    if (filters.amazonOfferMode === 'exclude' && item.hasAmazonOffer) {
+      return false;
+    }
+
+    if (filters.singleVariantOnly && item.hasMultipleVariations) {
+      return false;
+    }
+
     return true;
   });
+}
+
+function sortSearchItems(items, filters) {
+  const sortedItems = [...items];
+
+  if (filters.sortBy === 'price_drop') {
+    return sortedItems.sort((left, right) => (Number(right.priceDifferenceAbs) || 0) - (Number(left.priceDifferenceAbs) || 0));
+  }
+
+  if (filters.sortBy === 'price') {
+    return sortedItems.sort((left, right) => {
+      const leftPrice = Number(left.currentPrice);
+      const rightPrice = Number(right.currentPrice);
+
+      if (!Number.isFinite(leftPrice) && !Number.isFinite(rightPrice)) {
+        return 0;
+      }
+
+      if (!Number.isFinite(leftPrice)) {
+        return 1;
+      }
+
+      if (!Number.isFinite(rightPrice)) {
+        return -1;
+      }
+
+      return leftPrice - rightPrice;
+    });
+  }
+
+  if (filters.sortBy === 'sales_rank') {
+    return sortedItems.sort((left, right) => {
+      const leftRank = Number(left.salesRank);
+      const rightRank = Number(right.salesRank);
+
+      if (!Number.isFinite(leftRank) && !Number.isFinite(rightRank)) {
+        return 0;
+      }
+
+      if (!Number.isFinite(leftRank)) {
+        return 1;
+      }
+
+      if (!Number.isFinite(rightRank)) {
+        return -1;
+      }
+
+      return leftRank - rightRank;
+    });
+  }
+
+  if (filters.sortBy === 'newest') {
+    return sortedItems;
+  }
+
+  return sortedItems.sort((left, right) => (Number(right.keepaDiscount) || 0) - (Number(left.keepaDiscount) || 0));
 }
 
 function mapExistingResultRow(row) {
@@ -1147,22 +2370,50 @@ async function keepaRequest(path, params = {}, options = {}) {
   if (!key) {
     throw new Error('KEEPA_API_KEY fehlt im Backend.');
   }
+  ensureKeepaApiKeyLog(key);
 
   const usageModule = normalizeUsageModule(
     options.module || options.source || (path === '/token' ? 'status-check' : 'manual-search'),
     path === '/token' ? 'status-check' : 'manual-search'
   );
+  const usageMode = resolveKeepaUsageMode(options, 'keepa-request', usageModule);
+  const usageDrawerKey = deriveUsageDrawerKey({
+    drawerKey: options.drawerKey,
+    filters: options.filters,
+    meta: options.meta
+  });
 
   return queueKeepaTask(async () => {
     let lastError;
     let lastDurationMs = 0;
+    let lastStartedAtIso = nowIso();
+    let lastTokensBefore = parseInteger(keepaConnectionCache?.tokensLeft, null);
 
     for (let attempt = 1; attempt <= keepaConfig.retryLimit; attempt += 1) {
       const controller = new AbortController();
       const timeoutHandle = setTimeout(() => controller.abort(), keepaConfig.timeoutMs);
       const startedAt = Date.now();
+      const startedAtIso = nowIso();
+      const previousTokensLeft = parseInteger(keepaConnectionCache?.tokensLeft, null);
+      lastStartedAtIso = startedAtIso;
+      lastTokensBefore = previousTokensLeft;
 
       try {
+        logGeneratorDebug('KEEPA REQUEST START', {
+          endpoint: path,
+          source: options.source || null,
+          module: usageModule,
+          mode: usageMode,
+          drawerKey: usageDrawerKey || null,
+          attempt
+        });
+        logGeneratorDebug('KEEPA TOKENS BEFORE', {
+          endpoint: path,
+          module: usageModule,
+          mode: usageMode,
+          drawerKey: usageDrawerKey || null,
+          tokensBefore: previousTokensLeft
+        });
         const searchParams = new URLSearchParams({
           key,
           ...Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== ''))
@@ -1184,16 +2435,27 @@ async function keepaRequest(path, params = {}, options = {}) {
         }
 
         const currentTokensLeft = parseInteger(data?.tokensLeft, null);
-        const previousTokensLeft = parseInteger(keepaConnectionCache?.tokensLeft, null);
         const officialUsageValue =
           currentTokensLeft !== null && previousTokensLeft !== null && previousTokensLeft >= currentTokensLeft
             ? previousTokensLeft - currentTokensLeft
             : null;
+        const tokensBefore = previousTokensLeft !== null
+          ? previousTokensLeft
+          : officialUsageValue !== null && currentTokensLeft !== null
+            ? currentTokensLeft + officialUsageValue
+            : null;
+        const resultCount = Array.isArray(data?.products) ? data.products.length : Array.isArray(data?.dr) ? data.dr.length : 0;
         const usage = recordKeepaUsage({
           action: 'keepa-request',
           module: usageModule,
+          mode: usageMode,
+          drawerKey: usageDrawerKey,
+          timestampStart: startedAtIso,
+          timestampEnd: nowIso(),
+          tokensBefore,
+          tokensAfter: currentTokensLeft,
           filters: options.filters,
-          resultCount: Array.isArray(data?.products) ? data.products.length : Array.isArray(data?.dr) ? data.dr.length : 0,
+          resultCount,
           durationMs: lastDurationMs,
           requestStatus: 'success',
           estimatedUsage: 0,
@@ -1204,7 +2466,8 @@ async function keepaRequest(path, params = {}, options = {}) {
             endpoint: path,
             attempt,
             refillIn: parseInteger(data?.refillIn, null),
-            refillRate: parseInteger(data?.refillRate, null)
+            refillRate: parseInteger(data?.refillRate, null),
+            sellerType: options.filters?.sellerType || null
           }
         });
 
@@ -1220,9 +2483,51 @@ async function keepaRequest(path, params = {}, options = {}) {
           };
         }
 
+        logGeneratorDebug('KEEPA RESPONSE RECEIVED', {
+          endpoint: path,
+          source: options.source || null,
+          module: usageModule,
+          attempt,
+          statusCode: response.status,
+          resultCount,
+          tokensLeft: currentTokensLeft
+        });
+        logGeneratorDebug('KEEPA TOKENS AFTER', {
+          endpoint: path,
+          module: usageModule,
+          mode: usageMode,
+          drawerKey: usageDrawerKey || null,
+          tokensAfter: currentTokensLeft
+        });
+        logGeneratorDebug('KEEPA TOKENS USED', {
+          endpoint: path,
+          module: usageModule,
+          mode: usageMode,
+          drawerKey: usageDrawerKey || null,
+          tokensUsed: usage.tokensUsed
+        });
+
+        const recent60s = getKeepaRequestWindowMetrics(KEEPA_REQUEST_WINDOW_60S_MS);
+        const recent5m = getKeepaRequestWindowMetrics(KEEPA_REQUEST_WINDOW_5M_MS);
+        if (
+          usage.tokensUsed >= KEEPA_EXPENSIVE_REQUEST_TOKENS ||
+          recent60s.tokensUsed >= KEEPA_MAX_TOKENS_PER_60S ||
+          recent60s.requestCount >= KEEPA_MAX_REQUESTS_PER_60S
+        ) {
+          logGeneratorDebug('KEEPA HIGH USAGE DETECTED', {
+            endpoint: path,
+            module: usageModule,
+            mode: usageMode,
+            drawerKey: usageDrawerKey || null,
+            tokensUsed: usage.tokensUsed,
+            recent60s,
+            recent5m
+          });
+        }
+
         logKeepaEvent('info', 'keepa_api_request', options.source || path, `Keepa Request ${path} erfolgreich.`, {
           filters: options.filters,
-          resultCount: Array.isArray(data?.products) ? data.products.length : Array.isArray(data?.dr) ? data.dr.length : null,
+          resultCount,
           tokensLeft: parseInteger(data?.tokensLeft, null),
           tokensConsumed: parseInteger(data?.tokensConsumed, null),
           payload: {
@@ -1251,6 +2556,11 @@ async function keepaRequest(path, params = {}, options = {}) {
     recordKeepaUsage({
       action: 'keepa-request',
       module: usageModule,
+      mode: usageMode,
+      drawerKey: usageDrawerKey,
+      timestampStart: lastStartedAtIso,
+      timestampEnd: nowIso(),
+      tokensBefore: lastTokensBefore,
       filters: options.filters,
       durationMs: lastDurationMs,
       requestStatus: 'error',
@@ -1269,6 +2579,13 @@ async function keepaRequest(path, params = {}, options = {}) {
         endpoint: path,
         message: buildKeepaRequestError(lastError, 'Unbekannter Keepa-Fehler')
       }
+    });
+    logGeneratorDebug('KEEPA ERROR', {
+      endpoint: path,
+      source: options.source || null,
+      module: usageModule,
+      message: buildKeepaRequestError(lastError, 'Unbekannter Keepa-Fehler'),
+      retryLimit: keepaConfig.retryLimit
     });
 
     throw (lastError instanceof Error ? lastError : new Error('Keepa-Request fehlgeschlagen.'));
@@ -1336,6 +2653,140 @@ export async function testKeepaConnection() {
       errorMessage: buildKeepaRequestError(error, 'Keepa-Verbindung fehlgeschlagen.')
     });
     throw error;
+  }
+}
+
+export async function runKeepaApiTest(input = {}) {
+  const settings = getKeepaSettings();
+  const keepaConfig = getKeepaConfig();
+  const asin = cleanText(input.asin).toUpperCase() || DEFAULT_KEEPA_TEST_ASIN;
+  const domainId =
+    DOMAIN_OPTIONS.some((item) => item.id === Number(input.domainId || settings.domainId))
+      ? Number(input.domainId || settings.domainId)
+      : settings.domainId;
+
+  logGeneratorDebug('KEEPA TEST START', {
+    asin,
+    domainId,
+    configured: Boolean(keepaConfig.key)
+  });
+
+  if (!keepaConfig.key) {
+    logGeneratorDebug('KEEPA ERROR', {
+      asin,
+      domainId,
+      message: 'Kein Keepa API Key gesetzt.',
+      code: 'KEEPA_API_KEY_MISSING'
+    });
+    throw createKeepaApiTestError('Kein Keepa API Key gesetzt.', 'KEEPA_API_KEY_MISSING', 500);
+  }
+
+  try {
+    const response = await keepaRequest(
+      '/product',
+      {
+        domain: domainId,
+        asin,
+        history: 1,
+        offers: 20,
+        rating: 1,
+        stock: 1,
+        update: 0,
+        stats: 90
+      },
+      {
+        source: 'api_test',
+        module: 'test-connection',
+        filters: {
+          asin,
+          domainId
+        }
+      }
+    );
+
+    const product = Array.isArray(response.data?.products) ? response.data.products[0] : null;
+    if (!product) {
+      throw createKeepaApiTestError(
+        'Keepa API hat kein Testprodukt fuer diese ASIN geliefert.',
+        'KEEPA_TEST_EMPTY_RESPONSE',
+        502
+      );
+    }
+
+    const normalized = normalizeProductContextRecord(
+      product,
+      {
+        asin
+      },
+      { domainId }
+    );
+
+    logGeneratorDebug('KEEPA RESPONSE RECEIVED', {
+      asin,
+      domainId,
+      productCount: Array.isArray(response.data?.products) ? response.data.products.length : 0,
+      tokensLeft: response.data?.tokensLeft ?? null
+    });
+
+    return {
+      ok: true,
+      testedAt: nowIso(),
+      asin,
+      domainId,
+      connection: {
+        connected: true,
+        checkedAt: nowIso(),
+        tokensLeft: response.data?.tokensLeft ?? null
+      },
+      product: normalized
+        ? {
+            status: 'loaded',
+            cached: false,
+            title: normalized.title || asin,
+            sellerType: normalized.sellerType || 'FBM',
+            currentPrice: normalized.currentPrice ?? null,
+            referencePrice: normalized.referencePrice ?? null,
+            keepaDiscount: normalized.keepaDiscount ?? null,
+            dealScore: normalized.dealScore ?? null,
+            categoryName: normalized.categoryName || '',
+            checkedAt: nowIso()
+          }
+        : {
+            status: 'loaded',
+            cached: false,
+            title: cleanText(product.title) || asin,
+            sellerType: 'FBM',
+            currentPrice: null,
+            referencePrice: null,
+            keepaDiscount: null,
+            dealScore: null,
+            categoryName: '',
+            checkedAt: nowIso()
+          },
+      raw: {
+        productCount: Array.isArray(response.data?.products) ? response.data.products.length : 0,
+        hasTokensLeft: response.data?.tokensLeft !== undefined
+      }
+    };
+  } catch (error) {
+    const message = buildKeepaRequestError(error, 'Keepa-Test konnte nicht ausgefuehrt werden.');
+    const statusCode =
+      Number(error?.statusCode) > 0
+        ? Number(error.statusCode)
+        : error?.name === 'AbortError'
+          ? 504
+          : 502;
+    const code =
+      error instanceof Error && error.code ? error.code : statusCode === 504 ? 'KEEPA_TEST_TIMEOUT' : 'KEEPA_API_TEST_FAILED';
+
+    logGeneratorDebug('KEEPA ERROR', {
+      asin,
+      domainId,
+      message,
+      code
+    });
+
+    throw createKeepaApiTestError(message, code, statusCode);
   }
 }
 
@@ -1410,6 +2861,10 @@ export function saveKeepaSettings(input = {}) {
       input.comparisonSourceConfig === undefined
         ? current.comparisonSourceConfig
         : normalizeComparisonSourceConfig(input.comparisonSourceConfig, current.comparisonSourceConfig),
+    drawerConfigs:
+      input.drawerConfigs === undefined
+        ? current.drawerConfigs
+        : normalizeDrawerConfigs(input.drawerConfigs, current.drawerConfigs),
     loggingEnabled: input.loggingEnabled === undefined ? current.loggingEnabled : parseBool(input.loggingEnabled),
     estimatedTokensPerManualRun:
       input.estimatedTokensPerManualRun === undefined
@@ -1423,6 +2878,17 @@ export function saveKeepaSettings(input = {}) {
     Number(next.defaultMinPrice) > Number(next.defaultMaxPrice)
   ) {
     throw new Error('Der Mindestpreis darf nicht groesser als der Hoechstpreis sein.');
+  }
+
+  for (const drawerKey of Object.keys(next.drawerConfigs)) {
+    const drawerConfig = next.drawerConfigs[drawerKey];
+    if (
+      drawerConfig.minPrice !== null &&
+      drawerConfig.maxPrice !== null &&
+      Number(drawerConfig.minPrice) > Number(drawerConfig.maxPrice)
+    ) {
+      throw new Error(`Die Preisgrenzen in der Schublade ${drawerKey} sind ungueltig.`);
+    }
   }
 
   db.prepare(
@@ -1448,6 +2914,7 @@ export function saveKeepaSettings(input = {}) {
           alert_max_per_product = @alertMaxPerProduct,
           telegram_message_prefix = @telegramMessagePrefix,
           comparison_source_config_json = @comparisonSourceConfigJson,
+          drawer_configs_json = @drawerConfigsJson,
           logging_enabled = @loggingEnabled,
           estimated_tokens_per_manual_run = @estimatedTokensPerManualRun,
           updated_at = @updatedAt
@@ -1474,6 +2941,7 @@ export function saveKeepaSettings(input = {}) {
     alertMaxPerProduct: next.alertMaxPerProduct,
     telegramMessagePrefix: next.telegramMessagePrefix,
     comparisonSourceConfigJson: toJson(next.comparisonSourceConfig),
+    drawerConfigsJson: toJson(next.drawerConfigs),
     loggingEnabled: next.loggingEnabled ? 1 : 0,
     estimatedTokensPerManualRun: next.estimatedTokensPerManualRun,
     updatedAt: nowIso()
@@ -1483,8 +2951,32 @@ export function saveKeepaSettings(input = {}) {
     payload: {
       keepaEnabled: next.keepaEnabled,
       schedulerEnabled: next.schedulerEnabled,
-      domainId: next.domainId
+      domainId: next.domainId,
+      drawerConfigs: next.drawerConfigs
     }
+  });
+  logGeneratorDebug('FLOW STATUS UPDATED', {
+    keepaEnabled: next.keepaEnabled,
+    schedulerEnabled: next.schedulerEnabled,
+    alertTelegramEnabled: next.alertTelegramEnabled
+  });
+  logGeneratorDebug('SOURCE STATUS UPDATED', {
+    keepaEnabled: next.keepaEnabled,
+    amazonPrepared: true,
+    loggingEnabled: next.loggingEnabled,
+    schedulerEnabled: next.schedulerEnabled
+  });
+  Object.entries(next.drawerConfigs || {}).forEach(([drawerKey, drawerConfig]) => {
+    logGeneratorDebug(`PATTERN SUPPORT ACTIVE: ${drawerKey}`, {
+      active: drawerConfig.active === true,
+      patternSupportEnabled: drawerConfig.patternSupportEnabled === true,
+      autoModeAllowed: drawerConfig.autoModeAllowed === true
+    });
+    logGeneratorDebug(`AUTO POST ACTIVE: ${drawerKey}`, {
+      active: drawerConfig.active === true,
+      autoPostingEnabled: drawerConfig.testGroupPostingAllowed === true,
+      globalTelegramEnabled: next.alertTelegramEnabled === true
+    });
   });
 
   return getKeepaSettingsView();
@@ -1732,10 +3224,12 @@ export function updateKeepaRule(id, input = {}) {
 
 function normalizeManualSearchInput(input = {}) {
   const settings = getKeepaSettings();
+  const drawerKey = normalizeDrawerKey(input.drawerKey || inferDrawerKeyFromSellerType(input.sellerType || settings.defaultSellerType));
+  const drawerConfig = getDrawerConfig(settings, drawerKey);
   const page = clamp(parseInteger(input.page, 1), 1, MAX_MANUAL_PAGE);
   const limit = clamp(parseInteger(input.limit, settings.defaultPageSize), 1, MAX_MANUAL_PAGE_SIZE);
-  const minPrice = sanitizePriceBoundary(input.minPrice ?? settings.defaultMinPrice);
-  const maxPrice = sanitizePriceBoundary(input.maxPrice ?? settings.defaultMaxPrice);
+  const minPrice = sanitizePriceBoundary(input.minPrice ?? drawerConfig.minPrice ?? settings.defaultMinPrice);
+  const maxPrice = sanitizePriceBoundary(input.maxPrice ?? drawerConfig.maxPrice ?? settings.defaultMaxPrice);
 
   if (minPrice !== null && maxPrice !== null && minPrice > maxPrice) {
     throw new Error('Der Mindestpreis darf nicht groesser als der Hoechstpreis sein.');
@@ -1744,18 +3238,25 @@ function normalizeManualSearchInput(input = {}) {
   return {
     page,
     limit,
+    drawerKey,
     domainId:
       DOMAIN_OPTIONS.some((item) => item.id === Number(input.domainId || settings.domainId))
         ? Number(input.domainId || settings.domainId)
         : settings.domainId,
-    minDiscount: clamp(parseNumber(input.minDiscount, settings.defaultDiscount), 0, 95),
-    sellerType: normalizeSellerType(input.sellerType ?? settings.defaultSellerType),
-    categories: normalizeCategoryIds(input.categories, settings.defaultCategories),
+    minDiscount: clamp(parseNumber(input.minDiscount, drawerConfig.minDiscount ?? settings.defaultDiscount), 0, 95),
+    sellerType: normalizeSellerType(input.sellerType ?? drawerConfig.sellerType ?? settings.defaultSellerType),
+    categories: normalizeCategoryIds(input.categories, drawerConfig.categories ?? settings.defaultCategories),
     minPrice,
     maxPrice,
-    onlyPrime: parseBool(input.onlyPrime, false),
-    onlyInStock: parseBool(input.onlyInStock, true),
-    onlyGoodRating: parseBool(input.onlyGoodRating, false)
+    trendInterval: normalizeTrendInterval(input.trendInterval ?? drawerConfig.trendInterval),
+    sortBy: normalizeSortBy(input.sortBy ?? drawerConfig.sortBy),
+    onlyPrime: parseBool(input.onlyPrime, drawerConfig.onlyPrime),
+    onlyInStock: parseBool(input.onlyInStock, drawerConfig.onlyInStock),
+    onlyGoodRating: parseBool(input.onlyGoodRating, drawerConfig.onlyGoodRating),
+    onlyWithReviews: parseBool(input.onlyWithReviews, drawerConfig.onlyWithReviews),
+    amazonOfferMode: normalizeAmazonOfferMode(input.amazonOfferMode ?? drawerConfig.amazonOfferMode),
+    singleVariantOnly: parseBool(input.singleVariantOnly, drawerConfig.singleVariantOnly),
+    recentPriceChangeOnly: parseBool(input.recentPriceChangeOnly, drawerConfig.recentPriceChangeOnly)
   };
 }
 
@@ -1796,12 +3297,15 @@ function normalizeDealRecord(deal, product, filters, existingRow = null) {
     referenceLabel: 'Referenzpreis / Verlauf',
     keepaDiscount: keepaDiscount !== null ? keepaDiscount : 0,
     sellerType: sellerTypeFromDeal || 'UNKNOWN',
+    salesRank: extractSalesRank(product, deal),
     categoryId: category.categoryId,
     categoryName: category.categoryName,
     rating,
     reviewCount,
     isPrime: Boolean(deal?.isPrimeEligible) || offerSummary.isPrime,
     isInStock: offerSummary.inStock,
+    hasAmazonOffer: hasAmazonOffer(product, sellerTypeFromDeal),
+    hasMultipleVariations: hasMultipleVariations(product),
     comparisonSource: cleanText(existingRow?.comparison_source),
     comparisonStatus: cleanText(existingRow?.comparison_status) || 'not_connected',
     comparisonPrice: parseNumber(existingRow?.comparison_price, null),
@@ -1836,6 +3340,97 @@ function normalizeDealRecord(deal, product, filters, existingRow = null) {
               buyBoxSellerIdHistory: product.buyBoxSellerIdHistory || null
             }
           : null
+      }
+    }
+  };
+}
+
+function extractAverageStatPrice(stats, keys = []) {
+  for (const key of keys) {
+    const value = stats?.[key];
+    if (Array.isArray(value)) {
+      const parsed = value.map((entry) => fromMinorUnits(parseNumber(entry, null))).find((entry) => entry !== null);
+      if (parsed !== null) {
+        return parsed;
+      }
+    }
+
+    const parsed = fromMinorUnits(parseNumber(value, null));
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function normalizeProductContextRecord(product, contextInput = {}, filters = {}, existingRow = null) {
+  const asin = cleanText(contextInput.asin).toUpperCase() || extractAsin(product);
+  if (!asin) {
+    return null;
+  }
+
+  const offerSummary = getOfferSummary(product);
+  const stats = product?.stats || {};
+  const currentPrice =
+    parseNumber(contextInput.currentPrice, null) ??
+    offerSummary.price ??
+    extractAverageStatPrice(stats, ['current', 'currentPrice', 'buyBoxPrice', 'min']);
+  const referencePrice = buildReferencePrice(currentPrice, null, {}, product) ?? extractAverageStatPrice(stats, ['avg90', 'avg30', 'avg']);
+  const keepaDiscount =
+    currentPrice !== null && referencePrice !== null && referencePrice > 0 && referencePrice >= currentPrice
+      ? Math.round((((referencePrice - currentPrice) / referencePrice) * 100) * 10) / 10
+      : 0;
+  const category = normalizeCategory(product, {});
+  const title = cleanText(contextInput.title || product?.title) || asin;
+  const normalizedSellerType = normalizeSellerType(contextInput.sellerType || offerSummary.sellerType || existingRow?.seller_type || 'FBM');
+  const sellerType = normalizedSellerType === 'ALL' ? 'FBM' : normalizedSellerType;
+
+  return {
+    asin,
+    domainId: filters.domainId,
+    title,
+    productUrl: cleanText(contextInput.productUrl) || buildAmazonProductUrl(asin, filters.domainId),
+    imageUrl: cleanText(contextInput.imageUrl) || buildAmazonImageUrl(product?.imagesCSV),
+    currentPrice,
+    referencePrice,
+    referenceLabel: 'Keepa Verlauf / avg90',
+    keepaDiscount,
+    sellerType,
+    salesRank: extractSalesRank(product, {}),
+    categoryId: category.categoryId,
+    categoryName: category.categoryName,
+    rating: normalizeRating(product?.currentRating || stats?.currentRating),
+    reviewCount: parseInteger(product?.currentRatingCount || stats?.reviewCount, null),
+    isPrime: offerSummary.isPrime,
+    isInStock: offerSummary.inStock,
+    hasAmazonOffer: hasAmazonOffer(product, sellerType),
+    hasMultipleVariations: hasMultipleVariations(product),
+    comparisonSource: cleanText(existingRow?.comparison_source),
+    comparisonStatus: cleanText(existingRow?.comparison_status) || 'not_connected',
+    comparisonPrice: parseNumber(existingRow?.comparison_price, null),
+    comparisonPayload: fromJson(existingRow?.comparison_payload_json, null),
+    keepaPayload: {
+      product: {
+        title,
+        imagesCSV: product?.imagesCSV || '',
+        rootCategory: product?.rootCategory || category.categoryId,
+        productGroup: product?.productGroup || '',
+        stats,
+        csv: Array.isArray(product?.csv) ? product.csv : null,
+        offerCSV: product?.offerCSV || null,
+        buyBoxSellerIdHistory: product?.buyBoxSellerIdHistory || null,
+        offers: Array.isArray(product?.offers) ? product.offers : [],
+        liveOffersOrder: Array.isArray(product?.liveOffersOrder) ? product.liveOffersOrder : []
+      },
+      raw: {
+        product: {
+          ...product,
+          stats,
+          csv: Array.isArray(product?.csv) ? product.csv : null,
+          offerCSV: product?.offerCSV || null,
+          buyBoxSellerIdHistory: product?.buyBoxSellerIdHistory || null
+        }
       }
     }
   };
@@ -2087,6 +3682,52 @@ async function executeSearch(filters, meta = {}) {
     origin: meta.origin,
     requestCount: 2
   });
+  const drawerKey = normalizeDrawerKey(filters.drawerKey || inferDrawerKeyFromSellerType(filters.sellerType));
+  const rawPageSize =
+    meta.origin === 'manual'
+      ? clamp(parseInteger(filters.limit, KEEPA_MANUAL_RESULT_LIMIT_CAP), 1, KEEPA_MANUAL_RESULT_LIMIT_CAP)
+      : Math.min(Math.max(filters.limit * 2, filters.limit), 60);
+  const { selection, diagnostics } = buildKeepaManualSelection(filters, settings, rawPageSize);
+
+  logGeneratorDebug(`KEEPA AUTO MODE: ${meta.origin === 'automatic'}`, {
+    drawerKey,
+    origin: meta.origin || 'manual',
+    ruleId: meta.rule?.id || null
+  });
+  logGeneratorDebug(`KEEPA DRAWER ACTIVE: ${drawerKey}`, {
+    drawerKey,
+    sellerType: filters.sellerType,
+    origin: meta.origin || 'manual'
+  });
+  logGeneratorDebug('KEEPA FILTERS APPLIED', {
+    drawerKey,
+    sellerType: filters.sellerType,
+    trendInterval: filters.trendInterval,
+    sortBy: filters.sortBy,
+    minDiscount: filters.minDiscount,
+    minPrice: filters.minPrice,
+    maxPrice: filters.maxPrice,
+    categories: filters.categories,
+    onlyPrime: filters.onlyPrime,
+    onlyInStock: filters.onlyInStock,
+    onlyGoodRating: filters.onlyGoodRating,
+    onlyWithReviews: filters.onlyWithReviews,
+    amazonOfferMode: filters.amazonOfferMode,
+    singleVariantOnly: filters.singleVariantOnly,
+    recentPriceChangeOnly: filters.recentPriceChangeOnly
+  });
+  logGeneratorDebug('KEEPA MANUAL FILTER RECEIVED', {
+    origin: meta.origin || 'manual',
+    drawerKey,
+    filters: sanitizeUsageFilters(filters)
+  });
+  logGeneratorDebug('KEEPA QUERY SANITIZED', {
+    drawerKey,
+    origin: meta.origin || 'manual',
+    localOnlyFields: diagnostics.localOnlyFields,
+    mappedFields: diagnostics.mappedFields,
+    selection
+  });
 
   try {
     if (!settings.keepaEnabled) {
@@ -2096,28 +3737,12 @@ async function executeSearch(filters, meta = {}) {
       throw new Error('KEEPA_API_KEY fehlt im Backend.');
     }
 
-    const rawPageSize = Math.min(Math.max(filters.limit * 2, filters.limit), 60);
-    const selection = {
-      page: filters.page - 1,
-      domainId: filters.domainId,
-      includeCategories: filters.categories,
-      currentRange: [
-        filters.minPrice !== null ? toMinorUnits(filters.minPrice) : 0,
-        filters.maxPrice !== null ? toMinorUnits(filters.maxPrice) : 999999999
-      ],
-      deltaPercentRange: [filters.minDiscount, 95],
-      minRating: filters.onlyGoodRating ? Math.round(settings.goodRatingThreshold * 10) : undefined,
-      hasReviews: filters.onlyGoodRating ? true : undefined,
-      isOutOfStock: filters.onlyInStock ? false : undefined,
-      isRangeEnabled: true,
-      isFilterEnabled: true,
-      filterErotic: true,
-      dateRange: SEARCH_DATE_RANGE_DAYS,
-      sortType: 0,
-      perPage: rawPageSize
-    };
-
     const keepaRequestUsage = [];
+    logGeneratorDebug('KEEPA QUERY SENT', {
+      drawerKey,
+      origin: meta.origin || 'manual',
+      selection
+    });
     const dealResponse = await keepaRequest(
       '/deal',
       {
@@ -2130,20 +3755,32 @@ async function executeSearch(filters, meta = {}) {
         filters: {
           page: filters.page,
           limit: filters.limit,
+          drawerKey,
           sellerType: filters.sellerType,
+          trendInterval: filters.trendInterval,
+          sortBy: filters.sortBy,
           categories: filters.categories,
           minDiscount: filters.minDiscount,
           minPrice: filters.minPrice,
           maxPrice: filters.maxPrice,
           onlyPrime: filters.onlyPrime,
           onlyInStock: filters.onlyInStock,
-          onlyGoodRating: filters.onlyGoodRating
+          onlyGoodRating: filters.onlyGoodRating,
+          onlyWithReviews: filters.onlyWithReviews,
+          amazonOfferMode: filters.amazonOfferMode,
+          singleVariantOnly: filters.singleVariantOnly,
+          recentPriceChangeOnly: filters.recentPriceChangeOnly
         }
       }
     );
     keepaRequestUsage.push(dealResponse.usage);
 
-    const rawDeals = Array.isArray(dealResponse.data?.dr) ? dealResponse.data.dr : [];
+    const rawDeals = extractKeepaDealRows(dealResponse.data);
+    logGeneratorDebug('KEEPA QUERY SUCCESS', {
+      drawerKey,
+      origin: meta.origin || 'manual',
+      rawResultCount: rawDeals.length
+    });
     const asins = [...new Set(rawDeals.map((deal) => extractAsin(deal)).filter(Boolean))].slice(0, rawPageSize);
     const productResponse = asins.length
       ? await keepaRequest(
@@ -2193,7 +3830,10 @@ async function executeSearch(filters, meta = {}) {
         continue;
       }
 
-      normalizedItems.push(await compareAgainstLegalSources(normalized));
+      normalizedItems.push({
+        ...(await compareAgainstLegalSources(normalized)),
+        sourceOrder: normalizedItems.length
+      });
     }
 
     recordKeepaUsage({
@@ -2211,7 +3851,14 @@ async function executeSearch(filters, meta = {}) {
       }
     });
 
-    const filteredItems = applyManualFilters(normalizedItems, filters, settings).slice(0, filters.limit);
+    const filteredItems = sortSearchItems(applyManualFilters(normalizedItems, filters, settings), filters).slice(0, filters.limit);
+    logGeneratorDebug('KEEPA RESULT COUNT', {
+      drawerKey,
+      origin: meta.origin || 'manual',
+      rawResultCount: rawDeals.length,
+      normalizedCount: normalizedItems.length,
+      filteredCount: filteredItems.length
+    });
     const savedItems = filteredItems.map((item) =>
       saveKeepaResult(item, {
         origin: meta.origin || 'manual',
@@ -2237,7 +3884,10 @@ async function executeSearch(filters, meta = {}) {
       meta: {
         requestCount: keepaRequestUsage.length,
         rawResultCount: rawDeals.length,
-        origin: meta.origin || 'manual'
+        origin: meta.origin || 'manual',
+        drawerKey,
+        trendInterval: filters.trendInterval,
+        sortBy: filters.sortBy
       }
     });
 
@@ -2276,6 +3926,14 @@ async function executeSearch(filters, meta = {}) {
       }
     };
   } catch (error) {
+    if (buildKeepaRequestError(error, '').includes('queryJSON')) {
+      logGeneratorDebug('KEEPA QUERY REJECTED', {
+        drawerKey,
+        origin: meta.origin || 'manual',
+        selection,
+        message: buildKeepaRequestError(error, 'Keepa Deal-Query wurde abgelehnt.')
+      });
+    }
     recordKeepaUsage({
       action,
       module,
@@ -2290,15 +3948,257 @@ async function executeSearch(filters, meta = {}) {
   }
 }
 
+export async function loadKeepaProductContext(input = {}) {
+  const asin = cleanText(input.asin).toUpperCase();
+  const settings = getKeepaSettings();
+  const requestedAt = nowIso();
+  const domainId =
+    DOMAIN_OPTIONS.some((item) => item.id === Number(input.domainId || settings.domainId))
+      ? Number(input.domainId || settings.domainId)
+      : settings.domainId;
+  const existingRow = asin
+    ? db.prepare(`SELECT * FROM keepa_results WHERE asin = ? AND domain_id = ? LIMIT 1`).get(asin, domainId)
+    : null;
+  const existingResult = existingRow ? buildResultDto(existingRow) : null;
+  const maxAgeMinutes = clamp(parseInteger(input.maxAgeMinutes, 180), 15, 1440);
+  const existingAgeMs = existingResult?.lastSyncedAt ? Date.now() - new Date(existingResult.lastSyncedAt).getTime() : Number.POSITIVE_INFINITY;
+
+  if (!asin) {
+    return {
+      available: false,
+      status: 'missing_asin',
+      cached: false,
+      requestedAt,
+      reason: 'ASIN fehlt fuer die Keepa-Pruefung.'
+    };
+  }
+
+  if (existingResult && Number.isFinite(existingAgeMs) && existingAgeMs <= maxAgeMinutes * 60 * 1000) {
+    return {
+      available: true,
+      status: 'cached',
+      cached: true,
+      requestedAt,
+      result: existingResult
+    };
+  }
+
+  if (!settings.keepaEnabled) {
+    return {
+      available: Boolean(existingResult),
+      status: existingResult ? 'cached_disabled' : 'disabled',
+      cached: Boolean(existingResult),
+      requestedAt,
+      result: existingResult,
+      reason: 'Keepa ist in den Einstellungen deaktiviert.'
+    };
+  }
+
+  if (!getKeepaConfig().key) {
+    return {
+      available: Boolean(existingResult),
+      status: existingResult ? 'cached_missing_key' : 'missing_key',
+      cached: Boolean(existingResult),
+      requestedAt,
+      result: existingResult,
+      reason: 'KEEPA_API_KEY fehlt im Backend.'
+    };
+  }
+
+  try {
+    const response = await keepaRequest(
+      '/product',
+      {
+        domain: domainId,
+        asin,
+        history: 1,
+        offers: 20,
+        rating: 1,
+        stock: 1,
+        update: 0,
+        stats: 90
+      },
+      {
+        source: 'generator_context_product',
+        module: 'background-check',
+        filters: {
+          asin,
+          domainId,
+          source: cleanText(input.source || 'generator')
+        }
+      }
+    );
+
+    const product = Array.isArray(response.data?.products) ? response.data.products[0] : null;
+    if (!product) {
+      return {
+        available: Boolean(existingResult),
+        status: existingResult ? 'cached_not_found' : 'not_found',
+        cached: Boolean(existingResult),
+        requestedAt,
+        result: existingResult,
+        reason: 'Keepa hat kein Produkt zu dieser ASIN geliefert.'
+      };
+    }
+
+    const normalized = normalizeProductContextRecord(
+      product,
+      {
+        asin,
+        sellerType: input.sellerType,
+        currentPrice: input.currentPrice,
+        title: input.title,
+        productUrl: input.productUrl,
+        imageUrl: input.imageUrl
+      },
+      { domainId },
+      existingRow
+    );
+
+    if (!normalized) {
+      return {
+        available: Boolean(existingResult),
+        status: existingResult ? 'cached_invalid' : 'invalid',
+        cached: Boolean(existingResult),
+        requestedAt,
+        result: existingResult,
+        reason: 'Keepa-Produkt konnte nicht normalisiert werden.'
+      };
+    }
+
+    const storedResult = saveKeepaResult(normalized, {
+      origin: cleanText(input.origin || input.source || 'generator') || 'generator',
+      searchPayload: {
+        source: cleanText(input.source || 'generator') || 'generator',
+        mode: 'product_context',
+        asin,
+        domainId
+      }
+    });
+
+    logGeneratorDebug('api.keepa.generator_context.success', {
+      asin,
+      domainId,
+      keepaResultId: storedResult?.id || null,
+      sellerType: storedResult?.sellerType || null,
+      keepaDiscount: storedResult?.keepaDiscount ?? null,
+      dealScore: storedResult?.dealScore ?? null
+    });
+
+    return {
+      available: true,
+      status: existingResult ? 'refreshed' : 'loaded',
+      cached: false,
+      requestedAt,
+      result: storedResult
+    };
+  } catch (error) {
+    logGeneratorDebug('api.keepa.generator_context.error', {
+      asin,
+      domainId,
+      error: error instanceof Error ? error.message : 'Keepa-Produktkontext fehlgeschlagen'
+    });
+
+    return {
+      available: Boolean(existingResult),
+      status: existingResult ? 'stale' : 'error',
+      cached: Boolean(existingResult),
+      requestedAt,
+      result: existingResult,
+      reason: error instanceof Error ? error.message : 'Keepa-Produktkontext fehlgeschlagen.'
+    };
+  }
+}
+
 export async function runKeepaManualSearch(input = {}) {
   const filters = normalizeManualSearchInput(input);
-  return {
-    filters,
-    ...(await executeSearch(filters, {
+  const confirmed = parseBool(input.confirmed, false);
+  const confirmationToken = cleanText(input.confirmationToken);
+
+  if (!confirmed) {
+    const dryRun = await buildKeepaManualDryRun(filters, { confirmed: false });
+    return {
+      executed: false,
+      dryRun,
+      protection: dryRun.protection,
+      items: [],
+      pagination: {
+        page: filters.page,
+        limit: dryRun.effectiveFilters.limit,
+        hasMore: false,
+        rawResultCount: 0
+      },
+      usage: null
+    };
+  }
+
+  const confirmedFilters = validateKeepaManualConfirmation(filters, confirmationToken);
+  const dryRun = await buildKeepaManualDryRun(confirmedFilters, { confirmed: true });
+  if (dryRun.blocked) {
+    return {
+      executed: false,
+      dryRun,
+      protection: dryRun.protection,
+      items: [],
+      pagination: {
+        page: confirmedFilters.page,
+        limit: dryRun.effectiveFilters.limit,
+        hasMore: false,
+        rawResultCount: 0
+      },
+      usage: null
+    };
+  }
+
+  beginKeepaSearchExecution('manual', confirmedFilters.drawerKey);
+  logGeneratorDebug('KEEPA MANUAL FETCH START', {
+    drawerKey: confirmedFilters.drawerKey,
+    sellerType: confirmedFilters.sellerType,
+    trendInterval: confirmedFilters.trendInterval,
+    minDiscount: confirmedFilters.minDiscount
+  });
+  logGeneratorDebug('KEEPA REQUEST START', {
+    source: 'manual',
+    drawerKey: confirmedFilters.drawerKey,
+    estimatedTokenCost: dryRun.protection.estimatedTokenCost,
+    tokensLeft: dryRun.protection.tokensLeft
+  });
+
+  try {
+    const response = await executeSearch(confirmedFilters, {
       source: 'manual_search',
       origin: 'manual'
-    }))
-  };
+    });
+
+    logGeneratorDebug('KEEPA REQUEST FINISHED', {
+      source: 'manual',
+      drawerKey: confirmedFilters.drawerKey,
+      resultCount: response.items?.length || 0,
+      rawResultCount: response.pagination?.rawResultCount || 0,
+      estimatedUsage: response.usage?.estimatedUsage ?? null
+    });
+    logGeneratorDebug('KEEPA MANUAL FETCH DONE', {
+      drawerKey: confirmedFilters.drawerKey,
+      sellerType: confirmedFilters.sellerType,
+      resultCount: response.items?.length || 0,
+      rawResultCount: response.pagination?.rawResultCount || 0,
+      estimatedUsage: response.usage?.estimatedUsage ?? null
+    });
+
+    return {
+      executed: true,
+      filters: confirmedFilters,
+      protection: {
+        ...dryRun.protection,
+        cooldownActive: true,
+        cooldownRemainingMs: KEEPA_MANUAL_COOLDOWN_MS,
+        lastFinishedAt: nowIso()
+      },
+      ...response
+    };
+  } finally {
+    finishKeepaSearchExecution('manual');
+  }
 }
 
 function buildResultQuery(filters = {}) {
@@ -2462,253 +4362,77 @@ export function updateKeepaResult(id, input = {}) {
   return recalculated;
 }
 
-function buildAlertMessage(result, settings, channelType) {
-  const lines = [];
-  if (settings.telegramMessagePrefix) {
-    lines.push(settings.telegramMessagePrefix);
-  }
-  lines.push(result.title);
-  lines.push(`Preis: ${formatCurrency(result.currentPrice)}`);
-  lines.push(`Rabatt: ${result.keepaDiscount?.toFixed(1) || '0'}%`);
-  lines.push(
-    `Vergleich: ${result.comparisonPrice !== null ? formatCurrency(result.comparisonPrice) : 'nicht verbunden'}`
-  );
-  lines.push(
-    `Preisvorteil: ${
-      result.priceDifferenceAbs !== null && result.priceDifferencePct !== null
-        ? `${formatCurrency(result.priceDifferenceAbs)} (${result.priceDifferencePct.toFixed(1)}%)`
-        : 'nicht berechenbar'
-    }`
-  );
-  lines.push(`Kategorie: ${result.categoryName || '-'}`);
-  lines.push(`Deal-Score: ${result.dealScore}`);
-  if (result.fakeDrop) {
-    lines.push(`Fake-Drop Risiko: ${result.fakeDrop.fakeDropRisk}`);
-    lines.push(`Analyse: ${result.fakeDrop.classificationLabel}`);
-  }
-  lines.push(`Link: ${result.productUrl}`);
+async function maybeSendAlertsForResult(result, rule) {
+  const settings = getKeepaSettings();
+  const drawerConfig = getDrawerConfig(settings, inferDrawerKeyFromSellerType(result.sellerType));
+  const amazonContext = await loadAmazonAffiliateContext({
+    asin: result.asin
+  });
+  const enrichedResult =
+    amazonContext?.available && amazonContext?.result
+      ? {
+          ...result,
+          title: amazonContext.result.title || result.title,
+          imageUrl: amazonContext.result.imageUrl || result.imageUrl,
+          productUrl: amazonContext.result.affiliateUrl || amazonContext.result.detailPageUrl || result.productUrl,
+          amazonAffiliate: amazonContext.result
+        }
+      : {
+          ...result,
+          amazonAffiliate: amazonContext?.result || null
+        };
 
-  return {
-    channelType,
-    text: lines.filter(Boolean).join('\n'),
-    preview: `${result.title} | ${formatCurrency(result.currentPrice)} | ${result.dealScore}`
-  };
-}
+  const learningContext = evaluateLearningRoute({
+    sourceType: 'auto_deals',
+    enforceDecision: true,
+    keepaRequired: true,
+    asin: result.asin,
+    sellerType: result.sellerType,
+    currentPrice: result.currentPrice,
+    keepaResultRecord: result,
+    amazonContext,
+    patternSupportEnabled: drawerConfig.patternSupportEnabled === true
+  });
 
-function buildAlertDedupeKey(result, ruleId, channelType) {
-  const fingerprint = `${result.asin}:${ruleId || 0}:${channelType}:${Math.round((result.currentPrice || 0) * 100)}:${Math.round(
-    (result.comparisonPrice || 0) * 100
-  )}:${result.dealStrength}`;
-  return crypto.createHash('sha1').update(fingerprint).digest('hex');
-}
+  logGeneratorDebug('AUTO DEAL ROUTED THROUGH LEARNING LOGIC', {
+    keepaResultId: result.id,
+    asin: result.asin,
+    sellerType: result.sellerType,
+    routingDecision: learningContext?.learning?.routingDecision || 'review',
+    keepaStatus: learningContext?.keepa?.status || 'missing',
+    amazonStatus: learningContext?.amazon?.status || 'missing'
+  });
 
-function canSendAlert(result, settings, channelType) {
-  if (parseInteger(result.alertCount, 0) >= settings.alertMaxPerProduct) {
-    return {
-      allowed: false,
-      reason: 'Maximale Alert-Anzahl fuer dieses Produkt erreicht.'
-    };
-  }
+  let decisionStatus = 'review';
+  let decisionReason = 'Deal wurde noch nicht fuer die Testgruppe freigegeben.';
 
-  if (result.lastAlertedAt) {
-    const msSinceLastAlert = Date.now() - new Date(result.lastAlertedAt).getTime();
-    if (Number.isFinite(msSinceLastAlert) && msSinceLastAlert < settings.alertCooldownMinutes * 60 * 1000) {
-      return {
-        allowed: false,
-        reason: 'Alert-Cooldown ist noch aktiv.'
-      };
+  if (result.dealStrength !== 'stark') {
+    decisionReason = 'Deal-Staerke liegt unter der Auto-Output-Schwelle.';
+  } else if (learningContext?.learning?.routingDecision !== 'test_group') {
+    decisionStatus = learningContext?.learning?.routingDecision === 'block' ? 'blocked' : 'review';
+    decisionReason = learningContext?.learning?.reason || 'Lern-Logik hat den Deal nicht freigegeben.';
+  } else {
+    const fakeDropGate = evaluateFakeDropAlertEligibility(result, rule);
+    if (!fakeDropGate.allowed) {
+      decisionStatus = fakeDropGate.reviewQueue ? 'review' : 'blocked';
+      decisionReason = fakeDropGate.reason;
+    } else {
+      decisionStatus = 'approved_for_test_group';
+      decisionReason = learningContext?.learning?.reason || 'Deal wurde fuer die Telegram-Testgruppe freigegeben.';
     }
   }
 
-  const duplicate = db
-    .prepare(
-      `
-        SELECT id
-        FROM keepa_alerts
-        WHERE asin = ?
-          AND channel_type = ?
-          AND created_at >= ?
-        LIMIT 1
-      `
-    )
-    .get(result.asin, channelType, new Date(Date.now() - settings.alertCooldownMinutes * 60 * 1000).toISOString());
-
-  if (duplicate) {
-    return {
-      allowed: false,
-      reason: 'Es existiert bereits ein kuerzlich gesendeter Alert fuer dieses Produkt.'
-    };
-  }
-
-  return { allowed: true };
-}
-
-async function insertAlertLog(result, rule, channelType, status, message, payload, errorMessage = null) {
-  const dedupeKey = buildAlertDedupeKey(result, rule?.id, channelType);
-  db.prepare(
-    `
-      INSERT OR IGNORE INTO keepa_alerts (
-        keepa_result_id,
-        asin,
-        channel_type,
-        status,
-        rule_id,
-        dedupe_key,
-        message_preview,
-        payload_json,
-        error_message,
-        created_at,
-        sent_at
-      ) VALUES (
-        @keepaResultId,
-        @asin,
-        @channelType,
-        @status,
-        @ruleId,
-        @dedupeKey,
-        @messagePreview,
-        @payloadJson,
-        @errorMessage,
-        @createdAt,
-        @sentAt
-      )
-    `
-  ).run({
-    keepaResultId: result.id || null,
-    asin: result.asin,
-    channelType,
-    status,
-    ruleId: rule?.id || null,
-    dedupeKey,
-    messagePreview: message.preview,
-    payloadJson: toJson(payload),
-    errorMessage,
-    createdAt: nowIso(),
-    sentAt: status === 'sent' || status === 'stored' ? nowIso() : null
+  const output = await publishAutoDealToTelegramTestGroup({
+    result: enrichedResult,
+    rule,
+    settings,
+    sourceType: cleanText(result.origin).includes('amazon') ? 'amazon' : 'keepa',
+    decisionStatus,
+    decisionReason,
+    learningContext
   });
-}
 
-async function dispatchAlert(result, rule, channelType, settings) {
-  const eligibility = canSendAlert(result, settings, channelType);
-  const message = buildAlertMessage(result, settings, channelType);
-
-  if (!eligibility.allowed) {
-    await insertAlertLog(result, rule, channelType, 'skipped', message, {
-      reason: eligibility.reason
-    });
-    return {
-      channelType,
-      status: 'skipped',
-      reason: eligibility.reason
-    };
-  }
-
-  if (channelType === 'internal') {
-    await insertAlertLog(result, rule, channelType, 'stored', message, {
-      workflowStatus: result.workflowStatus
-    });
-    return {
-      channelType,
-      status: 'stored'
-    };
-  }
-
-  if (channelType === 'whatsapp') {
-    await insertAlertLog(result, rule, channelType, 'disabled', message, {
-      reason: 'WhatsApp ist nur als sicherer Platzhalter vorbereitet.'
-    });
-    return {
-      channelType,
-      status: 'disabled'
-    };
-  }
-
-  try {
-    await sendTelegramPost({
-      text: message.text,
-      imageUrl: result.imageUrl || undefined
-    });
-    await insertAlertLog(result, rule, channelType, 'sent', message, {
-      comparisonPrice: result.comparisonPrice
-    });
-    return {
-      channelType,
-      status: 'sent'
-    };
-  } catch (error) {
-    await insertAlertLog(
-      result,
-      rule,
-      channelType,
-      'failed',
-      message,
-      {
-        comparisonPrice: result.comparisonPrice
-      },
-      buildKeepaRequestError(error, 'Telegram-Versand fehlgeschlagen.')
-    );
-    return {
-      channelType,
-      status: 'failed',
-      error: buildKeepaRequestError(error, 'Telegram-Versand fehlgeschlagen.')
-    };
-  }
-}
-
-async function maybeSendAlertsForResult(result, rule) {
-  const settings = getKeepaSettings();
-  if (result.dealStrength !== 'stark') {
-    return [];
-  }
-
-  const fakeDropGate = evaluateFakeDropAlertEligibility(result, rule);
-  if (!fakeDropGate.allowed) {
-    return [
-      {
-        channelType: 'review',
-        status: fakeDropGate.reviewQueue ? 'review_queue' : 'skipped',
-        reason: fakeDropGate.reason
-      }
-    ];
-  }
-
-  const channels = [];
-  if (settings.alertInternalEnabled) {
-    channels.push('internal');
-  }
-  if (settings.alertTelegramEnabled) {
-    channels.push('telegram');
-  }
-  if (settings.alertWhatsappPlaceholderEnabled) {
-    channels.push('whatsapp');
-  }
-
-  const outputs = [];
-  for (const channelType of channels) {
-    outputs.push(await dispatchAlert(result, rule, channelType, settings));
-  }
-
-  if (outputs.some((item) => item.status === 'sent' || item.status === 'stored')) {
-    db.prepare(
-      `
-        UPDATE keepa_results
-        SET alert_count = COALESCE(alert_count, 0) + 1,
-            last_alerted_at = @lastAlertedAt,
-            workflow_status = CASE
-              WHEN workflow_status = 'verworfen' THEN workflow_status
-              ELSE 'alert_gesendet'
-            END,
-            updated_at = @updatedAt
-        WHERE id = @id
-      `
-    ).run({
-      id: result.id,
-      lastAlertedAt: nowIso(),
-      updatedAt: nowIso()
-    });
-  }
-
-  return outputs;
+  return [output];
 }
 
 function getOverviewCounts() {
@@ -2761,19 +4485,38 @@ function getUsageActionLabel(action) {
 }
 
 function mapUsageLogRow(row) {
+  const tokensUsed = resolveKeepaTokensUsedValue({
+    tokensUsed: row.tokens_used,
+    tokensBefore: row.tokens_before,
+    tokensAfter: row.tokens_after,
+    officialTokensLeft: row.official_tokens_left,
+    officialUsageValue: row.official_usage_value,
+    estimatedUsage: row.estimated_usage
+  });
+  const resultCount = parseInteger(row.result_count, 0);
+
   return {
     id: row.id,
     action: row.action,
     actionLabel: getUsageActionLabel(row.action),
     module: row.module,
     moduleLabel: getUsageModuleLabel(row.module),
+    mode: normalizeKeepaUsageMode(row.mode, resolveKeepaUsageMode({ mode: row.mode }, row.action, row.module)),
+    drawerKey: sanitizeUsageDrawerKey(row.drawer_key, ''),
+    timestampStart: row.timestamp_start || row.created_at,
+    timestampEnd: row.timestamp_end || row.created_at,
     filters: fromJson(row.filters_json, null),
-    resultCount: parseInteger(row.result_count, 0),
+    resultCount,
     durationMs: parseInteger(row.duration_ms, 0),
     requestStatus: normalizeUsageStatus(row.request_status, 'success'),
     estimatedUsage: parseNumber(row.estimated_usage, 0) || 0,
     officialUsageValue: parseNumber(row.official_usage_value, null),
     officialTokensLeft: parseInteger(row.official_tokens_left, null),
+    tokensBefore: parseInteger(row.tokens_before, null),
+    tokensAfter: parseInteger(row.tokens_after, parseInteger(row.official_tokens_left, null)),
+    tokensUsed,
+    tokensPerRequest: tokensUsed,
+    tokensPerResult: resultCount > 0 ? Math.round(((tokensUsed / resultCount) * 10)) / 10 : 0,
     ruleId: parseInteger(row.rule_id, null),
     errorMessage: row.error_message || '',
     meta: fromJson(row.meta_json, null),
@@ -2837,12 +4580,101 @@ function getLatestUsageLog(action) {
   return row ? mapUsageLogRow(row) : null;
 }
 
+function getKeepaRequestTrackingSummary() {
+  const todayStartIso = getRangeStart('today').toISOString();
+  const monthStartIso = getRangeStart('month').toISOString();
+  const monthStartDateKey = toLocalDateKey(getRangeStart('month'));
+  const recent60s = getKeepaRequestWindowMetrics(KEEPA_REQUEST_WINDOW_60S_MS);
+  const recent5m = getKeepaRequestWindowMetrics(KEEPA_REQUEST_WINDOW_5M_MS);
+  const lastRequest = getLatestKeepaApiRequest();
+  const expensiveRequest = getMostExpensiveKeepaApiRequest();
+  const todayStats =
+    db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS requestCount,
+            COALESCE(SUM(COALESCE(tokens_used, official_usage_value, estimated_usage, 0)), 0) AS tokensUsed,
+            COALESCE(SUM(result_count), 0) AS resultCount,
+            MAX(created_at) AS lastRequestAt
+          FROM keepa_usage_logs
+          WHERE action = 'keepa-request'
+            AND created_at >= ?
+        `
+      )
+      .get(todayStartIso) || {};
+  const monthStats =
+    db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS requestCount,
+            COALESCE(SUM(COALESCE(tokens_used, official_usage_value, estimated_usage, 0)), 0) AS tokensUsed,
+            COALESCE(SUM(result_count), 0) AS resultCount
+          FROM keepa_usage_logs
+          WHERE action = 'keepa-request'
+            AND created_at >= ?
+        `
+      )
+      .get(monthStartIso) || {};
+  const activeDaysInMonth =
+    db
+      .prepare(
+        `
+          SELECT COUNT(*) AS count
+          FROM keepa_usage_daily
+          WHERE action = 'keepa-request'
+            AND usage_date >= ?
+            AND request_count > 0
+        `
+      )
+      .get(monthStartDateKey)?.count || 0;
+  const elapsedDaysInMonth = Math.max(1, new Date().getDate());
+  const tokensToday = Math.round((parseNumber(todayStats.tokensUsed, 0) || 0) * 10) / 10;
+  const requestsToday = parseInteger(todayStats.requestCount, 0);
+  const resultsToday = parseInteger(todayStats.resultCount, 0);
+  const tokensMonth = Math.round((parseNumber(monthStats.tokensUsed, 0) || 0) * 10) / 10;
+  const hardStopActive = (() => {
+    const cachedTokens = parseInteger(keepaConnectionCache?.tokensLeft, null);
+    return cachedTokens !== null && cachedTokens < KEEPA_HARD_STOP_MIN_TOKENS;
+  })();
+  const warningsActive = buildKeepaTrackingWarnings({
+    recent60s,
+    recent5m,
+    lastRequest,
+    expensiveRequest,
+    hardStopActive
+  });
+
+  return {
+    lastRequest,
+    expensiveRequest,
+    windows: {
+      last60s: recent60s,
+      last5m: recent5m
+    },
+    requestsToday,
+    tokensToday,
+    tokensMonth,
+    resultsToday,
+    activeDaysInMonth,
+    averageTokensPerDay: Math.round(((tokensMonth / elapsedDaysInMonth) * 10)) / 10,
+    averageTokensPerRequest: requestsToday ? Math.round(((tokensToday / requestsToday) * 10)) / 10 : 0,
+    averageTokensPerResult: resultsToday ? Math.round(((tokensToday / resultsToday) * 10)) / 10 : 0,
+    tokensPerMinute: Math.round((recent5m.tokensUsed / Math.max(KEEPA_REQUEST_WINDOW_5M_MS / 60000, 1)) * 10) / 10,
+    requestsPerMinute: recent5m.requestsPerMinute,
+    hardStopActive,
+    warningsActive
+  };
+}
+
 export function getKeepaUsageSummary() {
   const settings = getKeepaSettings();
   const todayStart = getRangeStart('today');
   const monthStart = getRangeStart('month');
   const todayStartIso = todayStart.toISOString();
   const monthStartIso = monthStart.toISOString();
+  const trackingSummary = getKeepaRequestTrackingSummary();
   const requestStatsToday =
     db
       .prepare(
@@ -2939,23 +4771,35 @@ export function getKeepaUsageSummary() {
     requestedAt: nowIso(),
     usageModeLabel: officialUsagePresence ? 'teilweise offiziell abgeleitet, sonst intern geschaetzt' : 'intern geschaetzt',
     kpis: {
-      lastRequestAt: latestRequestOverall.lastRequestAt || requestStatsToday.lastRequestAt || latestManualSearch?.createdAt || latestAutomationRun?.createdAt || null,
-      requestsToday: parseInteger(requestStatsToday.requestCount, 0),
+      lastRequestAt: trackingSummary.lastRequest?.createdAt || latestRequestOverall.lastRequestAt || requestStatsToday.lastRequestAt || latestManualSearch?.createdAt || latestAutomationRun?.createdAt || null,
+      requestsToday: trackingSummary.requestsToday,
       requestsMonth: parseInteger(requestStatsMonth.requestCount, 0),
       estimatedUsageToday: Math.round((parseNumber(summaryToday.estimatedUsage, 0) || 0) * 10) / 10,
       estimatedUsageMonth,
       hitsToday: parseInteger(summaryToday.hitCount, 0),
       activeRulesCount,
-      monthlyProjection: Math.round(((estimatedUsageMonth / todayIndex) * daysInMonth) * 10) / 10
+      monthlyProjection: Math.round(((estimatedUsageMonth / todayIndex) * daysInMonth) * 10) / 10,
+      tokensToday: trackingSummary.tokensToday,
+      tokensMonth: trackingSummary.tokensMonth,
+      burnLast60s: trackingSummary.windows.last60s.tokensUsed,
+      burnLast5m: trackingSummary.windows.last5m.tokensUsed,
+      requestsPerMinute: trackingSummary.requestsPerMinute,
+      averageTokensPerRequest: trackingSummary.averageTokensPerRequest,
+      averageTokensPerResult: trackingSummary.averageTokensPerResult,
+      averageTokensPerDay: trackingSummary.averageTokensPerDay,
+      mostExpensiveRequestTokens: trackingSummary.expensiveRequest?.tokensUsed ?? 0,
+      hardStopActive: trackingSummary.hardStopActive
     },
     today: {
       estimatedUsage: Math.round((parseNumber(summaryToday.estimatedUsage, 0) || 0) * 10) / 10,
+      tokensUsed: trackingSummary.tokensToday,
       hitCount: parseInteger(summaryToday.hitCount, 0),
       errorCount: parseInteger(summaryToday.errorCount, 0),
-      requestCount: parseInteger(requestStatsToday.requestCount, 0)
+      requestCount: trackingSummary.requestsToday
     },
     month: {
       estimatedUsage: estimatedUsageMonth,
+      tokensUsed: trackingSummary.tokensMonth,
       hitCount: parseInteger(summaryMonth.hitCount, 0),
       errorCount: parseInteger(summaryMonth.errorCount, 0),
       requestCount: parseInteger(requestStatsMonth.requestCount, 0)
@@ -2965,6 +4809,7 @@ export function getKeepaUsageSummary() {
     dealsToday: parseInteger(summaryToday.hitCount, 0),
     sourceBreakdown: getUsageSourceBreakdown(todayStartIso),
     recentIssues,
+    requestTracking: trackingSummary,
     usageModules: USAGE_MODULE_CATALOG
       .filter((item) => item.id !== 'status-check')
       .map((item) => ({ id: item.id, label: item.label })),
@@ -2989,7 +4834,8 @@ export function getKeepaUsageHistory(filters = {}) {
           COALESCE(SUM(CASE WHEN action != 'keepa-request' THEN estimated_usage ELSE 0 END), 0) AS estimatedUsage,
           COALESCE(SUM(CASE WHEN action IN ('manual-search', 'automation-run') THEN result_count ELSE 0 END), 0) AS hitCount,
           COALESCE(SUM(CASE WHEN action = 'keepa-request' THEN request_count ELSE 0 END), 0) AS requestCount,
-          COALESCE(SUM(CASE WHEN official_usage_value IS NOT NULL THEN official_usage_value ELSE 0 END), 0) AS officialUsage
+          COALESCE(SUM(CASE WHEN official_usage_value IS NOT NULL THEN official_usage_value ELSE 0 END), 0) AS officialUsage,
+          COALESCE(SUM(CASE WHEN action = 'keepa-request' THEN tokens_used_total ELSE 0 END), 0) AS tokensUsed
         FROM keepa_usage_daily
         WHERE usage_date >= @startDateKey
           AND usage_date <= @endDateKey
@@ -3016,6 +4862,7 @@ export function getKeepaUsageHistory(filters = {}) {
       label: new Intl.DateTimeFormat('de-DE', { day: '2-digit', month: '2-digit' }).format(currentDate),
       estimatedUsage: Math.round((parseNumber(row.estimatedUsage, 0) || 0) * 10) / 10,
       officialUsage: parseNumber(row.officialUsage, null),
+      tokensUsed: Math.round((parseNumber(row.tokensUsed, 0) || 0) * 10) / 10,
       hitCount: parseInteger(row.hitCount, 0),
       requestCount: parseInteger(row.requestCount, 0)
     });
@@ -3069,33 +4916,60 @@ export function listKeepaUsageLogs(filters = {}) {
 
 export async function getKeepaStatus() {
   const settingsView = getKeepaSettingsView();
-  let connection = {
-    connected: false,
-    tokensLeft: null,
-    refillRate: null,
-    refillInMs: null,
-    tokensConsumed: null,
-    checkedAt: null
-  };
-
-  if (getKeepaConfig().key) {
-    try {
-      connection = await loadKeepaConnectionStatus(false);
-    } catch (error) {
-      connection = {
+  const protectionConnection = await getKeepaProtectionConnection('status-check');
+  const connection = protectionConnection.configured
+    ? {
+        connected: Boolean(protectionConnection.connected),
+        tokensLeft: protectionConnection.tokensLeft ?? null,
+        refillRate: protectionConnection.refillRate ?? null,
+        refillInMs: protectionConnection.refillInMs ?? null,
+        tokensConsumed: protectionConnection.tokensConsumed ?? null,
+        checkedAt: protectionConnection.checkedAt || null,
+        configured: true,
+        errorMessage: protectionConnection.errorMessage || ''
+      }
+    : {
         connected: false,
-        error: buildKeepaRequestError(error, 'Keepa-Verbindung fehlgeschlagen.'),
-        checkedAt: nowIso()
+        tokensLeft: null,
+        refillRate: null,
+        refillInMs: null,
+        tokensConsumed: null,
+        checkedAt: null,
+        configured: false,
+        errorMessage: protectionConnection.errorMessage || ''
       };
-    }
-  }
 
   const counts = getOverviewCounts();
   const usageSummary = getKeepaUsageSummary();
   const fakeDropSummary = getFakeDropSummary();
+  const protection = finalizeKeepaProtectionDecision(
+    buildKeepaProtectionState({
+      origin: 'manual',
+      connection,
+      risk: {
+        estimatedTokenCost: usageSummary.usageSettings.estimatedManualRunCost,
+        estimatedRiskScore: 0,
+        estimatedRawHitsRisk: 'low',
+        warnings: [],
+        blockingReasons: []
+      }
+    })
+  );
+  const requestTracking = {
+    ...(usageSummary.requestTracking || {}),
+    hardStopActive: Boolean(protection.blocked || protection.hardStopActive),
+    warningsActive: buildKeepaTrackingWarnings({
+      recent60s: usageSummary.requestTracking?.windows?.last60s,
+      recent5m: usageSummary.requestTracking?.windows?.last5m,
+      lastRequest: usageSummary.requestTracking?.lastRequest,
+      expensiveRequest: usageSummary.requestTracking?.expensiveRequest,
+      hardStopActive: Boolean(protection.blocked || protection.hardStopActive)
+    })
+  };
   return {
     settings: settingsView,
     connection,
+    protection,
     overview: {
       apiStatus: connection.connected ? 'verbunden' : settingsView.keepaKeyStatus.connected ? 'fehler' : 'nicht_konfiguriert',
       keepaConnected: connection.connected,
@@ -3115,9 +4989,14 @@ export async function getKeepaStatus() {
         estimatedManualRunCost: usageSummary.usageSettings.estimatedManualRunCost,
         lastRequestAt: usageSummary.kpis.lastRequestAt,
         hitsToday: usageSummary.kpis.hitsToday,
-        usageModeLabel: usageSummary.usageModeLabel
+        usageModeLabel: usageSummary.usageModeLabel,
+        tokensToday: usageSummary.kpis.tokensToday,
+        burnLast60s: usageSummary.kpis.burnLast60s
       },
-      usageSummary
+      usageSummary: {
+        ...usageSummary,
+        requestTracking
+      }
     }
   };
 }
@@ -3152,6 +5031,7 @@ export async function sendKeepaTestAlert() {
     id: null,
     asin: 'KEEPATEST01',
     title: 'Keepa Test Alert',
+    sellerType: 'AMAZON',
     currentPrice: 29.99,
     keepaDiscount: 35,
     comparisonPrice: 44.99,
@@ -3167,16 +5047,22 @@ export async function sendKeepaTestAlert() {
     lastAlertedAt: null
   };
 
-  const outputs = [];
-  if (settings.alertInternalEnabled) {
-    outputs.push(await dispatchAlert(sampleResult, null, 'internal', settings));
-  }
-  if (settings.alertTelegramEnabled) {
-    outputs.push(await dispatchAlert(sampleResult, null, 'telegram', settings));
-  }
-  if (settings.alertWhatsappPlaceholderEnabled) {
-    outputs.push(await dispatchAlert(sampleResult, null, 'whatsapp', settings));
-  }
+  const outputs = [
+    await publishAutoDealToTelegramTestGroup({
+      result: sampleResult,
+      rule: null,
+      settings,
+      sourceType: 'keepa',
+      decisionStatus: 'approved_for_test_group',
+      decisionReason: 'Manueller Keepa-Testgruppen-Test.',
+      learningContext: {
+        keepa: {
+          status: 'test_alert',
+          available: true
+        }
+      }
+    })
+  ];
 
   recordKeepaUsage({
     action: 'alert-check',
@@ -3197,26 +5083,221 @@ export async function sendKeepaTestAlert() {
   };
 }
 
+function scheduleNextRuleRun(rule) {
+  db.prepare(
+    `
+      UPDATE keepa_rules
+      SET last_run_at = @lastRunAt,
+          next_run_at = @nextRunAt,
+          updated_at = @updatedAt
+      WHERE id = @id
+    `
+  ).run({
+    id: rule.id,
+    lastRunAt: nowIso(),
+    nextRunAt: new Date(Date.now() + rule.intervalMinutes * 60 * 1000).toISOString(),
+    updatedAt: nowIso()
+  });
+}
+
 async function processRule(rule) {
+  const settings = getKeepaSettings();
+  const drawerKey = inferDrawerKeyFromSellerType(rule.sellerType);
+  const drawerConfig = getDrawerConfig(settings, drawerKey);
+  const autoModeActive = settings.schedulerEnabled && drawerConfig.active && drawerConfig.autoModeAllowed;
+
+  logGeneratorDebug(`KEEPA DRAWER ACTIVE: ${drawerKey}`, {
+    drawerKey,
+    ruleId: rule.id,
+    sellerType: rule.sellerType
+  });
+  logGeneratorDebug(`KEEPA AUTO MODE: ${autoModeActive}`, {
+    drawerKey,
+    ruleId: rule.id,
+    schedulerEnabled: settings.schedulerEnabled,
+    drawerActive: drawerConfig.active,
+    drawerAutoModeAllowed: drawerConfig.autoModeAllowed
+  });
+
+  if (!drawerConfig.active || !drawerConfig.autoModeAllowed) {
+    recordKeepaUsage({
+      action: 'automation-run',
+      module: 'automation-run',
+      filters: {
+        ruleId: rule.id,
+        drawerKey,
+        sellerType: rule.sellerType
+      },
+      resultCount: 0,
+      durationMs: 0,
+      requestStatus: 'skipped',
+      estimatedUsage: 0,
+      ruleId: rule.id,
+      meta: {
+        reason: !drawerConfig.active ? 'drawer_inactive' : 'auto_mode_disabled'
+      }
+    });
+    scheduleNextRuleRun(rule);
+
+    logKeepaEvent('info', 'rule_skipped', 'scheduler', `Keepa-Regel ${rule.name} wurde uebersprungen.`, {
+      payload: {
+        ruleId: rule.id,
+        drawerKey,
+        reason: !drawerConfig.active ? 'drawer_inactive' : 'auto_mode_disabled'
+      }
+    });
+    return;
+  }
+
+  const categoryIntersection =
+    drawerConfig.categories.length && rule.categories.length
+      ? rule.categories.filter((categoryId) => drawerConfig.categories.includes(categoryId))
+      : [];
+  const mergedCategories =
+    categoryIntersection.length > 0
+      ? categoryIntersection
+      : drawerConfig.categories.length
+        ? drawerConfig.categories
+        : rule.categories;
   const filters = {
     page: 1,
     limit: 20,
-    domainId: getKeepaSettings().domainId,
-    minDiscount: rule.minDiscount,
+    drawerKey,
+    domainId: settings.domainId,
+    minDiscount: Math.max(rule.minDiscount, drawerConfig.minDiscount),
     sellerType: rule.sellerType,
-    categories: rule.categories,
-    minPrice: rule.minPrice,
-    maxPrice: rule.maxPrice,
-    onlyPrime: rule.onlyPrime,
-    onlyInStock: rule.onlyInStock,
-    onlyGoodRating: rule.onlyGoodRating
+    categories: mergedCategories,
+    minPrice:
+      drawerConfig.minPrice !== null && rule.minPrice !== null
+        ? Math.max(drawerConfig.minPrice, rule.minPrice)
+        : drawerConfig.minPrice ?? rule.minPrice,
+    maxPrice:
+      drawerConfig.maxPrice !== null && rule.maxPrice !== null
+        ? Math.min(drawerConfig.maxPrice, rule.maxPrice)
+        : drawerConfig.maxPrice ?? rule.maxPrice,
+    trendInterval: drawerConfig.trendInterval,
+    sortBy: drawerConfig.sortBy,
+    onlyPrime: Boolean(rule.onlyPrime || drawerConfig.onlyPrime),
+    onlyInStock: Boolean(rule.onlyInStock || drawerConfig.onlyInStock),
+    onlyGoodRating: Boolean(rule.onlyGoodRating || drawerConfig.onlyGoodRating),
+    onlyWithReviews: Boolean(drawerConfig.onlyWithReviews),
+    amazonOfferMode: drawerConfig.amazonOfferMode,
+    singleVariantOnly: Boolean(drawerConfig.singleVariantOnly),
+    recentPriceChangeOnly: Boolean(drawerConfig.recentPriceChangeOnly)
   };
 
-  const result = await executeSearch(filters, {
-    source: 'rule_scan',
-    origin: 'automatic',
-    rule
-  });
+  if (filters.minPrice !== null && filters.maxPrice !== null && Number(filters.minPrice) > Number(filters.maxPrice)) {
+    recordKeepaUsage({
+      action: 'automation-run',
+      module: 'automation-run',
+      filters: {
+        ruleId: rule.id,
+        drawerKey,
+        sellerType: rule.sellerType
+      },
+      resultCount: 0,
+      durationMs: 0,
+      requestStatus: 'skipped',
+      estimatedUsage: 0,
+      ruleId: rule.id,
+      meta: {
+        reason: 'invalid_price_range'
+      }
+    });
+    scheduleNextRuleRun(rule);
+    logKeepaEvent('warning', 'rule_skipped', 'scheduler', `Keepa-Regel ${rule.name} hat eine ungueltige Preisrange.`, {
+      payload: {
+        ruleId: rule.id,
+        drawerKey,
+        minPrice: filters.minPrice,
+        maxPrice: filters.maxPrice
+      }
+    });
+    return;
+  }
+
+  const autoConnection = await getKeepaProtectionConnection('status-check');
+  const autoProtection = finalizeKeepaProtectionDecision(
+    buildKeepaProtectionState({
+      origin: 'automatic',
+      drawerKey,
+      connection: autoConnection,
+      risk: {
+        estimatedTokenCost: Math.max(estimateSearchUsage(filters, settings, { origin: 'automatic', requestCount: 2 }), 40),
+        estimatedRiskScore: 0,
+        estimatedRawHitsRisk: 'low',
+        warnings: [],
+        blockingReasons: []
+      }
+    })
+  );
+
+  if (autoProtection.blocked) {
+    logGeneratorDebug('KEEPA REQUEST BLOCKED', {
+      origin: 'automatic',
+      drawerKey,
+      blockCode: autoProtection.blockCode || 'protection_blocked',
+      blockReason: autoProtection.blockReason
+    });
+
+    if (autoProtection.blockCode === 'KEEPA_LOW_TOKENS') {
+      logGeneratorDebug('KEEPA REQUEST BLOCKED LOW TOKENS', {
+        origin: 'automatic',
+        drawerKey,
+        tokensLeft: autoProtection.tokensLeft,
+        minTokensRequired: autoProtection.minTokensRequired
+      });
+      logGeneratorDebug('KEEPA HARD STOP ACTIVE', {
+        origin: 'automatic',
+        drawerKey,
+        tokensLeft: autoProtection.tokensLeft,
+        minTokensRequired: autoProtection.minTokensRequired
+      });
+    } else if (autoProtection.blockCode === 'KEEPA_TOO_MANY_REQUESTS' || autoProtection.blockCode === 'KEEPA_HIGH_USAGE_WINDOW') {
+      logGeneratorDebug('KEEPA HIGH USAGE DETECTED', {
+        origin: 'automatic',
+        drawerKey,
+        blockCode: autoProtection.blockCode,
+        requestCount60s: autoProtection.recentUsage?.last60s?.requestCount ?? 0,
+        tokensUsed60s: autoProtection.recentUsage?.last60s?.tokensUsed ?? 0,
+        requestCount5m: autoProtection.recentUsage?.last5m?.requestCount ?? 0,
+        tokensUsed5m: autoProtection.recentUsage?.last5m?.tokensUsed ?? 0
+      });
+    }
+
+    recordKeepaUsage({
+      action: 'automation-run',
+      module: 'automation-run',
+      filters: {
+        ruleId: rule.id,
+        drawerKey,
+        sellerType: rule.sellerType
+      },
+      resultCount: 0,
+      durationMs: 0,
+      requestStatus: 'skipped',
+      estimatedUsage: 0,
+      ruleId: rule.id,
+      meta: {
+        reason: autoProtection.blockCode || 'protection_blocked',
+        message: autoProtection.blockReason
+      }
+    });
+    scheduleNextRuleRun(rule);
+    return;
+  }
+
+  beginKeepaSearchExecution('automatic', drawerKey);
+  let result;
+  try {
+    result = await executeSearch(filters, {
+      source: 'rule_scan',
+      origin: 'automatic',
+      rule
+    });
+  } finally {
+    finishKeepaSearchExecution('automatic');
+  }
 
   let alertDispatchCount = 0;
   let alertFailureCount = 0;
@@ -3251,20 +5332,7 @@ async function processRule(rule) {
     }
   });
 
-  db.prepare(
-    `
-      UPDATE keepa_rules
-      SET last_run_at = @lastRunAt,
-          next_run_at = @nextRunAt,
-          updated_at = @updatedAt
-      WHERE id = @id
-    `
-  ).run({
-    id: rule.id,
-    lastRunAt: nowIso(),
-    nextRunAt: new Date(Date.now() + rule.intervalMinutes * 60 * 1000).toISOString(),
-    updatedAt: nowIso()
-  });
+  scheduleNextRuleRun(rule);
 
   logKeepaEvent('info', 'rule_processed', 'scheduler', `Keepa-Regel ${rule.name} verarbeitet.`, {
     payload: {

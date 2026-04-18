@@ -1,5 +1,6 @@
 import { getTelegramConfig } from '../env.js';
 import { getTelegramCopyButtonText } from './dealHistoryService.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
 import sharp from 'sharp';
 
 const NORMALIZED_POST_IMAGE = {
@@ -217,9 +218,19 @@ export async function sendTelegramPost({
   }
 
   const effectiveImageUrl = parsedUploadedImage ? '' : trimmedImageUrl;
+  const resolvedDisableWebPagePreview = disableWebPagePreview || (!parsedUploadedImage && !effectiveImageUrl);
   const telegramMethod = parsedUploadedImage || effectiveImageUrl ? 'sendPhoto' : 'sendMessage';
   let telegramResponse;
   let telegramData;
+
+  logGeneratorDebug('api.telegram.request', {
+    method: telegramMethod,
+    textLength: text.trim().length,
+    hasUploadedImage: Boolean(parsedUploadedImage),
+    hasImageUrl: Boolean(effectiveImageUrl),
+    disableWebPagePreview: resolvedDisableWebPagePreview,
+    hasCouponCode: Boolean(trimmedCouponCode)
+  });
 
   if (parsedUploadedImage) {
     const normalizedImage = await normalizeImageForTelegram(parsedUploadedImage.buffer, 'upload');
@@ -253,7 +264,7 @@ export async function sendTelegramPost({
     ({ telegramResponse, telegramData } = await sendTelegramRequest(token, telegramMethod, {
       chat_id: finalChatId,
       text: String(text),
-      ...(disableWebPagePreview ? { disable_web_page_preview: true } : {}),
+      ...(resolvedDisableWebPagePreview ? { disable_web_page_preview: true } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {})
     }));
   }
@@ -261,8 +272,20 @@ export async function sendTelegramPost({
   if (!telegramResponse.ok || !telegramData?.ok) {
     const telegramDescription =
       telegramData?.description || telegramData?.raw || 'Telegram API hat einen unbekannten Fehler geliefert';
+    logGeneratorDebug('api.telegram.error', {
+      method: telegramMethod,
+      error: telegramDescription,
+      disableWebPagePreview: resolvedDisableWebPagePreview
+    });
     throw new Error(`Telegram API Fehler: ${telegramDescription}`);
   }
+
+  logGeneratorDebug('api.telegram.success', {
+    method: telegramMethod,
+    messageId: telegramData.result?.message_id,
+    hasImageUrl: Boolean(effectiveImageUrl),
+    disableWebPagePreview: resolvedDisableWebPagePreview
+  });
 
   return {
     method: telegramMethod,

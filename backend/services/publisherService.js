@@ -149,6 +149,9 @@ export function createGeneratorPublishingEntry(input = {}) {
         INSERT INTO generator_posts (
           title,
           product_link,
+          asin,
+          normalized_url,
+          seller_type,
           telegram_text,
           whatsapp_text,
           facebook_text,
@@ -159,12 +162,15 @@ export function createGeneratorPublishingEntry(input = {}) {
           facebook_image_source,
           created_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     .run(
       cleanText(input.title),
       cleanText(input.link),
+      cleanText(input.asin).toUpperCase(),
+      cleanText(input.normalizedUrl),
+      cleanText(input.sellerType) || 'FBM',
       cleanText(input.textByChannel?.telegram),
       cleanText(input.textByChannel?.whatsapp),
       cleanText(input.textByChannel?.facebook),

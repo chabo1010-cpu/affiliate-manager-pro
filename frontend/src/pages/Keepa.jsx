@@ -9,7 +9,7 @@ const FALLBACK_IMAGE =
   'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72"><rect width="72" height="72" rx="18" fill="%230f172a"/><text x="50%" y="52%" dominant-baseline="middle" text-anchor="middle" fill="%2394a3b8" font-family="Arial" font-size="14">AM</text></svg>';
 
 const keepaTabs = [
-  { label: 'Uebersicht', path: '/keepa' },
+  { label: 'Flow Dashboard', path: '/keepa' },
   { label: 'Manuelle Suche', path: '/keepa/manual-search' },
   { label: 'Automatik', path: '/keepa/automatik' },
   { label: 'Ergebnisse', path: '/keepa/ergebnisse' },
@@ -21,12 +21,124 @@ const keepaTabs = [
   { label: 'Einstellungen', path: '/keepa/einstellungen' }
 ];
 
+function normalizeLearningTabPath(pathname) {
+  if (typeof pathname !== 'string' || !pathname.trim()) {
+    return '/keepa';
+  }
+
+  if (pathname.startsWith('/learning')) {
+    const nextPath = pathname.replace('/learning', '/keepa');
+    return nextPath || '/keepa';
+  }
+
+  return pathname;
+}
+
+function buildLearningTabPath(basePath, canonicalPath) {
+  if (basePath === '/keepa') {
+    return canonicalPath;
+  }
+
+  return canonicalPath.replace('/keepa', '/learning');
+}
+
 const sellerTypeOptions = [
   { value: 'ALL', label: 'Alle' },
   { value: 'AMAZON', label: 'Amazon' },
   { value: 'FBA', label: 'FBA' },
   { value: 'FBM', label: 'FBM' }
 ];
+
+const keepaDrawerCatalog = [
+  { key: 'AMAZON', label: 'Amazon', description: 'Verkauf und Versand durch Amazon.' },
+  { key: 'FBA', label: 'FBA', description: 'Verkauf durch Haendler, Versand durch Amazon.' },
+  { key: 'FBM', label: 'FBM', description: 'Verkauf und Versand durch Haendler.' }
+];
+
+const keepaTrendIntervalOptions = [
+  { value: 'day', label: 'Tag' },
+  { value: 'week', label: 'Woche' },
+  { value: 'month', label: 'Monat' },
+  { value: 'three_months', label: '3 Monate' },
+  { value: 'all', label: 'Alle' }
+];
+
+const keepaSortOptions = [
+  { value: 'percent', label: 'Prozent' },
+  { value: 'price_drop', label: 'Preissturz' },
+  { value: 'price', label: 'Preis' },
+  { value: 'newest', label: 'Neueste' },
+  { value: 'sales_rank', label: 'Sales Rank' }
+];
+
+const keepaAmazonOfferOptions = [
+  { value: 'all', label: 'egal' },
+  { value: 'require', label: 'nur mit Amazon-Angebot' },
+  { value: 'exclude', label: 'kein Amazon-Angebot' }
+];
+
+const defaultDrawerConfigs = {
+  AMAZON: {
+    active: true,
+    sellerType: 'AMAZON',
+    patternSupportEnabled: true,
+    trendInterval: 'week',
+    minDiscount: 20,
+    minPrice: '',
+    maxPrice: '',
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'require',
+    singleVariantOnly: false,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: true,
+    testGroupPostingAllowed: true
+  },
+  FBA: {
+    active: true,
+    sellerType: 'FBA',
+    patternSupportEnabled: true,
+    trendInterval: 'week',
+    minDiscount: 25,
+    minPrice: '',
+    maxPrice: '',
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'exclude',
+    singleVariantOnly: false,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: true,
+    testGroupPostingAllowed: true
+  },
+  FBM: {
+    active: true,
+    sellerType: 'FBM',
+    patternSupportEnabled: true,
+    trendInterval: 'month',
+    minDiscount: 35,
+    minPrice: '',
+    maxPrice: '',
+    categories: [],
+    onlyPrime: false,
+    onlyInStock: true,
+    onlyGoodRating: false,
+    onlyWithReviews: true,
+    amazonOfferMode: 'exclude',
+    singleVariantOnly: true,
+    recentPriceChangeOnly: false,
+    sortBy: 'percent',
+    autoModeAllowed: true,
+    testGroupPostingAllowed: true
+  }
+};
 
 const workflowStatusOptions = [
   { value: '', label: 'Alle Stati' },
@@ -56,11 +168,23 @@ const workflowLabels = {
 };
 
 const reviewLabelOptions = [
-  { value: 'ja', label: 'Ja' },
-  { value: 'nein', label: 'Nein' },
-  { value: 'eventuell_gut', label: 'Eventuell gut' },
-  { value: 'ueberspringen', label: 'Ueberspringen' }
+  { value: 'good', label: 'Good' },
+  { value: 'fake', label: 'Fake' },
+  { value: 'weak', label: 'Weak' },
+  { value: 'review', label: 'Review' }
 ];
+
+const reviewLabelAliases = {
+  approved: 'good',
+  strong_deal: 'good',
+  ja: 'good',
+  fake_drop: 'fake',
+  rejected: 'fake',
+  nein: 'fake',
+  weak_deal: 'weak',
+  eventuell_gut: 'review',
+  ueberspringen: 'review'
+};
 
 const exampleBucketOptions = [
   { value: '', label: 'Alle Buckets' },
@@ -86,6 +210,23 @@ const fakeDropFilterOptions = [
   { value: 'amazon_stabil', label: 'nur Amazon stabil' },
   { value: 'echter_deal', label: 'nur echte Deals' }
 ];
+
+function normalizeReviewUiValue(value) {
+  if (!value) {
+    return 'review';
+  }
+
+  return reviewLabelAliases[value] || value;
+}
+
+function getReviewOptionMeta(value) {
+  const normalized = normalizeReviewUiValue(value);
+  return reviewLabelOptions.find((item) => item.value === normalized) || reviewLabelOptions[3];
+}
+
+function isNegativeReviewValue(value) {
+  return ['fake', 'weak'].includes(normalizeReviewUiValue(value));
+}
 
 function formatDateTime(value) {
   if (!value) {
@@ -162,35 +303,95 @@ function formatDuration(value) {
   return `${(parsed / 60000).toFixed(1)} Min.`;
 }
 
-function buildManualFilters(settings) {
+function formatKeepaModeLabel(value) {
+  const normalized = String(value || '').toLowerCase();
+  return (
+    {
+      manual: 'manuell',
+      auto: 'auto',
+      test: 'test'
+    }[normalized] || '-'
+  );
+}
+
+function shortenText(value, maxLength = 110) {
+  if (!value) {
+    return '-';
+  }
+
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function normalizeDrawerKey(value) {
+  return keepaDrawerCatalog.some((item) => item.key === value) ? value : 'AMAZON';
+}
+
+function buildDrawerConfigs(settings) {
+  return Object.fromEntries(
+    keepaDrawerCatalog.map((drawer) => [
+      drawer.key,
+      {
+        ...defaultDrawerConfigs[drawer.key],
+        ...(settings?.drawerConfigs?.[drawer.key] || {})
+      }
+    ])
+  );
+}
+
+function buildManualFilters(settings, drawerKey = 'AMAZON') {
+  const resolvedDrawerKey = normalizeDrawerKey(drawerKey);
+  const drawerConfig = buildDrawerConfigs(settings)[resolvedDrawerKey];
+
   return {
+    drawerKey: resolvedDrawerKey,
     page: 1,
     limit: settings?.defaultPageSize || 24,
-    minDiscount: settings?.defaultDiscount || 40,
-    sellerType: settings?.defaultSellerType || 'ALL',
-    categories: settings?.defaultCategories || [],
-    minPrice: settings?.defaultMinPrice ?? '',
-    maxPrice: settings?.defaultMaxPrice ?? '',
-    onlyPrime: false,
-    onlyInStock: true,
-    onlyGoodRating: false
+    minDiscount: drawerConfig.minDiscount ?? (settings?.defaultDiscount || 40),
+    sellerType: drawerConfig.sellerType || settings?.defaultSellerType || 'ALL',
+    categories: [...(drawerConfig.categories || settings?.defaultCategories || [])],
+    minPrice: drawerConfig.minPrice ?? settings?.defaultMinPrice ?? '',
+    maxPrice: drawerConfig.maxPrice ?? settings?.defaultMaxPrice ?? '',
+    trendInterval: drawerConfig.trendInterval || 'week',
+    sortBy: drawerConfig.sortBy || 'percent',
+    onlyPrime: Boolean(drawerConfig.onlyPrime),
+    onlyInStock: drawerConfig.onlyInStock !== false,
+    onlyGoodRating: Boolean(drawerConfig.onlyGoodRating),
+    onlyWithReviews: Boolean(drawerConfig.onlyWithReviews),
+    amazonOfferMode: drawerConfig.amazonOfferMode || 'all',
+    singleVariantOnly: Boolean(drawerConfig.singleVariantOnly),
+    recentPriceChangeOnly: Boolean(drawerConfig.recentPriceChangeOnly)
   };
 }
 
-function buildRuleForm(settings) {
+function buildRuleForm(settings, drawerKey = 'AMAZON') {
+  const resolvedDrawerKey = normalizeDrawerKey(drawerKey);
+  const drawerConfig = buildDrawerConfigs(settings)[resolvedDrawerKey];
+
   return {
     id: 0,
     name: '',
-    minDiscount: settings?.defaultDiscount || 40,
-    sellerType: settings?.defaultSellerType || 'ALL',
-    categories: settings?.defaultCategories || [],
-    minPrice: settings?.defaultMinPrice ?? '',
-    maxPrice: settings?.defaultMaxPrice ?? '',
+    drawerKey: resolvedDrawerKey,
+    minDiscount: drawerConfig.minDiscount ?? (settings?.defaultDiscount || 40),
+    sellerType: drawerConfig.sellerType || settings?.defaultSellerType || 'ALL',
+    categories: [...(drawerConfig.categories || settings?.defaultCategories || [])],
+    minPrice: drawerConfig.minPrice ?? settings?.defaultMinPrice ?? '',
+    maxPrice: drawerConfig.maxPrice ?? settings?.defaultMaxPrice ?? '',
     minDealScore: 70,
     intervalMinutes: settings?.defaultIntervalMinutes || 60,
-    onlyPrime: false,
-    onlyInStock: true,
-    onlyGoodRating: false,
+    trendInterval: drawerConfig.trendInterval || 'week',
+    sortBy: drawerConfig.sortBy || 'percent',
+    onlyPrime: Boolean(drawerConfig.onlyPrime),
+    onlyInStock: drawerConfig.onlyInStock !== false,
+    onlyGoodRating: Boolean(drawerConfig.onlyGoodRating),
+    onlyWithReviews: Boolean(drawerConfig.onlyWithReviews),
+    amazonOfferMode: drawerConfig.amazonOfferMode || 'all',
+    singleVariantOnly: Boolean(drawerConfig.singleVariantOnly),
+    recentPriceChangeOnly: Boolean(drawerConfig.recentPriceChangeOnly),
     comparisonSources: ['manual-source'],
     isActive: true
   };
@@ -222,6 +423,7 @@ function buildSettingsForm(settings) {
       idealo: { enabled: false },
       'custom-api': { enabled: false }
     },
+    drawerConfigs: buildDrawerConfigs(settings),
     loggingEnabled: Boolean(settings?.loggingEnabled),
     estimatedTokensPerManualRun: settings?.estimatedTokensPerManualRun || 8
   };
@@ -308,6 +510,22 @@ function getFakeDropChip(classification) {
   }
 
   if (classification === 'verdaechtig') {
+    return 'warning';
+  }
+
+  return 'info';
+}
+
+function getFlowStatusTone(value) {
+  if (value === 'connected' || value === 'approved' || value === 'sent' || value === 'active') {
+    return 'success';
+  }
+
+  if (value === 'blocked' || value === 'inactive') {
+    return 'danger';
+  }
+
+  if (value === 'review' || value === 'optional') {
     return 'warning';
   }
 
@@ -496,11 +714,13 @@ function KeepaPage() {
   const initializedRef = useRef(false);
   const ruleInitializedRef = useRef(false);
   const fakeDropSettingsInitializedRef = useRef(false);
+  const canonicalPath = useMemo(() => normalizeLearningTabPath(location.pathname), [location.pathname]);
+  const navigationBasePath = location.pathname.startsWith('/learning') ? '/learning' : '/keepa';
 
   const currentTab = useMemo(() => {
-    const match = keepaTabs.find((item) => item.path === location.pathname);
+    const match = keepaTabs.find((item) => item.path === canonicalPath);
     return match?.path || '/keepa';
-  }, [location.pathname]);
+  }, [canonicalPath]);
 
   const [bootLoading, setBootLoading] = useState(true);
   const [manualLoading, setManualLoading] = useState(false);
@@ -513,6 +733,9 @@ function KeepaPage() {
   const [reviewBusyId, setReviewBusyId] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
   const [statusData, setStatusData] = useState(null);
+  const [amazonStatusData, setAmazonStatusData] = useState(null);
+  const [copybotOverview, setCopybotOverview] = useState(null);
+  const [learningOverview, setLearningOverview] = useState(null);
   const [usageSummary, setUsageSummary] = useState(null);
   const [usageHistory, setUsageHistory] = useState({
     series: [],
@@ -567,13 +790,17 @@ function KeepaPage() {
     limit: 40,
     days: 30
   });
-  const [manualFilters, setManualFilters] = useState(buildManualFilters());
+  const [activeManualDrawer, setActiveManualDrawer] = useState('AMAZON');
+  const [activeAutomationDrawer, setActiveAutomationDrawer] = useState('AMAZON');
+  const [manualFilters, setManualFilters] = useState(buildManualFilters(undefined, 'AMAZON'));
+  const [manualDryRun, setManualDryRun] = useState(null);
   const [manualResponse, setManualResponse] = useState({
     items: [],
     pagination: { page: 1, limit: 24, hasMore: false, rawResultCount: 0 },
-    usage: null
+    usage: null,
+    protection: null
   });
-  const [ruleForm, setRuleForm] = useState(buildRuleForm());
+  const [ruleForm, setRuleForm] = useState(buildRuleForm(undefined, 'AMAZON'));
   const [settingsForm, setSettingsForm] = useState(buildSettingsForm());
   const [selectedResultId, setSelectedResultId] = useState(null);
   const [resultDrafts, setResultDrafts] = useState({});
@@ -605,6 +832,9 @@ function KeepaPage() {
       const moduleQuery = nextUsageFilters.module === 'all' ? '' : nextUsageFilters.module;
       const [
         statusResponse,
+        amazonStatusResponse,
+        copybotOverviewResponse,
+        learningOverviewResponse,
         usageSummaryResponse,
         rulesResponse,
         alertsResponse,
@@ -616,6 +846,9 @@ function KeepaPage() {
         fakeDropSettingsResponse
       ] = await Promise.all([
         apiFetch('/api/keepa/status'),
+        apiFetch('/api/amazon/status'),
+        apiFetch('/api/copybot/overview'),
+        apiFetch('/api/learning/overview'),
         apiFetch('/api/keepa/usage/summary'),
         apiFetch('/api/keepa/rules'),
         apiFetch('/api/keepa/alerts?limit=30'),
@@ -638,6 +871,9 @@ function KeepaPage() {
       ]);
 
       setStatusData(statusResponse);
+      setAmazonStatusData(amazonStatusResponse);
+      setCopybotOverview(copybotOverviewResponse);
+      setLearningOverview(learningOverviewResponse);
       setUsageSummary(usageSummaryResponse);
       setRules(rulesResponse.items || []);
       setAlerts(alertsResponse.items || []);
@@ -648,13 +884,15 @@ function KeepaPage() {
       setFakeDropHistory(fakeDropHistoryResponse);
 
       if (!initializedRef.current && statusResponse?.settings) {
-        setManualFilters(buildManualFilters(statusResponse.settings));
-        setSettingsForm(buildSettingsForm(statusResponse.settings));
+        const nextSettingsForm = buildSettingsForm(statusResponse.settings);
+        setSettingsForm(nextSettingsForm);
+        setManualFilters(buildManualFilters(nextSettingsForm, activeManualDrawer));
         initializedRef.current = true;
       }
 
       if (!ruleInitializedRef.current && statusResponse?.settings) {
-        setRuleForm(buildRuleForm(statusResponse.settings));
+        const nextSettingsForm = buildSettingsForm(statusResponse.settings);
+        setRuleForm(buildRuleForm(nextSettingsForm, activeAutomationDrawer));
         ruleInitializedRef.current = true;
       }
 
@@ -670,7 +908,7 @@ function KeepaPage() {
         setSelectedResultId(null);
       }
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Keepa-Daten konnten nicht geladen werden.');
+      setStatusMessage(error instanceof Error ? error.message : 'Lern-Logik- und Keepa-Daten konnten nicht geladen werden.');
     } finally {
       if (withSpinner) {
         setBootLoading(false);
@@ -731,6 +969,8 @@ function KeepaPage() {
     () => estimateUsagePreview(manualFilters, statusData?.settings),
     [manualFilters, statusData?.settings]
   );
+  const manualProtection = manualDryRun?.protection || manualResponse?.protection || statusData?.protection || null;
+  const manualConfirmationReady = Boolean(manualDryRun?.confirmationRequired && manualDryRun?.confirmationToken);
   const usageBreakdown = usageHistory?.sourceBreakdown?.length ? usageHistory.sourceBreakdown : usageSummary?.sourceBreakdown || [];
   const recentIssues = usageSummary?.recentIssues || [];
   const fakeDropDistribution = fakeDropSummary?.distribution || [];
@@ -816,6 +1056,69 @@ function KeepaPage() {
     }));
   }
 
+  function getDrawerConfig(drawerKey, source = settingsForm.drawerConfigs) {
+    const resolvedDrawerKey = normalizeDrawerKey(drawerKey);
+    return source?.[resolvedDrawerKey] || defaultDrawerConfigs[resolvedDrawerKey];
+  }
+
+  function updateDrawerConfig(drawerKey, patch) {
+    const resolvedDrawerKey = normalizeDrawerKey(drawerKey);
+    setSettingsForm((prev) => ({
+      ...prev,
+      drawerConfigs: {
+        ...(prev.drawerConfigs || buildDrawerConfigs(prev)),
+        [resolvedDrawerKey]: {
+          ...getDrawerConfig(resolvedDrawerKey, prev.drawerConfigs),
+          ...patch,
+          sellerType: resolvedDrawerKey
+        }
+      }
+    }));
+  }
+
+  function handleSelectManualDrawer(drawerKey) {
+    const resolvedDrawerKey = normalizeDrawerKey(drawerKey);
+    setActiveManualDrawer(resolvedDrawerKey);
+    setManualFilters(buildManualFilters(settingsForm, resolvedDrawerKey));
+    setManualDryRun(null);
+  }
+
+  function updateManualFilters(patch) {
+    setManualFilters((prev) => ({
+      ...prev,
+      ...patch
+    }));
+    updateDrawerConfig(activeManualDrawer, patch);
+    setManualDryRun(null);
+  }
+
+  function handleSelectAutomationDrawer(drawerKey) {
+    setActiveAutomationDrawer(normalizeDrawerKey(drawerKey));
+  }
+
+  function loadDrawerIntoRuleForm(drawerKey = activeAutomationDrawer) {
+    const resolvedDrawerKey = normalizeDrawerKey(drawerKey);
+    const drawerConfig = getDrawerConfig(resolvedDrawerKey);
+    setRuleForm((prev) => ({
+      ...prev,
+      drawerKey: resolvedDrawerKey,
+      sellerType: resolvedDrawerKey,
+      minDiscount: drawerConfig.minDiscount,
+      minPrice: drawerConfig.minPrice,
+      maxPrice: drawerConfig.maxPrice,
+      categories: [...drawerConfig.categories],
+      trendInterval: drawerConfig.trendInterval,
+      sortBy: drawerConfig.sortBy,
+      onlyPrime: drawerConfig.onlyPrime,
+      onlyInStock: drawerConfig.onlyInStock,
+      onlyGoodRating: drawerConfig.onlyGoodRating,
+      onlyWithReviews: drawerConfig.onlyWithReviews,
+      amazonOfferMode: drawerConfig.amazonOfferMode,
+      singleVariantOnly: drawerConfig.singleVariantOnly,
+      recentPriceChangeOnly: drawerConfig.recentPriceChangeOnly
+    }));
+  }
+
   function toggleReviewTag(reviewItemId, tagId) {
     setReviewDrafts((prev) => {
       const currentTags = prev[reviewItemId]?.tags || [];
@@ -833,7 +1136,7 @@ function KeepaPage() {
     });
   }
 
-  async function handleManualSearch(page = 1) {
+  async function handleManualSearch(page = 1, confirmed = false) {
     setManualLoading(true);
     setStatusMessage('');
 
@@ -842,18 +1145,47 @@ function KeepaPage() {
         method: 'POST',
         body: JSON.stringify({
           ...manualFilters,
-          page
+          page,
+          confirmed,
+          confirmationToken: confirmed ? manualDryRun?.confirmationToken || '' : ''
         })
       });
 
-      setManualFilters((prev) => ({ ...prev, page }));
+      if (data?.executed === false) {
+        setManualDryRun(data.dryRun || null);
+        setManualResponse((prev) => ({
+          ...prev,
+          protection: data.protection || null
+        }));
+
+        if (data?.dryRun?.blocked) {
+          setStatusMessage(data.dryRun?.protection?.blockReason || 'Keepa-Schutz aktiv – Abfrage wurde blockiert.');
+        } else if (data?.dryRun?.confirmationRequired) {
+          setStatusMessage('Keepa-Dry-Run erstellt. Bitte die Abfrage jetzt bewusst bestaetigen.');
+        }
+
+        return;
+      }
+
+      setManualDryRun(null);
+      setManualFilters((prev) => ({ ...prev, page, limit: data?.filters?.limit ?? prev.limit }));
       setManualResponse(data);
+      setStatusMessage('Keepa-Abfrage abgeschlossen.');
       await loadDashboard(resultsFilters, usageFilters, false);
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Manuelle Suche fehlgeschlagen.');
     } finally {
       setManualLoading(false);
     }
+  }
+
+  async function handleConfirmManualSearch(page = 1) {
+    if (!manualDryRun?.confirmationToken) {
+      setStatusMessage('Bitte zuerst einen Dry-Run erzeugen.');
+      return;
+    }
+
+    await handleManualSearch(page, true);
   }
 
   async function handleSaveRule() {
@@ -915,7 +1247,18 @@ function KeepaPage() {
         body: JSON.stringify(settingsForm)
       });
 
-      setSettingsForm(buildSettingsForm(data));
+      const nextSettingsForm = buildSettingsForm(data);
+      setSettingsForm(nextSettingsForm);
+      setManualFilters(buildManualFilters(nextSettingsForm, activeManualDrawer));
+      setRuleForm((prev) => ({
+        ...buildRuleForm(nextSettingsForm, activeAutomationDrawer),
+        id: prev.id,
+        name: prev.name,
+        minDealScore: prev.minDealScore,
+        intervalMinutes: prev.intervalMinutes,
+      comparisonSources: [...prev.comparisonSources],
+        isActive: prev.isActive
+      }));
       setStatusMessage('Keepa-Einstellungen gespeichert.');
       await loadDashboard(resultsFilters, usageFilters, false);
     } catch (error) {
@@ -1014,7 +1357,7 @@ function KeepaPage() {
         })
       });
 
-      setStatusMessage(`Review gespeichert: ${reviewLabelOptions.find((item) => item.value === label)?.label || label}.`);
+      setStatusMessage(`Review gespeichert: ${getReviewOptionMeta(label).label}.`);
       await loadDashboard(resultsFilters, usageFilters, false);
       await loadReviewQueue(reviewFilters);
       if (saveAsExample || currentTab === '/keepa/lern-datenbank') {
@@ -1146,53 +1489,100 @@ function KeepaPage() {
     );
   }
 
+  function renderDrawerCards(mode = 'manual') {
+    const activeDrawer = mode === 'manual' ? activeManualDrawer : activeAutomationDrawer;
+    const onSelect = mode === 'manual' ? handleSelectManualDrawer : handleSelectAutomationDrawer;
+
+    return (
+      <div className="keepa-drawer-grid">
+        {keepaDrawerCatalog.map((drawer) => {
+          const drawerConfig = getDrawerConfig(drawer.key);
+
+          return (
+            <button
+              key={drawer.key}
+              type="button"
+              className={`keepa-drawer-card ${activeDrawer === drawer.key ? 'active' : ''}`}
+              onClick={() => onSelect(drawer.key)}
+            >
+              <div className="keepa-drawer-card-top">
+                <div>
+                  <strong>{drawer.label}</strong>
+                  <p className="text-muted">{drawer.description}</p>
+                </div>
+                <div className="keepa-card-tags">
+                  <span className={`status-chip ${drawerConfig.active ? 'success' : 'warning'}`}>
+                    {drawerConfig.active ? 'aktiv' : 'pausiert'}
+                  </span>
+                  <span className={`status-chip ${drawerConfig.patternSupportEnabled ? 'info' : 'warning'}`}>
+                    Muster {drawerConfig.patternSupportEnabled ? 'an' : 'aus'}
+                  </span>
+                  {mode === 'automation' && (
+                    <span className={`status-chip ${drawerConfig.autoModeAllowed ? 'info' : 'warning'}`}>
+                      Auto {drawerConfig.autoModeAllowed ? 'an' : 'aus'}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="keepa-drawer-card-metrics">
+                <span>Rabatt ab {drawerConfig.minDiscount}%</span>
+                <span>Intervall {keepaTrendIntervalOptions.find((item) => item.value === drawerConfig.trendInterval)?.label || drawerConfig.trendInterval}</span>
+                <span>Sortierung {keepaSortOptions.find((item) => item.value === drawerConfig.sortBy)?.label || drawerConfig.sortBy}</span>
+                <span>Auto-Posting {drawerConfig.testGroupPostingAllowed ? 'erlaubt' : 'gesperrt'}</span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
   function renderTopKpiBar() {
     const overview = statusData?.overview;
     const connection = statusData?.connection;
     const kpis = usageSummary?.kpis || {};
+    const quickStats = [
+      {
+        label: 'Keepa Status',
+        value: overview?.apiStatus || '-',
+        detail: connection?.connected ? 'verbunden' : 'vorbereitet'
+      },
+      {
+        label: 'Letzte Abfrage',
+        value: formatDateTime(kpis.lastRequestAt),
+        detail: 'zuletzt protokolliert'
+      },
+      {
+        label: 'Requests heute',
+        value: kpis.requestsToday || 0,
+        detail: 'offizielle Keepa-Requests'
+      },
+      {
+        label: 'Treffer heute',
+        value: kpis.hitsToday || 0,
+        detail: 'manuell + Automatik'
+      },
+      {
+        label: 'Offene Reviews',
+        value: fakeDropSummary?.kpis?.openReviewCount || 0,
+        detail: 'warten auf Freigabe'
+      },
+      {
+        label: 'Aktive Regeln',
+        value: kpis.activeRulesCount || 0,
+        detail: 'im Backend aktiv'
+      }
+    ];
 
     return (
       <section className="card keepa-kpi-strip">
-        <article className="keepa-kpi-pill">
-          <span>Status</span>
-          <strong>{overview?.apiStatus || '-'}</strong>
-          <small>{connection?.connected ? 'Backend-Only verbunden' : 'Noch keine aktive Verbindung'}</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Letzte Abfrage</span>
-          <strong>{formatDateTime(kpis.lastRequestAt)}</strong>
-          <small>Zuletzt protokollierter Keepa-Request</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Requests heute</span>
-          <strong>{kpis.requestsToday || 0}</strong>
-          <small>Offiziell erfasste Keepa-Requests</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Requests Monat</span>
-          <strong>{kpis.requestsMonth || 0}</strong>
-          <small>Seit Monatsbeginn</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Verbrauch heute</span>
-          <strong>{formatUsage(kpis.estimatedUsageToday)}</strong>
-          <small>Intern geschaetzt</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Verbrauch Monat</span>
-          <strong>{formatUsage(kpis.estimatedUsageMonth)}</strong>
-          <small>Intern geschaetzt</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Treffer heute</span>
-          <strong>{kpis.hitsToday || 0}</strong>
-          <small>Manuelle Suche + Automatik</small>
-        </article>
-        <article className="keepa-kpi-pill">
-          <span>Aktive Regeln</span>
-          <strong>{kpis.activeRulesCount || 0}</strong>
-          <small>Automatik-Regeln im Backend</small>
-        </article>
+        {quickStats.map((item) => (
+          <article key={item.label} className="keepa-kpi-pill">
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <small>{item.detail}</small>
+          </article>
+        ))}
       </section>
     );
   }
@@ -1200,62 +1590,471 @@ function KeepaPage() {
   function renderOverviewTab() {
     const overview = statusData?.overview;
     const connection = statusData?.connection;
+    const amazonOverview = amazonStatusData?.overview;
+    const amazonConnection = amazonStatusData?.connection;
+    const learningPipeline = Array.isArray(learningOverview?.pipeline) ? learningOverview.pipeline : [];
+    const learningSellerTypes = Array.isArray(learningOverview?.sellerTypes) ? learningOverview.sellerTypes : [];
+    const learningSellerControls = Array.isArray(learningOverview?.sellerControls) ? learningOverview.sellerControls : [];
+    const sentAlerts = alerts.filter((item) => item.status === 'sent').length;
+    const blockedAlerts = alerts.filter((item) => item.status === 'blocked' || item.status === 'failed').length;
+    const reviewAlerts = alerts.filter((item) => item.status === 'review' || item.status === 'stored').length;
+    const latestTelegramFailure = alerts.find((item) => item.status === 'failed') || null;
+    const suspiciousCases = fakeDropDistribution
+      .filter((item) => ['wahrscheinlicher_fake_drop', 'verdaechtig', 'manuelle_pruefung'].includes(item.classification))
+      .reduce((sum, item) => sum + Number(item.count || 0), 0);
+    const keepaPipeline = learningPipeline.find((item) => item.id === 'auto_deals');
+    const scrapperPipeline = learningPipeline.find((item) => item.id === 'scrapper');
+    const generatorPipeline = learningPipeline.find((item) => item.id === 'generator');
+    const flowLanes = [
+      {
+        id: 'keepa',
+        title: 'Keepa + Amazon API / Auto-Deals',
+        badge: connection?.connected && amazonConnection?.configured ? 'verbunden' : 'vorbereitet',
+        badgeTone: connection?.connected && amazonConnection?.configured ? 'connected' : 'review',
+        summary:
+          keepaPipeline?.detail || 'Keepa liefert Preisverlauf, Amazon API liefert Produkt- und Affiliate-Daten fuer Auto-Deals.',
+        steps: [
+          {
+            eyebrow: 'Quelle',
+            title: 'Keepa + Amazon API',
+            detail:
+              connection?.connected && amazonConnection?.configured
+                ? 'Keepa prueft Preisverlauf, Amazon API liefert Produkt-/Affiliate-Daten als zweite Quelle.'
+                : 'Keepa und Amazon API sind getrennt vorbereitet und werden je nach Verfuegbarkeit zusammengefuehrt.',
+            tone: connection?.connected || amazonConnection?.configured ? 'connected' : 'review'
+          },
+          {
+            eyebrow: 'Pflichtschicht',
+            title: 'Lern-Logik',
+            detail: 'Preisverlauf, Fake-Drop und Freigabe-Regeln muessen zuerst durchlaufen.',
+            tone: 'active'
+          },
+          {
+            eyebrow: 'Regeln',
+            title: 'AMAZON / FBA / FBM',
+            detail: 'Getrennte Seller-Type-Schwellen bleiben als eigene Logik aktiv.',
+            tone: 'active'
+          },
+          {
+            eyebrow: 'Entscheidung',
+            title: sentAlerts ? 'approved_for_test_group' : reviewAlerts ? 'review' : 'blocked / review',
+            detail: `${sentAlerts} gesendet, ${reviewAlerts} in Review, ${blockedAlerts} blockiert.`,
+            tone: sentAlerts ? 'approved' : reviewAlerts ? 'review' : 'blocked'
+          },
+          {
+            eyebrow: 'Output',
+            title: 'Telegram Testgruppe',
+            detail: settingsForm.alertTelegramEnabled ? 'Nur freigegebene Auto-Deals werden ausgegeben.' : 'Telegram-Auto-Output ist derzeit deaktiviert.',
+            tone: settingsForm.alertTelegramEnabled ? 'sent' : 'inactive'
+          }
+        ]
+      },
+      {
+        id: 'scrapper',
+        title: 'Scrapper / Rohdeals',
+        badge: 'pflichtgekoppelt',
+        badgeTone: 'connected',
+        summary: scrapperPipeline?.detail || 'Rohdeals werden zuerst bewertet und dann weitergeleitet.',
+        steps: [
+          {
+            eyebrow: 'Quelle',
+            title: 'Scrapper',
+            detail: 'Quellen und Rohdeals bleiben vom Bewertungsbereich getrennt.',
+            tone: 'connected'
+          },
+          {
+            eyebrow: 'Pflichtschicht',
+            title: 'Lern-Logik',
+            detail: 'Scrapper-Deals duerfen die Bewertung nicht umgehen.',
+            tone: 'active'
+          },
+          {
+            eyebrow: 'Regeln',
+            title: 'AMAZON / FBA / FBM',
+            detail: `${fakeDropSummary?.kpis?.openReviewCount || 0} Faelle warten aktuell auf Review oder Freigabe.`,
+            tone: 'active'
+          },
+          {
+            eyebrow: 'Entscheidung',
+            title: (fakeDropSummary?.kpis?.openReviewCount || 0) > 0 ? 'review' : 'approved / block',
+            detail: 'Rohdeals landen je nach Verlauf in Review, Testgruppe oder Block.',
+            tone: (fakeDropSummary?.kpis?.openReviewCount || 0) > 0 ? 'review' : 'info'
+          },
+          {
+            eyebrow: 'Output',
+            title: 'Review / Testgruppe',
+            detail: 'Nur freigegebene Deals koennen spaeter in Outputs weiterlaufen.',
+            tone: 'info'
+          }
+        ]
+      },
+      {
+        id: 'generator',
+        title: 'Generator / Manuell',
+        badge: 'sauber getrennt',
+        badgeTone: 'info',
+        summary: generatorPipeline?.detail || 'Manuelle Deals bleiben schnell und direkt veroeffentlichbar.',
+        steps: [
+          {
+            eyebrow: 'Quelle',
+            title: 'Generator',
+            detail: 'Manueller Arbeitsbereich fuer Erstellen, Bearbeiten und Posten.',
+            tone: 'connected'
+          },
+          {
+            eyebrow: 'Unterstuetzung',
+            title: 'Optionale Lern-Logik',
+            detail: 'Die Anbindung bleibt intern aktiv, aber nicht mehr als Standard-UI im Generator sichtbar.',
+            tone: 'optional'
+          },
+          {
+            eyebrow: 'Regeln',
+            title: 'Seller Type Kontext',
+            detail: 'Bewertung und Keepa-Kontext koennen intern mitlaufen, ohne den Workflow zu ueberlagern.',
+            tone: 'info'
+          },
+          {
+            eyebrow: 'Entscheidung',
+            title: 'manuell gesteuert',
+            detail: 'Der Admin bewertet im separaten Bereich, der Mitarbeiter arbeitet im Generator sauber weiter.',
+            tone: 'info'
+          },
+          {
+            eyebrow: 'Output',
+            title: 'Direct Publish',
+            detail: 'Direktes Telegram-Posting bleibt als separater manueller Flow bestehen.',
+            tone: 'sent'
+          }
+        ]
+      }
+    ];
+    const dashboardMetrics = [
+      {
+        label: 'Offene Reviews',
+        value: fakeDropSummary?.kpis?.openReviewCount || overview?.fakeDropSummary?.kpis?.openReviewCount || 0,
+        detail: 'Faelle aus Quelle, Review oder Auto-Flow'
+      },
+      {
+        label: 'Verdaechtige Verlaeufe',
+        value: suspiciousCases,
+        detail: 'mit Fake-Drop- oder Pruef-Hinweis'
+      },
+      {
+        label: 'Telegram Outputs',
+        value: sentAlerts,
+        detail: 'zuletzt erfolgreich gesendet'
+      },
+      {
+        label: 'Letzte manuelle Suche',
+        value: formatDateTime(usageSummary?.lastManualSearch?.createdAt),
+        detail: `${usageSummary?.lastManualSearch?.resultCount || 0} Treffer aus kontrolliertem Abruf`
+      }
+    ];
+    const sourceStatusCards = [
+      {
+        label: 'Keepa Status',
+        tone: connection?.connected ? 'success' : statusData?.settings?.keepaKeyStatus?.connected ? 'warning' : 'danger',
+        status: connection?.connected ? 'verbunden' : statusData?.settings?.keepaKeyStatus?.connected ? 'fehler' : 'nicht konfiguriert',
+        value: formatDateTime(connection?.checkedAt || overview?.lastSync),
+        detail: connection?.connected ? 'Preisverlauf aktiv.' : 'Preisquelle noch nicht sauber verbunden.'
+      },
+      {
+        label: 'Amazon API Status',
+        tone:
+          amazonOverview?.apiStatus === 'verbunden'
+            ? 'success'
+            : amazonOverview?.apiStatus === 'auth_fehler' || amazonOverview?.apiStatus === 'fehler'
+              ? 'danger'
+              : 'warning',
+        status: amazonOverview?.apiStatus || 'vorbereitet',
+        value: formatDateTime(amazonOverview?.lastSuccessfulFetch),
+        detail:
+          amazonOverview?.apiStatus === 'verbunden'
+            ? `Produkt- und Affiliate-Daten aktiv. Deprecated ab ${learningOverview?.amazon?.deprecation?.date || '2026-04-30'}.`
+            : amazonOverview?.lastErrorMessage ||
+              `Amazon API vorbereitet. Deprecated ab ${learningOverview?.amazon?.deprecation?.date || '2026-04-30'}.`
+      },
+      {
+        label: 'Scrapper Status',
+        tone: copybotOverview?.copybotEnabled ? 'success' : 'warning',
+        status: copybotOverview?.copybotEnabled ? 'aktiv' : 'deaktiviert',
+        value: `${copybotOverview?.reviewCount || 0} Review-Faelle`,
+        detail: copybotOverview?.lastProcessedSource?.name || 'Rohdeals bleiben getrennt.'
+      }
+    ];
+    const processingStatusCards = [
+      {
+        label: 'Link Builder',
+        status: 'aktiv',
+        tone: 'success',
+        detail: 'Externe Amazon-Links werden standardisiert.'
+      },
+      {
+        label: 'Lern-Logik',
+        status: 'pflicht',
+        tone: 'success',
+        detail: 'Quellen laufen vor jedem Output ueber die zentrale Entscheidung.'
+      },
+      {
+        label: 'AMAZON / FBA / FBM',
+        status: 'getrennt',
+        tone: 'info',
+        detail: `${learningSellerTypes.length} Seller-Type-Profile mit eigenen Regeln und Feedback-Schwellen.`
+      }
+    ];
+    const outputStatusCards = [
+      {
+        label: 'Review',
+        status: reviewAlerts > 0 ? 'offen' : 'leer',
+        tone: reviewAlerts > 0 ? 'warning' : 'info',
+        detail: `${reviewAlerts} Deals warten auf Freigabe.`
+      },
+      {
+        label: 'Telegram Testgruppe',
+        status: sentAlerts > 0 ? 'aktiv' : settingsForm.alertTelegramEnabled ? 'bereit' : 'deaktiviert',
+        tone: sentAlerts > 0 ? 'success' : settingsForm.alertTelegramEnabled ? 'info' : 'warning',
+        detail: sentAlerts > 0 ? `${sentAlerts} Alerts erfolgreich gesendet.` : 'Output nur fuer freigegebene Deals.'
+      },
+      {
+        label: 'Live-Gruppen',
+        status: 'vorbereitet',
+        tone: 'info',
+        detail: 'Weiterer Output bleibt separat vorbereitet und laeuft aktuell noch nicht automatisch.'
+      }
+    ];
+    const sellerControlCards = keepaDrawerCatalog.map((drawer) => {
+      const drawerConfig = getDrawerConfig(drawer.key);
+      const control = learningSellerControls.find((item) => item.id === drawer.key) || {};
+
+      return {
+        id: drawer.key,
+        label: drawer.label,
+        active: drawerConfig.active,
+        patternSupportEnabled: drawerConfig.patternSupportEnabled,
+        autoModeAllowed: drawerConfig.autoModeAllowed,
+        autoPostingEnabled: drawerConfig.testGroupPostingAllowed && settingsForm.alertTelegramEnabled,
+        rulesActive: control.rulesActive !== false,
+        lastDecision: control.lastDecision || 'noch_keine',
+        lastDecisionDetail: shortenText(control.lastDecisionDetail || 'Noch keine letzte Entscheidung gespeichert.', 90),
+        lastRunAt: control.lastRunAt || null,
+        lastAsin: control.lastAsin || '',
+        lastStrength: control.lastStrength || ''
+      };
+    });
+    const faultStatusCards = [
+      {
+        label: 'Amazon letzter Fehler',
+        value: formatDateTime(amazonOverview?.lastErrorAt),
+        detail: amazonOverview?.lastErrorMessage || 'Noch kein Amazon-Fehler gespeichert.'
+      },
+      {
+        label: 'Amazon Auth Fehler',
+        value: formatDateTime(amazonOverview?.lastAuthErrorAt),
+        detail: amazonOverview?.authErrorCount24h ? `${amazonOverview.authErrorCount24h} Auth-Fehler in 24h.` : 'Kein letzter Auth-Fehler gespeichert.'
+      },
+      {
+        label: 'Keine Treffer',
+        value: `${amazonOverview?.noHitsCount24h || 0}`,
+        detail: 'Amazon-Requests ohne Treffer in den letzten 24 Stunden.'
+      },
+      {
+        label: 'Telegram Fehler',
+        value: latestTelegramFailure ? formatDateTime(latestTelegramFailure.createdAt) : '-',
+        detail: latestTelegramFailure?.errorMessage || 'Noch kein letzter Telegram-Fehler gespeichert.'
+      }
+    ];
+    const statusAndOutputCards = [...sourceStatusCards, ...processingStatusCards, ...outputStatusCards, ...faultStatusCards].map((item) => ({
+      ...item,
+      detail: shortenText(item.detail, 96)
+    }));
 
     return (
       <div className="keepa-section-stack">
-        <div className="responsive-grid">
-          <section className="card keepa-metric-card">
-            <p className="section-title">Keepa Nutzung heute</p>
-            <h2>{formatUsage(usageSummary?.today?.estimatedUsage)}</h2>
-            <p className="text-muted">
-              {usageSummary?.today?.requestCount || 0} Requests, {usageSummary?.today?.hitCount || 0} Treffer, {usageSummary?.usageModeLabel || 'intern geschaetzt'}.
-            </p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Keepa Nutzung Monat</p>
-            <h2>{formatUsage(usageSummary?.month?.estimatedUsage)}</h2>
-            <p className="text-muted">Monatsprojektion {formatUsage(usageSummary?.kpis?.monthlyProjection)}.</p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Letzte manuelle Suche</p>
-            <h2>{formatDateTime(usageSummary?.lastManualSearch?.createdAt)}</h2>
-            <p className="text-muted">
-              {usageSummary?.lastManualSearch?.resultCount || 0} Treffer, {formatUsage(usageSummary?.lastManualSearch?.estimatedUsage)}.
-            </p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Letzter Automatik-Lauf</p>
-            <h2>{formatDateTime(usageSummary?.lastAutomationRun?.createdAt)}</h2>
-            <p className="text-muted">
-              {usageSummary?.lastAutomationRun?.resultCount || 0} Treffer, {formatUsage(usageSummary?.lastAutomationRun?.estimatedUsage)}.
-            </p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">API Status</p>
-            <h2>{overview?.apiStatus || '-'}</h2>
-            <p className="text-muted">
-              {connection?.connected ? `Tokens verfuegbar: ${connection.tokensLeft}` : 'Keepa aktuell nicht verbunden.'}
-            </p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Letzte Treffer</p>
-            <h2>{overview?.latestHits?.length || 0}</h2>
-            <p className="text-muted">Persistierte Treffer aus Suche und Automatik.</p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Offene Reviews</p>
-            <h2>{fakeDropSummary?.kpis?.openReviewCount || overview?.fakeDropSummary?.kpis?.openReviewCount || 0}</h2>
-            <p className="text-muted">Verdaechtige oder unsichere Verlaeufe fuer die Review Queue.</p>
-          </section>
-        </div>
+        <section className="card keepa-banner keepa-admin-banner keepa-admin-summary">
+          <div className="dashboard-hero-copy">
+            <p className="section-title">Admin-Steuerbereich</p>
+            <h2 className="page-title">Logik-Zentrale fuer Quellen, Regeln und Output</h2>
+            <p className="page-subtitle">Generator und Scrapper bleiben clean, die Steuerung sitzt kompakt hier.</p>
+          </div>
+          <div className="dashboard-chip-row">
+            <span className="status-chip info">Nur fuer Admin sichtbar</span>
+            <span className={`status-chip ${connection?.connected ? 'success' : 'warning'}`}>
+              {connection?.connected ? 'Keepa verbunden' : 'Keepa vorbereitet'}
+            </span>
+            <span
+              className={`status-chip ${
+                amazonOverview?.apiStatus === 'verbunden'
+                  ? 'success'
+                  : amazonOverview?.apiStatus === 'auth_fehler' || amazonOverview?.apiStatus === 'fehler'
+                    ? 'danger'
+                    : 'warning'
+              }`}
+            >
+              {amazonOverview?.apiStatus === 'verbunden' ? 'Amazon API verbunden' : 'Amazon API vorbereitet'}
+            </span>
+          </div>
+        </section>
+
+        <section className="card keepa-panel keepa-overview-panel">
+          <div className="dashboard-section-header">
+            <div className="dashboard-title-block">
+              <p className="section-title">Steuerung</p>
+              <h2>Quellen, Kennzahlen und Seller-Typen kompakt</h2>
+            </div>
+            {isAdmin && (
+              <button className="primary" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+                {savingSettings ? 'Speichert...' : 'Steuerung speichern'}
+              </button>
+            )}
+          </div>
+
+          <div className="dashboard-stat-grid">
+            {dashboardMetrics.map((item) => (
+              <section key={item.label} className="card keepa-metric-card keepa-compact-card">
+                <p className="section-title">{item.label}</p>
+                <h2>{item.value}</h2>
+                <p className="dashboard-meta-line">{item.detail}</p>
+              </section>
+            ))}
+          </div>
+
+          <div className="keepa-control-grid">
+            {sellerControlCards.map((item) => (
+              <article key={item.id} className="keepa-control-card">
+                <div className="keepa-control-header">
+                  <div className="dashboard-title-block">
+                    <span className="dashboard-link-meta">{item.label}</span>
+                    <h3>{item.lastDecision}</h3>
+                  </div>
+                  <span className={`status-chip ${item.active ? 'success' : 'warning'}`}>
+                    {item.active ? 'aktiv' : 'inaktiv'}
+                  </span>
+                </div>
+
+                <div className="dashboard-chip-row">
+                  <span className={`status-chip ${item.patternSupportEnabled ? 'info' : 'warning'}`}>
+                    Muster {item.patternSupportEnabled ? 'an' : 'aus'}
+                  </span>
+                  <span className={`status-chip ${item.autoModeAllowed ? 'info' : 'warning'}`}>
+                    Auto-Modus {item.autoModeAllowed ? 'an' : 'aus'}
+                  </span>
+                  <span className={`status-chip ${item.autoPostingEnabled ? 'success' : 'warning'}`}>
+                    Auto-Posting {item.autoPostingEnabled ? 'an' : 'aus'}
+                  </span>
+                </div>
+
+                <div className="keepa-control-meta">
+                  <p className="dashboard-meta-line">Regeln {item.rulesActive ? 'aktiv' : 'vorbereitet'}{item.lastStrength ? ` | Staerke ${item.lastStrength}` : ''}</p>
+                  <p className="dashboard-meta-line">Letzter Lauf {formatDateTime(item.lastRunAt)}{item.lastAsin ? ` | ${item.lastAsin}` : ''}</p>
+                  <p className="dashboard-meta-line">{item.lastDecisionDetail}</p>
+                </div>
+
+                {isAdmin && (
+                  <div className="dashboard-toggle-grid">
+                    <label className="dashboard-toggle-card">
+                      <span>Muster</span>
+                      <input
+                        type="checkbox"
+                        checked={item.patternSupportEnabled}
+                        onChange={(event) => updateDrawerConfig(item.id, { patternSupportEnabled: event.target.checked })}
+                      />
+                    </label>
+                    <label className="dashboard-toggle-card">
+                      <span>Auto-Posting</span>
+                      <input
+                        type="checkbox"
+                        checked={getDrawerConfig(item.id).testGroupPostingAllowed}
+                        onChange={(event) => updateDrawerConfig(item.id, { testGroupPostingAllowed: event.target.checked })}
+                      />
+                    </label>
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="card keepa-panel">
+          <div className="dashboard-title-block">
+            <p className="section-title">Deal-Flow</p>
+            <h2>Quelle, Pflichtschicht und Output auf einen Blick</h2>
+          </div>
+          <div className="keepa-flow-board">
+            {flowLanes.map((lane) => (
+              <article key={lane.id} className="keepa-flow-lane">
+                <div className="keepa-flow-lane-header">
+                  <div>
+                    <p className="section-title">{lane.title}</p>
+                    <strong>{shortenText(lane.summary, 110)}</strong>
+                  </div>
+                  <span className={`status-chip ${getFlowStatusTone(lane.badgeTone)}`}>{lane.badge}</span>
+                </div>
+                <div className="keepa-flow-steps">
+                  {lane.steps.map((step, index) => (
+                    <div key={`${lane.id}-${step.eyebrow}`} className="keepa-flow-step-wrap">
+                      <section className="keepa-flow-step">
+                        <div className="keepa-flow-step-header">
+                          <span>{step.eyebrow}</span>
+                          <span className={`status-chip ${getFlowStatusTone(step.tone)}`}>{step.title}</span>
+                        </div>
+                        <p>{shortenText(step.detail, 84)}</p>
+                      </section>
+                      {index < lane.steps.length - 1 && (
+                        <div className="keepa-flow-arrow" aria-hidden="true">
+                          -&gt;
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="card keepa-panel">
+          <div className="dashboard-title-block">
+            <p className="section-title">Systemstatus</p>
+            <h2>Quellen, Verarbeitung, Output und Fehler kurz erklaert</h2>
+          </div>
+          <div className="keepa-status-grid">
+            {statusAndOutputCards.map((item) => (
+              <section key={item.label} className="card keepa-status-card keepa-compact-card">
+                <div className="keepa-panel-header">
+                  <p className="section-title">{item.label}</p>
+                  {'status' in item ? <span className={`status-chip ${item.tone}`}>{item.status}</span> : null}
+                </div>
+                <h3>{item.value || '-'}</h3>
+                <p className="dashboard-meta-line">{item.detail}</p>
+              </section>
+            ))}
+          </div>
+        </section>
+
+        <section className="card keepa-panel">
+          <div className="dashboard-title-block">
+            <p className="section-title">Seller Type Logik</p>
+            <h2>AMAZON, FBA und FBM bleiben getrennt</h2>
+          </div>
+          <div className="dashboard-compact-grid">
+            {learningSellerTypes.map((item) => (
+              <div key={item.id} className="keepa-metric-card keepa-compact-card">
+                <p className="section-title">{item.id}</p>
+                <h2>{item.keepaRating}</h2>
+                <p className="dashboard-meta-line">Rabatt {item.minDiscount}% | Score {item.minScore} | Fake-Drop {item.maxFakeDropRisk}</p>
+                <p className="dashboard-meta-line">
+                  Labels: {Array.isArray(item.learningLabels) && item.learningLabels.length ? item.learningLabels.join(', ') : 'noch offen'}
+                </p>
+              </div>
+            ))}
+          </div>
+        </section>
 
         <section className="card keepa-banner">
-          <div>
+          <div className="dashboard-hero-copy">
             <p className="section-title">Verbindungs-Hinweis</p>
-            <h2 className="page-title">{connection?.connected ? 'Keepa ist aktiv verbunden' : 'Keepa ist noch nicht voll aktiv'}</h2>
-            <p className="page-subtitle">
-              API-Key bleibt im Backend, Verbrauchswerte werden intern protokolliert und offizielle Token-Werte nur genutzt, wenn Keepa sie sauber zurueckmeldet.
-            </p>
+            <h2 className="page-title">{connection?.connected ? 'Keepa ist aktiv verbunden' : 'Keepa ist vorbereitet'}</h2>
+            <p className="page-subtitle">API-Keys bleiben im Backend, Verbrauchswerte werden intern protokolliert.</p>
           </div>
           <span className={`status-chip ${connection?.connected ? 'success' : 'warning'}`}>
             {connection?.connected ? 'Verbunden' : 'Nicht verbunden'}
@@ -1289,8 +2088,8 @@ function KeepaPage() {
           <section className="card keepa-panel">
             <div className="keepa-panel-header">
               <div>
-                <p className="section-title">Letzte Treffer</p>
-                <h2>Aktuelle Keepa-Ergebnisse</h2>
+                <p className="section-title">Entscheidungen</p>
+                <h2>Aktuelle Deal-Eingaenge</h2>
               </div>
             </div>
             <div className="keepa-list">
@@ -1312,8 +2111,8 @@ function KeepaPage() {
           <section className="card keepa-panel">
             <div className="keepa-panel-header">
               <div>
-                <p className="section-title">Letzte Alerts</p>
-                <h2>Benachrichtigungen</h2>
+                <p className="section-title">Outputs & Logs</p>
+                <h2>Telegram und letzte Versandpfade</h2>
               </div>
             </div>
             <div className="keepa-list">
@@ -1338,6 +2137,13 @@ function KeepaPage() {
 
   function renderManualSearchTab() {
     const lastUsage = manualResponse?.usage;
+    const activeDrawerConfig = getDrawerConfig(activeManualDrawer);
+    const protectionTone = manualProtection?.blocked ? 'danger' : manualConfirmationReady ? 'warning' : 'success';
+    const protectionLabel = manualProtection?.blocked
+      ? 'Geblockt'
+      : manualConfirmationReady
+        ? 'Bestaetigung noetig'
+        : 'Bereit';
 
     return (
       <div className="keepa-section-stack">
@@ -1347,10 +2153,32 @@ function KeepaPage() {
               <p className="section-title">Manuelle Suche</p>
               <h2>Deals kontrolliert abrufen</h2>
             </div>
-            <button className="primary" onClick={() => void handleManualSearch(1)} disabled={manualLoading}>
-              {manualLoading ? 'Laedt...' : 'Deals aktualisieren'}
-            </button>
+            <div className="keepa-inline-actions">
+              {isAdmin && (
+                <button className="secondary" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+                  {savingSettings ? 'Speichert...' : 'Profil speichern'}
+                </button>
+              )}
+              {manualDryRun && (
+                <button className="secondary" onClick={() => setManualDryRun(null)} disabled={manualLoading}>
+                  Vorschau verwerfen
+                </button>
+              )}
+              <button className="secondary" onClick={() => void handleManualSearch(1)} disabled={manualLoading}>
+                {manualLoading ? 'Laedt...' : 'Pruefung starten'}
+              </button>
+              <button className="primary" onClick={() => void handleConfirmManualSearch(1)} disabled={manualLoading || !manualConfirmationReady}>
+                {manualLoading && manualConfirmationReady ? 'Bestaetigt...' : 'Abfrage bestaetigen'}
+              </button>
+            </div>
           </div>
+
+          <p className="text-muted" style={{ margin: 0 }}>
+            Manuelle Keepa-Abfragen starten jetzt immer mit einem Dry-Run. Erst nach klarer Bestaetigung wird die
+            echte Query fuer AMAZON, FBA oder FBM ausgefuehrt.
+          </p>
+
+          {renderDrawerCards('manual')}
 
           <div className="keepa-card-metrics three">
             <span>
@@ -1371,30 +2199,101 @@ function KeepaPage() {
             <span>
               <strong>Quelle:</strong> {lastUsage?.sourceLabel || 'manuell'}
             </span>
+            <span>
+              <strong>Schublade:</strong> {activeManualDrawer}
+            </span>
+            <span>
+              <strong>Auto-Output:</strong> {activeDrawerConfig.testGroupPostingAllowed ? 'erlaubt' : 'gesperrt'}
+            </span>
+            <span>
+              <strong>Tokens:</strong> {manualProtection?.tokensLeft ?? statusData?.connection?.tokensLeft ?? '-'}
+            </span>
+            <span>
+              <strong>Schutz:</strong> {protectionLabel}
+            </span>
+            <span>
+              <strong>Cooldown:</strong>{' '}
+              {manualProtection?.cooldownActive ? `${Math.ceil((manualProtection?.cooldownRemainingMs || 0) / 1000)}s` : 'frei'}
+            </span>
+            <span>
+              <strong>Limit-Hardcap:</strong> {manualProtection?.cappedLimit ?? 12}
+            </span>
           </div>
 
+          <section className="card keepa-metric-card">
+            <p className="section-title">Keepa-Schutzschicht</p>
+            <h2>{protectionLabel}</h2>
+            <div className="keepa-card-tags" style={{ marginBottom: 12 }}>
+              <span className={`status-chip ${protectionTone}`}>{protectionLabel}</span>
+              {manualProtection?.hardStopActive && <span className="status-chip danger">Hard Stop aktiv</span>}
+              {manualProtection?.requestActive && <span className="status-chip warning">Request aktiv</span>}
+              {manualConfirmationReady && <span className="status-chip info">Dry-Run bereit</span>}
+            </div>
+            <p className="text-muted" style={{ marginTop: 0 }}>
+              {manualProtection?.blockReason ||
+                'Vor jedem echten Keepa-Deal-Request wird jetzt zuerst eine Kosten- und Risiko-Vorschau erzeugt.'}
+            </p>
+            <div className="keepa-card-metrics three">
+              <span>
+                <strong>Restguthaben:</strong> {manualProtection?.tokensLeft ?? statusData?.connection?.tokensLeft ?? '-'}
+              </span>
+              <span>
+                <strong>Minimum:</strong> {manualProtection?.minTokensRequired ?? '-'}
+              </span>
+              <span>
+                <strong>Geschaetzter Run:</strong> {manualProtection?.estimatedTokenCost ?? '-'}
+              </span>
+              <span>
+                <strong>Risiko:</strong> {manualProtection?.riskLevel || '-'}
+              </span>
+              <span>
+                <strong>Letzte Sperre:</strong> {formatDateTime(manualProtection?.lastBlockedAt)}
+              </span>
+              <span>
+                <strong>Letzter Lauf:</strong> {formatDateTime(manualProtection?.lastFinishedAt)}
+              </span>
+            </div>
+            {manualProtection?.warnings?.length ? (
+              <div className="keepa-card-tags">
+                {manualProtection.warnings.map((warning) => (
+                  <span key={warning} className="status-chip warning">
+                    {warning}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </section>
+
           <div className="keepa-form-grid">
+            <label>
+              <span className="section-title">Preisverfall Intervall</span>
+              <select value={manualFilters.trendInterval} onChange={(event) => updateManualFilters({ trendInterval: event.target.value })}>
+                {keepaTrendIntervalOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
             <label>
               <span className="section-title">Mindest-Rabatt</span>
               <div className="keepa-range-row">
                 <input
                   type="range"
-                  min="30"
+                  min="5"
                   max="90"
                   value={manualFilters.minDiscount}
-                  onChange={(event) => setManualFilters((prev) => ({ ...prev, minDiscount: Number(event.target.value) }))}
+                  onChange={(event) => updateManualFilters({ minDiscount: Number(event.target.value) })}
                 />
                 <strong>{manualFilters.minDiscount}%</strong>
               </div>
             </label>
 
             <label>
-              <span className="section-title">Verkaeufer-Typ</span>
-              <select
-                value={manualFilters.sellerType}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, sellerType: event.target.value }))}
-              >
-                {sellerTypeOptions.map((option) => (
+              <span className="section-title">Sortierung</span>
+              <select value={manualFilters.sortBy} onChange={(event) => updateManualFilters({ sortBy: event.target.value })}>
+                {keepaSortOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
@@ -1407,7 +2306,7 @@ function KeepaPage() {
               <input
                 type="number"
                 value={manualFilters.minPrice}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, minPrice: event.target.value }))}
+                onChange={(event) => updateManualFilters({ minPrice: event.target.value })}
                 placeholder="0"
               />
             </label>
@@ -1417,7 +2316,7 @@ function KeepaPage() {
               <input
                 type="number"
                 value={manualFilters.maxPrice}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, maxPrice: event.target.value }))}
+                onChange={(event) => updateManualFilters({ maxPrice: event.target.value })}
                 placeholder="500"
               />
             </label>
@@ -1426,11 +2325,22 @@ function KeepaPage() {
               <span className="section-title">Treffer pro Lauf</span>
               <select
                 value={manualFilters.limit}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, limit: Number(event.target.value) }))}
+                onChange={(event) => updateManualFilters({ limit: Number(event.target.value) })}
               >
                 <option value="12">12</option>
                 <option value="24">24</option>
                 <option value="48">48</option>
+              </select>
+            </label>
+
+            <label>
+              <span className="section-title">Amazon-Angebot</span>
+              <select value={manualFilters.amazonOfferMode} onChange={(event) => updateManualFilters({ amazonOfferMode: event.target.value })}>
+                {keepaAmazonOfferOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
           </div>
@@ -1441,7 +2351,7 @@ function KeepaPage() {
               <input
                 type="checkbox"
                 checked={manualFilters.onlyPrime}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, onlyPrime: event.target.checked }))}
+                onChange={(event) => updateManualFilters({ onlyPrime: event.target.checked })}
               />
             </label>
             <label className="checkbox-card">
@@ -1449,7 +2359,7 @@ function KeepaPage() {
               <input
                 type="checkbox"
                 checked={manualFilters.onlyInStock}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, onlyInStock: event.target.checked }))}
+                onChange={(event) => updateManualFilters({ onlyInStock: event.target.checked })}
               />
             </label>
             <label className="checkbox-card">
@@ -1457,14 +2367,44 @@ function KeepaPage() {
               <input
                 type="checkbox"
                 checked={manualFilters.onlyGoodRating}
-                onChange={(event) => setManualFilters((prev) => ({ ...prev, onlyGoodRating: event.target.checked }))}
+                onChange={(event) => updateManualFilters({ onlyGoodRating: event.target.checked })}
+              />
+            </label>
+            <label className="checkbox-card">
+              <span>Nur mit Bewertungen</span>
+              <input
+                type="checkbox"
+                checked={manualFilters.onlyWithReviews}
+                onChange={(event) => updateManualFilters({ onlyWithReviews: event.target.checked })}
+              />
+            </label>
+            <label className="checkbox-card">
+              <span>Nur eine Variante</span>
+              <input
+                type="checkbox"
+                checked={manualFilters.singleVariantOnly}
+                onChange={(event) => updateManualFilters({ singleVariantOnly: event.target.checked })}
+              />
+            </label>
+            <label className="checkbox-card">
+              <span>Nur letzte Preisphase</span>
+              <input
+                type="checkbox"
+                checked={manualFilters.recentPriceChangeOnly}
+                onChange={(event) => updateManualFilters({ recentPriceChangeOnly: event.target.checked })}
               />
             </label>
           </div>
 
           <div>
             <p className="section-title">Kategorien</p>
-            {renderCategoryPicker(manualFilters.categories, (categoryId) => toggleCategory(setManualFilters, categoryId))}
+            {renderCategoryPicker(manualFilters.categories, (categoryId) =>
+              updateManualFilters({
+                categories: manualFilters.categories.includes(categoryId)
+                  ? manualFilters.categories.filter((item) => item !== categoryId)
+                  : [...manualFilters.categories, categoryId]
+              })
+            )}
           </div>
         </section>
 
@@ -1590,13 +2530,15 @@ function KeepaPage() {
   }
 
   function renderAutomatikTab() {
+    const activeAutoDrawerConfig = getDrawerConfig(activeAutomationDrawer);
+
     return (
       <div className="keepa-section-stack">
         <div className="responsive-grid">
           <section className="card keepa-metric-card">
-            <p className="section-title">Scheduler</p>
+            <p className="section-title">Globaler Auto-Modus</p>
             <h2>{settingsForm.schedulerEnabled ? 'Aktiv' : 'Pausiert'}</h2>
-            <p className="text-muted">Prueft aktive Regeln im Backend-Intervall und vermeidet Endlosschleifen.</p>
+            <p className="text-muted">Nur aktive Schubladen duerfen im Hintergrund laden und an die Testgruppe ausgeben.</p>
           </section>
           <section className="card keepa-metric-card">
             <p className="section-title">Vergleichs-Adapter</p>
@@ -1621,6 +2563,99 @@ function KeepaPage() {
             </p>
           </div>
           <span className="status-chip info">Review Queue aktiv</span>
+        </section>
+
+        <section className="card keepa-panel">
+          <div className="keepa-panel-header">
+            <div>
+              <p className="section-title">Schubladen-Steuerung</p>
+              <h2>Auto-Modus nur pro aktivierter Schublade</h2>
+            </div>
+            <div className="keepa-inline-actions">
+              {isAdmin && (
+                <button className="secondary" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+                  {savingSettings ? 'Speichert...' : 'Schubladen speichern'}
+                </button>
+              )}
+              <button className="primary" onClick={() => loadDrawerIntoRuleForm(activeAutomationDrawer)}>
+                Schublade in Regel laden
+              </button>
+            </div>
+          </div>
+
+          {renderDrawerCards('automation')}
+
+          <div className="keepa-flag-grid">
+            <label className="checkbox-card">
+              <span>Schublade aktiv</span>
+              <input
+                type="checkbox"
+                checked={activeAutoDrawerConfig.active}
+                disabled={!isAdmin}
+                onChange={(event) => updateDrawerConfig(activeAutomationDrawer, { active: event.target.checked })}
+              />
+            </label>
+            <label className="checkbox-card">
+              <span>Auto-Modus erlaubt</span>
+              <input
+                type="checkbox"
+                checked={activeAutoDrawerConfig.autoModeAllowed}
+                disabled={!isAdmin}
+                onChange={(event) => updateDrawerConfig(activeAutomationDrawer, { autoModeAllowed: event.target.checked })}
+              />
+            </label>
+            <label className="checkbox-card">
+              <span>Muster-Unterstuetzung aktiv</span>
+              <input
+                type="checkbox"
+                checked={activeAutoDrawerConfig.patternSupportEnabled}
+                disabled={!isAdmin}
+                onChange={(event) =>
+                  updateDrawerConfig(activeAutomationDrawer, { patternSupportEnabled: event.target.checked })
+                }
+              />
+            </label>
+            <label className="checkbox-card">
+              <span>Testgruppen-Posting erlaubt</span>
+              <input
+                type="checkbox"
+                checked={activeAutoDrawerConfig.testGroupPostingAllowed}
+                disabled={!isAdmin}
+                onChange={(event) =>
+                  updateDrawerConfig(activeAutomationDrawer, {
+                    testGroupPostingAllowed: event.target.checked
+                  })
+                }
+              />
+            </label>
+          </div>
+
+          <div className="keepa-card-metrics three">
+            <span>
+              <strong>Drawer:</strong> {activeAutomationDrawer}
+            </span>
+            <span>
+              <strong>Muster:</strong> {activeAutoDrawerConfig.patternSupportEnabled ? 'aktiv' : 'deaktiviert'}
+            </span>
+            <span>
+              <strong>Intervall:</strong>{' '}
+              {keepaTrendIntervalOptions.find((item) => item.value === activeAutoDrawerConfig.trendInterval)?.label || activeAutoDrawerConfig.trendInterval}
+            </span>
+            <span>
+              <strong>Rabatt:</strong> ab {activeAutoDrawerConfig.minDiscount}%
+            </span>
+            <span>
+              <strong>Amazon-Angebot:</strong>{' '}
+              {keepaAmazonOfferOptions.find((item) => item.value === activeAutoDrawerConfig.amazonOfferMode)?.label || activeAutoDrawerConfig.amazonOfferMode}
+            </span>
+            <span>
+              <strong>Sortierung:</strong>{' '}
+              {keepaSortOptions.find((item) => item.value === activeAutoDrawerConfig.sortBy)?.label || activeAutoDrawerConfig.sortBy}
+            </span>
+            <span>
+              <strong>Schutz:</strong> Lern-Logik Pflicht
+            </span>
+          </div>
         </section>
 
         <section className="card keepa-panel">
@@ -2509,44 +3544,87 @@ function KeepaPage() {
   }
 
   function renderUsageTab() {
+    const requestTracking = usageSummary?.requestTracking || {};
+    const recent60s = requestTracking.windows?.last60s || {};
+    const recent5m = requestTracking.windows?.last5m || {};
+    const warningsActive = requestTracking.warningsActive || [];
+    const latestKeepaRequests = (usageLogs.items || []).filter((item) => item.action === 'keepa-request').slice(0, 10);
+    const usageSeries = usageHistory?.series || [];
+    const hasTokenSeries = usageSeries.some((item) => Number(item.tokensUsed || 0) > 0);
+
     return (
       <div className="keepa-section-stack">
         <div className="responsive-grid">
           <section className="card keepa-metric-card">
-            <p className="section-title">Keepa Nutzung heute</p>
-            <h2>{formatUsage(usageSummary?.today?.estimatedUsage)}</h2>
-            <p className="text-muted">{usageSummary?.today?.requestCount || 0} Requests heute, Verbrauch klar als intern geschaetzt markiert.</p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Keepa Nutzung Monat</p>
-            <h2>{formatUsage(usageSummary?.month?.estimatedUsage)}</h2>
-            <p className="text-muted">Monatsnutzung bisher, als geschaetzter Verbrauch ausgewiesen.</p>
-          </section>
-          <section className="card keepa-metric-card">
-            <p className="section-title">Letzte manuelle Suche</p>
-            <h2>{formatDateTime(usageSummary?.lastManualSearch?.createdAt)}</h2>
+            <p className="section-title">Letzter Keepa-Request</p>
+            <h2>{formatDateTime(requestTracking?.lastRequest?.createdAt)}</h2>
             <p className="text-muted">
-              {usageSummary?.lastManualSearch?.resultCount || 0} Treffer - {formatDuration(usageSummary?.lastManualSearch?.durationMs)}
+              {formatKeepaModeLabel(requestTracking?.lastRequest?.mode)} {requestTracking?.lastRequest?.drawerKey || '-'} - {formatUsage(requestTracking?.lastRequest?.tokensUsed)}
             </p>
           </section>
           <section className="card keepa-metric-card">
-            <p className="section-title">Letzter Automatik-Lauf</p>
-            <h2>{formatDateTime(usageSummary?.lastAutomationRun?.createdAt)}</h2>
+            <p className="section-title">Tokens heute</p>
+            <h2>{formatUsage(requestTracking?.tokensToday)}</h2>
+            <p className="text-muted">{requestTracking?.requestsToday || 0} echte Keepa-Requests heute.</p>
+          </section>
+          <section className="card keepa-metric-card">
+            <p className="section-title">Verbrauch letzte Minute</p>
+            <h2>{formatUsage(recent60s?.tokensUsed)}</h2>
             <p className="text-muted">
-              {usageSummary?.lastAutomationRun?.resultCount || 0} Treffer - {formatDuration(usageSummary?.lastAutomationRun?.durationMs)}
+              {recent60s?.requestCount || 0} Requests in 60s.
             </p>
           </section>
           <section className="card keepa-metric-card">
-            <p className="section-title">Gefundene Deals heute</p>
-            <h2>{usageSummary?.dealsToday || 0}</h2>
-            <p className="text-muted">Manuelle Suche und Automatik kombiniert.</p>
+            <p className="section-title">Requests pro Minute</p>
+            <h2>{requestTracking?.requestsPerMinute?.toFixed ? requestTracking.requestsPerMinute.toFixed(1) : requestTracking?.requestsPerMinute || '0.0'}</h2>
+            <p className="text-muted">
+              Basis: 5-Minuten-Fenster mit {recent5m?.requestCount || 0} Requests.
+            </p>
           </section>
           <section className="card keepa-metric-card">
-            <p className="section-title">Monatsprojektion</p>
-            <h2>{formatUsage(usageSummary?.kpis?.monthlyProjection)}</h2>
-            <p className="text-muted">{usageSummary?.usageModeLabel || 'intern geschaetzt'}.</p>
+            <p className="section-title">Ø Tokens / Request</p>
+            <h2>{formatUsage(requestTracking?.averageTokensPerRequest)}</h2>
+            <p className="text-muted">Heute uebers alle echten Keepa-Requests berechnet.</p>
+          </section>
+          <section className="card keepa-metric-card">
+            <p className="section-title">Ø Tokens / Ergebnis</p>
+            <h2>{formatUsage(requestTracking?.averageTokensPerResult)}</h2>
+            <p className="text-muted">{usageSummary?.today?.hitCount || 0} Treffer dienen als Basis.</p>
+          </section>
+          <section className="card keepa-metric-card">
+            <p className="section-title">Teuerster Request</p>
+            <h2>{formatUsage(requestTracking?.expensiveRequest?.tokensUsed)}</h2>
+            <p className="text-muted">
+              {formatDateTime(requestTracking?.expensiveRequest?.createdAt)} - {requestTracking?.expensiveRequest?.drawerKey || '-'}
+            </p>
+          </section>
+          <section className="card keepa-metric-card">
+            <p className="section-title">Ø pro Tag</p>
+            <h2>{formatUsage(requestTracking?.averageTokensPerDay)}</h2>
+            <p className="text-muted">Seit Monatsstart, ohne Fantasiewerte.</p>
           </section>
         </div>
+
+        <section className="card keepa-panel">
+          <div className="keepa-panel-header">
+            <div>
+              <p className="section-title">Schutzstatus</p>
+              <h2>Warnungen und Verbrauchsschutz</h2>
+            </div>
+          </div>
+          <div className="keepa-list">
+            {warningsActive.map((item) => (
+              <div key={item.code} className="keepa-list-item static">
+                <div>
+                  <strong>{item.title}</strong>
+                  <p className="text-muted">{item.message}</p>
+                </div>
+                <span className={`status-chip ${item.level === 'danger' ? 'danger' : 'warning'}`}>{item.code}</span>
+              </div>
+            ))}
+            {!warningsActive.length && <p className="text-muted">Aktuell keine aktiven Keepa-Verbrauchswarnungen.</p>}
+          </div>
+        </section>
 
         <section className="card keepa-panel">
           <div className="keepa-panel-header">
@@ -2595,10 +3673,10 @@ function KeepaPage() {
             <div className="keepa-panel-header">
               <div>
                 <p className="section-title">Linienchart</p>
-                <h2>Keepa-Nutzung ueber Zeit</h2>
+                <h2>{hasTokenSeries ? 'Tokenverbrauch ueber Zeit' : 'Keepa-Nutzung ueber Zeit'}</h2>
               </div>
             </div>
-            <MiniLineChart data={usageHistory?.series || []} valueKey="estimatedUsage" color="#10b981" />
+            <MiniLineChart data={usageSeries} valueKey={hasTokenSeries ? 'tokensUsed' : 'estimatedUsage'} color="#10b981" />
           </section>
 
           <section className="card keepa-panel">
@@ -2633,6 +3711,56 @@ function KeepaPage() {
             <MiniDonutChart data={usageBreakdown} valueKey="estimatedUsage" valueFormatter={formatUsage} />
           </section>
         </div>
+
+        <section className="card keepa-panel">
+          <div className="keepa-panel-header">
+            <div>
+              <p className="section-title">Request Tracking</p>
+              <h2>Letzte echte Keepa-Requests</h2>
+            </div>
+          </div>
+
+          <div className="keepa-table-wrap">
+            <table className="keepa-table">
+              <thead>
+                <tr>
+                  <th>Start</th>
+                  <th>Ende</th>
+                  <th>Mode</th>
+                  <th>Schublade</th>
+                  <th>Tokens vorher</th>
+                  <th>Tokens nachher</th>
+                  <th>Verbrauch</th>
+                  <th>Treffer</th>
+                  <th>Dauer</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {latestKeepaRequests.map((item) => (
+                  <tr key={`request-${item.id}`}>
+                    <td>{formatDateTime(item.timestampStart)}</td>
+                    <td>{formatDateTime(item.timestampEnd)}</td>
+                    <td>{formatKeepaModeLabel(item.mode)}</td>
+                    <td>{item.drawerKey || '-'}</td>
+                    <td>{item.tokensBefore ?? '-'}</td>
+                    <td>{item.tokensAfter ?? '-'}</td>
+                    <td>{formatUsage(item.tokensUsed)}</td>
+                    <td>{item.resultCount}</td>
+                    <td>{formatDuration(item.durationMs)}</td>
+                    <td>
+                      <span className={`status-chip ${item.requestStatus === 'error' ? 'danger' : item.requestStatus === 'warning' ? 'warning' : 'success'}`}>
+                        {item.requestStatus}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {!latestKeepaRequests.length && <p className="text-muted">Noch keine echten Keepa-Requests im Tracking vorhanden.</p>}
+        </section>
 
         <section className="card keepa-panel">
           <div className="keepa-panel-header">
@@ -2672,6 +3800,8 @@ function KeepaPage() {
                   <th>Zeitpunkt</th>
                   <th>Aktion</th>
                   <th>Modul</th>
+                  <th>Mode</th>
+                  <th>Schublade</th>
                   <th>Filter</th>
                   <th>Treffer</th>
                   <th>Dauer</th>
@@ -2685,6 +3815,8 @@ function KeepaPage() {
                     <td>{formatDateTime(item.createdAt)}</td>
                     <td>{item.actionLabel}</td>
                     <td>{item.moduleLabel}</td>
+                    <td>{formatKeepaModeLabel(item.mode)}</td>
+                    <td>{item.drawerKey || '-'}</td>
                     <td>
                       {item.filters ? (
                         <span className="keepa-log-filters">
@@ -2699,7 +3831,7 @@ function KeepaPage() {
                     </td>
                     <td>{item.resultCount}</td>
                     <td>{formatDuration(item.durationMs)}</td>
-                    <td>{formatUsage(item.estimatedUsage)}</td>
+                    <td>{formatUsage(item.tokensUsed || item.estimatedUsage)}</td>
                     <td>
                       <span className={`status-chip ${item.requestStatus === 'error' ? 'danger' : item.requestStatus === 'warning' ? 'warning' : 'success'}`}>
                         {item.requestStatus}
@@ -2942,7 +4074,7 @@ function KeepaPage() {
                     <div>
                       <strong>{item.title}</strong>
                       <p className="text-muted">
-                        {item.asin} - {item.sellerType} - {item.categoryName || '-'}
+                        {item.asin} - {item.sellerType} - {item.sourceLabel || 'Keepa'} - {item.categoryName || '-'}
                       </p>
                     </div>
                   </div>
@@ -2988,6 +4120,29 @@ function KeepaPage() {
                       <p className="section-title">Analyse-Begruendung</p>
                       <p className="text-muted">{item.fakeDrop?.analysisReason || 'Noch keine Begruendung gespeichert.'}</p>
                     </div>
+                    {item.similarCaseSummary?.total > 0 && (
+                      <div className="keepa-info-card">
+                        <p className="section-title">Aehnliche Faelle</p>
+                        <p className="text-muted">
+                          {item.similarCaseSummary.total} aehnliche {item.sellerType}-Faelle.
+                          {' '}Good: {item.similarCaseSummary.positiveCount || 0}, kritisch: {item.similarCaseSummary.negativeCount || 0}, Review: {item.similarCaseSummary.uncertainCount || 0}.
+                        </p>
+                        {!!item.similarCases?.length && (
+                          <div className="keepa-list">
+                            {item.similarCases.slice(0, 3).map((similar) => (
+                              <div key={`${item.id}-${similar.reviewItemId}`} className="keepa-list-item static">
+                                <div>
+                                  <strong>{similar.title || similar.asin}</strong>
+                                  <p className="text-muted">
+                                    {similar.sourceLabel} - {similar.labelLabel} - {similar.similarityScore}% Match
+                                  </p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="keepa-card-tags">
                       {(item.fakeDrop?.flags || []).slice(0, 4).map((flag) => (
                         <span key={flag.id} className="status-chip warning">
@@ -3063,7 +4218,7 @@ function KeepaPage() {
                       {reviewLabelOptions.map((option) => (
                         <button
                           key={option.value}
-                          className={option.value === 'nein' ? 'secondary' : 'primary'}
+                          className={isNegativeReviewValue(option.value) ? 'secondary' : 'primary'}
                           onClick={() => void handleSubmitReview(item.id, option.value)}
                           disabled={reviewBusyId === item.id}
                         >
@@ -3185,7 +4340,7 @@ function KeepaPage() {
                   <div>
                     <strong>{item.title}</strong>
                     <p className="text-muted">
-                      {item.asin} - {item.sellerType} - {item.categoryName || '-'}
+                      {item.asin} - {item.sellerType} - {item.sourceLabel || 'Keepa'} - {item.categoryName || '-'}
                     </p>
                   </div>
                 </div>
@@ -3235,10 +4390,11 @@ function KeepaPage() {
                           <div>
                             <strong>{similar.title || similar.asin}</strong>
                             <p className="text-muted">
-                              {similar.labelLabel} - {similar.classificationLabel} - Risk {similar.fakeDropRisk}
+                              {similar.sourceLabel || 'Keepa'} - {similar.labelLabel} - {similar.classificationLabel} - Risk {similar.fakeDropRisk}
+                              {typeof similar.similarityScore === 'number' ? ` - ${similar.similarityScore}% Match` : ''}
                             </p>
                           </div>
-                          <span className="status-chip info">{similar.bucketLabel}</span>
+                          <span className="status-chip info">{similar.categoryName || 'Vergleich'}</span>
                         </div>
                       ))}
                       {!item.similarCases?.length && <p className="text-muted">Keine aehnlichen gespeicherten Faelle gefunden.</p>}
@@ -3340,22 +4496,27 @@ function KeepaPage() {
     <Layout>
       <div className="keepa-page">
         <section className="card keepa-hero">
-          <div>
-            <p className="section-title">Keepa</p>
-            <h1 className="page-title">Deal Monitoring mit sicherer Backend-Architektur</h1>
-            <p className="page-subtitle">
-              Keepa laeuft nur ueber eigene Backend-Endpunkte, API-Keys bleiben im Backend und das Verbrauchs-Tracking wird sichtbar aus Backend-Logs und geschaetzten Usage-Werten aufgebaut.
-            </p>
+          <div className="dashboard-hero-copy">
+            <p className="section-title">Admin-Zentrale</p>
+            <h1 className="page-title">Logik-Zentrale fuer Quellen, Regeln und Output</h1>
+            <p className="page-subtitle">Admin sieht hier den Deal-Flow kompakt, Generator und Scrapper bleiben davon getrennt.</p>
           </div>
-          <span className={`status-chip ${statusData?.connection?.connected ? 'success' : 'warning'}`}>
-            {statusData?.connection?.connected ? 'Keepa verbunden' : 'Keepa nicht verbunden'}
-          </span>
+          <div className="dashboard-chip-row">
+            <span className="status-chip info">{isAdmin ? 'Admin sichtbar' : 'versteckt'}</span>
+            <span className={`status-chip ${statusData?.connection?.connected ? 'success' : 'warning'}`}>
+              {statusData?.connection?.connected ? 'Keepa verbunden' : 'Keepa getrennt vorbereitet'}
+            </span>
+          </div>
         </section>
 
         <section className="card keepa-tab-card">
           <nav className="keepa-tabs">
             {keepaTabs.map((item) => (
-              <NavLink key={item.path} to={item.path} className={({ isActive }) => (isActive ? 'keepa-tab active' : 'keepa-tab')}>
+              <NavLink
+                key={item.path}
+                to={buildLearningTabPath(navigationBasePath, item.path)}
+                className={() => (currentTab === item.path ? 'keepa-tab active' : 'keepa-tab')}
+              >
                 {item.label}
               </NavLink>
             ))}
@@ -3370,7 +4531,7 @@ function KeepaPage() {
           </section>
         )}
 
-        {bootLoading ? <section className="card keepa-message-card">Keepa-Daten werden geladen...</section> : renderCurrentTab()}
+        {bootLoading ? <section className="card keepa-message-card">Lern-Logik-Daten werden geladen...</section> : renderCurrentTab()}
       </div>
     </Layout>
   );

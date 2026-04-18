@@ -1,5 +1,7 @@
 import { Router } from 'express';
+import { getAmazonAffiliateStatus, runAmazonAffiliateApiTest } from '../services/amazonAffiliateService.js';
 import { classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
+import { logGeneratorDebug } from '../services/generatorFlowService.js';
 
 const router = Router();
 
@@ -119,6 +121,10 @@ async function handleScrape(req, res) {
     }
 
     const trimmedUrl = url.trim();
+    logGeneratorDebug('api.amazon.scrape.request', {
+      url: trimmedUrl
+    });
+
     if (!/^https?:\/\//i.test(trimmedUrl)) {
       return res.status(400).json({
         success: false,
@@ -157,11 +163,20 @@ async function handleScrape(req, res) {
     const asin = extractAsin(canonicalUrl) || extractAsin(trimmedUrl) || '';
     const normalizedUrl = normalizeAmazonLink(canonicalUrl || trimmedUrl);
     const sellerInfo = extractSellerInfo(html);
+    const imageUrl = normalizeDealImageUrl(extractAmazonImage(html)) || '';
+
+    logGeneratorDebug('api.amazon.scrape.success', {
+      url: trimmedUrl,
+      asin,
+      sellerType: sellerInfo.sellerType,
+      hasImage: Boolean(imageUrl),
+      normalizedUrl
+    });
 
     return res.status(200).json({
       success: true,
       title: extractAmazonTitle(html) || '',
-      image: normalizeDealImageUrl(extractAmazonImage(html)) || '',
+      image: imageUrl,
       price: extractAmazonPrice(html) || '',
       oldPrice: extractAmazonOldPrice(html) || '',
       asin,
@@ -171,6 +186,9 @@ async function handleScrape(req, res) {
       sellerType: sellerInfo.sellerType
     });
   } catch (error) {
+    logGeneratorDebug('api.amazon.scrape.error', {
+      error: error instanceof Error ? error.message : 'Scrape failed'
+    });
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? `Scrape failed: ${error.message}` : 'Scrape failed',
@@ -178,6 +196,31 @@ async function handleScrape(req, res) {
     });
   }
 }
+
+router.get('/status', (req, res) => {
+  try {
+    res.json(getAmazonAffiliateStatus());
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Amazon API Status konnte nicht geladen werden.'
+    });
+  }
+});
+
+router.get('/test', async (req, res) => {
+  try {
+    res.json(
+      await runAmazonAffiliateApiTest({
+        asin: req.query.asin
+      })
+    );
+  } catch (error) {
+    res.status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 400).json({
+      error: error instanceof Error ? error.message : 'Amazon API Test fehlgeschlagen.',
+      code: error instanceof Error ? error.code || 'AMAZON_API_TEST_FAILED' : 'AMAZON_API_TEST_FAILED'
+    });
+  }
+});
 
 router.post('/scrape', handleScrape);
 

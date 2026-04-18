@@ -1,6 +1,12 @@
 import { Router } from 'express';
 import { enqueueGeneratorPost } from '../services/generatorService.js';
 import {
+  buildGeneratorDebugPayload,
+  getGeneratorValidationError,
+  logGeneratorDebug,
+  normalizeGeneratorInput
+} from '../services/generatorFlowService.js';
+import {
   getWorkerStatus,
   listPublishingLogs,
   listPublishingQueue,
@@ -36,9 +42,31 @@ router.get('/workers/status', (req, res) => {
 });
 
 router.post('/generator', (req, res) => {
+  const normalizedInput = normalizeGeneratorInput(req.body ?? {});
+  const debugPayload = buildGeneratorDebugPayload(normalizedInput);
+  logGeneratorDebug('api.publishing.generator.request', debugPayload);
+
+  const validationError = getGeneratorValidationError(normalizedInput, { mode: 'queue' });
+  if (validationError) {
+    logGeneratorDebug('api.publishing.generator.rejected', {
+      error: validationError,
+      ...debugPayload
+    });
+    return res.status(400).json({ error: validationError });
+  }
+
   try {
-    res.status(201).json({ item: enqueueGeneratorPost(req.body ?? {}) });
+    const item = enqueueGeneratorPost(normalizedInput);
+    logGeneratorDebug('api.publishing.generator.success', {
+      queueId: item?.id ?? null,
+      ...debugPayload
+    });
+    res.status(201).json({ item });
   } catch (error) {
+    logGeneratorDebug('api.publishing.generator.error', {
+      error: error instanceof Error ? error.message : 'Generator-Queue konnte nicht erstellt werden.',
+      ...debugPayload
+    });
     res.status(400).json({ error: error instanceof Error ? error.message : 'Generator-Queue konnte nicht erstellt werden.' });
   }
 });

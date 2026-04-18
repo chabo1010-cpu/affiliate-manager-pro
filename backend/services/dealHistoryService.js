@@ -1,6 +1,18 @@
 import { DEFAULT_TELEGRAM_COPY_BUTTON_TEXT, getDb } from '../db.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
 
 const db = getDb();
+const AMAZON_AFFILIATE_TAG = 'codeundcoup08-21';
+const AMAZON_FALLBACK_HOST = 'amazon.de';
+const AMAZON_SHORT_HOSTS = new Set(['amzn.to']);
+const AMAZON_HOST_PATTERN = /(^|\.)amazon\.[a-z.]+$/i;
+const AMAZON_ASIN_PATTERNS = [
+  /\/dp\/([A-Z0-9]{10})(?:[/?]|$)/i,
+  /\/gp\/product\/([A-Z0-9]{10})(?:[/?]|$)/i,
+  /\/exec\/obidos\/ASIN\/([A-Z0-9]{10})(?:[/?]|$)/i,
+  /\/product\/([A-Z0-9]{10})(?:[/?]|$)/i,
+  /[?&](?:asin|ASIN)=([A-Z0-9]{10})(?:[&#]|$)/i
+];
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -35,6 +47,15 @@ function safeUrl(value) {
   } catch {
     return null;
   }
+}
+
+function normalizeHostname(value = '') {
+  return cleanText(value).toLowerCase().replace(/^www\./, '');
+}
+
+function isAmazonHostname(value = '') {
+  const hostname = normalizeHostname(value);
+  return AMAZON_SHORT_HOSTS.has(hostname) || AMAZON_HOST_PATTERN.test(hostname);
 }
 
 function findDealsByField(field, value) {
@@ -111,8 +132,23 @@ function getDealMatchClause(asin, normalizedUrl) {
 }
 
 export function extractAsin(value = '') {
-  const match = cleanText(value).match(/(?:\/dp\/|\/gp\/product\/|[?&]asin=)([A-Z0-9]{10})/i);
-  return match?.[1]?.toUpperCase() || '';
+  const trimmed = cleanText(value);
+  if (!trimmed) {
+    return '';
+  }
+
+  if (/^[A-Z0-9]{10}$/i.test(trimmed)) {
+    return trimmed.toUpperCase();
+  }
+
+  for (const pattern of AMAZON_ASIN_PATTERNS) {
+    const match = trimmed.match(pattern);
+    if (match?.[1]) {
+      return match[1].toUpperCase();
+    }
+  }
+
+  return '';
 }
 
 export function normalizeAmazonLink(value = '') {
@@ -133,6 +169,86 @@ export function normalizeAmazonLink(value = '') {
   }
 
   return `${parsed.protocol}//${hostname}${parsed.pathname.replace(/\/+$/, '') || '/'}`;
+}
+
+export function buildAmazonAffiliateLinkRecord(value = '', options = {}) {
+  const originalUrl = cleanText(value);
+  const resolvedUrl = cleanText(options.resolvedUrl);
+  const providedAsin = cleanText(options.asin).toUpperCase();
+  const lookupValue = resolvedUrl || originalUrl;
+  const parsedUrl = safeUrl(lookupValue);
+  const hostname = normalizeHostname(parsedUrl?.hostname || '');
+  const isAmazonSource = hostname ? isAmazonHostname(hostname) : false;
+
+  logGeneratorDebug('RAW LINK RECEIVED', {
+    originalUrl: originalUrl || null,
+    resolvedUrl: resolvedUrl || null
+  });
+
+  const directAsin = extractAsin(lookupValue) || extractAsin(originalUrl);
+  const asin =
+    directAsin ||
+    (!originalUrl || isAmazonSource || /^[A-Z0-9]{10}$/i.test(originalUrl) ? providedAsin : '');
+
+  if (asin) {
+    logGeneratorDebug('ASIN EXTRACTED', {
+      asin,
+      sourceHost: hostname || null
+    });
+  }
+
+  if (!asin) {
+    logGeneratorDebug('INVALID LINK', {
+      originalUrl: originalUrl || null,
+      resolvedUrl: resolvedUrl || null,
+      reason: 'ASIN konnte nicht erkannt werden.'
+    });
+
+    return {
+      originalUrl,
+      asin: '',
+      normalizedUrl: '',
+      affiliateUrl: '',
+      valid: false
+    };
+  }
+
+  if (parsedUrl && !isAmazonSource) {
+    logGeneratorDebug('INVALID LINK', {
+      originalUrl: originalUrl || null,
+      resolvedUrl: resolvedUrl || null,
+      reason: 'Link stammt nicht von Amazon.'
+    });
+
+    return {
+      originalUrl,
+      asin: '',
+      normalizedUrl: '',
+      affiliateUrl: '',
+      valid: false
+    };
+  }
+
+  const finalHost = AMAZON_HOST_PATTERN.test(hostname) ? hostname : normalizeHostname(options.defaultHost || AMAZON_FALLBACK_HOST);
+  const normalizedUrl = `https://www.${finalHost}/dp/${asin}`;
+  const affiliateUrl = `${normalizedUrl}?tag=${AMAZON_AFFILIATE_TAG}`;
+
+  logGeneratorDebug('LINK NORMALIZED', {
+    asin,
+    normalizedUrl
+  });
+  logGeneratorDebug('AFFILIATE LINK BUILT', {
+    asin,
+    affiliateUrl
+  });
+
+  return {
+    originalUrl,
+    asin,
+    normalizedUrl,
+    affiliateUrl,
+    valid: true
+  };
 }
 
 export function classifySellerType({ soldByAmazon, shippedByAmazon }) {

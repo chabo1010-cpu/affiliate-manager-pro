@@ -64,9 +64,9 @@ router.delete('/sources/:id', requireAdmin, (req, res) => {
   res.json({ item: deleteSource(Number(req.params.id)) });
 });
 
-router.post('/sources/:id/test', requireAdmin, (req, res) => {
+router.post('/sources/:id/test', requireAdmin, async (req, res) => {
   try {
-    res.json({ item: testSource(Number(req.params.id), req.body ?? {}) });
+    res.json({ item: await testSource(Number(req.params.id), req.body ?? {}) });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Quellen-Test fehlgeschlagen.' });
   }
@@ -136,9 +136,9 @@ router.get('/logs', (req, res) => {
   res.json({ items: listCopybotLogs() });
 });
 
-router.post('/imports/process/:sourceId', requireAdmin, (req, res) => {
+router.post('/imports/process/:sourceId', requireAdmin, async (req, res) => {
   try {
-    res.json({ item: processImportedDeal(Number(req.params.sourceId), req.body ?? {}) });
+    res.json({ item: await processImportedDeal(Number(req.params.sourceId), req.body ?? {}) });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Deal-Verarbeitung fehlgeschlagen.' });
   }

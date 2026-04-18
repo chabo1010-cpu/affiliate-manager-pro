@@ -1,5 +1,8 @@
 import { getDb } from '../db.js';
+import { getTelegramTestGroupConfig } from '../env.js';
 import { cleanText, savePostedDeal } from './dealHistoryService.js';
+import { buildGeneratorDealContext } from './generatorDealScoringService.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
 import { sendTelegramPost } from './telegramSenderService.js';
 
 const db = getDb();
@@ -16,6 +19,9 @@ function insertGeneratorPost(input = {}) {
         INSERT INTO generator_posts (
           title,
           product_link,
+          asin,
+          normalized_url,
+          seller_type,
           telegram_text,
           whatsapp_text,
           facebook_text,
@@ -24,14 +30,19 @@ function insertGeneratorPost(input = {}) {
           telegram_image_source,
           whatsapp_image_source,
           facebook_image_source,
+          keepa_result_id,
+          generator_context_json,
           created_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     .run(
       cleanText(input.title),
       cleanText(input.link),
+      cleanText(input.asin).toUpperCase(),
+      cleanText(input.normalizedUrl),
+      cleanText(input.sellerType) || 'FBM',
       cleanText(input.textByChannel?.telegram),
       cleanText(input.textByChannel?.whatsapp),
       cleanText(input.textByChannel?.facebook),
@@ -40,11 +51,34 @@ function insertGeneratorPost(input = {}) {
       cleanText(input.telegramImageSource) || 'standard',
       cleanText(input.whatsappImageSource) || 'standard',
       cleanText(input.facebookImageSource) || 'link_preview',
+      input.generatorContext?.keepa?.keepaResultId || null,
+      input.generatorContext ? JSON.stringify(input.generatorContext) : null,
       timestamp,
       timestamp
     );
 
   return result.lastInsertRowid;
+}
+
+function updateGeneratorPostMeta(generatorPostId, meta = {}) {
+  db.prepare(
+    `
+      UPDATE generator_posts
+      SET keepa_result_id = @keepaResultId,
+          generator_context_json = @generatorContextJson,
+          telegram_message_id = @telegramMessageId,
+          posted_channels_json = @postedChannelsJson,
+          updated_at = @updatedAt
+      WHERE id = @id
+    `
+  ).run({
+    id: generatorPostId,
+    keepaResultId: meta.keepaResultId ?? null,
+    generatorContextJson: meta.generatorContext ? JSON.stringify(meta.generatorContext) : null,
+    telegramMessageId: meta.telegramMessageId ?? null,
+    postedChannelsJson: JSON.stringify(meta.postedChannels || null),
+    updatedAt: nowIso()
+  });
 }
 
 function getImageForSource(imageSource, input = {}) {
@@ -71,7 +105,21 @@ function getImageForSource(imageSource, input = {}) {
 }
 
 export async function publishGeneratorPostDirect(input = {}) {
-  const generatorPostId = insertGeneratorPost(input);
+  const testGroupConfig = getTelegramTestGroupConfig();
+  const generatorContext = await buildGeneratorDealContext({
+    asin: input.asin,
+    sellerType: input.sellerType,
+    currentPrice: input.currentPrice,
+    title: input.title,
+    productUrl: input.normalizedUrl || input.link,
+    imageUrl: input.generatedImagePath,
+    source: 'generator_direct_publish'
+  });
+  const preparedInput = {
+    ...input,
+    generatorContext
+  };
+  const generatorPostId = insertGeneratorPost(preparedInput);
   const postedAt = nowIso();
   const results = {
     generatorPostId,
@@ -79,6 +127,15 @@ export async function publishGeneratorPostDirect(input = {}) {
     whatsapp: null,
     facebook: null
   };
+
+  logGeneratorDebug('GENERATOR DIRECT TEST POST', {
+    generatorPostId,
+    asin: cleanText(input.asin).toUpperCase(),
+    sellerType: cleanText(input.sellerType) || 'FBM',
+    decision: generatorContext?.evaluation?.decision || 'manual_review',
+    testGroupApproved: generatorContext?.evaluation?.testGroupApproved === true,
+    keepaStatus: generatorContext?.keepa?.status || 'missing'
+  });
 
   if (input.enableTelegram !== false) {
     const telegramImage = getImageForSource(input.telegramImageSource, input);
@@ -88,7 +145,8 @@ export async function publishGeneratorPostDirect(input = {}) {
       uploadedImage: telegramImage.uploadedImage,
       imageUrl: telegramImage.imageUrl,
       disableWebPagePreview: !telegramImage.uploadedFile && !telegramImage.uploadedImage && !telegramImage.imageUrl,
-      rabattgutscheinCode: input.couponCode
+      rabattgutscheinCode: input.couponCode,
+      chatId: testGroupConfig.chatId
     });
 
     savePostedDeal({
@@ -109,6 +167,14 @@ export async function publishGeneratorPostDirect(input = {}) {
       imageSource: input.telegramImageSource || 'standard',
       ...telegramResult
     };
+
+    logGeneratorDebug('TEST GROUP POST SENT', {
+      generatorPostId,
+      asin: cleanText(input.asin).toUpperCase(),
+      messageId: telegramResult?.messageId || null,
+      chatId: telegramResult?.chatId || testGroupConfig.chatId || null,
+      imageSource: input.telegramImageSource || 'standard'
+    });
   }
 
   if (input.enableWhatsapp === true) {
@@ -125,9 +191,17 @@ export async function publishGeneratorPostDirect(input = {}) {
     };
   }
 
+  updateGeneratorPostMeta(generatorPostId, {
+    keepaResultId: generatorContext?.keepa?.keepaResultId || null,
+    generatorContext,
+    telegramMessageId: results.telegram?.messageId || null,
+    postedChannels: results
+  });
+
   return {
     success: true,
     postedAt,
-    results
+    results,
+    generatorContext
   };
 }

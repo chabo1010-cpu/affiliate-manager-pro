@@ -1,13 +1,13 @@
 export const quickLinks = [
   { title: 'Generator Poster', path: '/generator', icon: '\u{1F4DD}' },
-  { title: 'Keepa', path: '/keepa', icon: '\u{1F50C}' },
+  { title: 'Lern-Logik', path: '/learning', icon: '\u{1F50C}' },
   { title: 'Copybot', path: '/copybot', icon: '\u{1F5C2}' },
   { title: 'Logs', path: '/logs', icon: '\u{1F4CB}' }
 ];
 
 export const homeCards = [
   { title: 'Offene Posts', value: '8', subtitle: 'fuer Telegram und WhatsApp bereit' },
-  { title: 'Keepa Treffer', value: 'Live', subtitle: 'Neuer Deal-Monitor integriert' },
+  { title: 'Lern-Logik', value: 'Live', subtitle: 'Keepa- und Feedback-Logik getrennt angebunden' },
   { title: 'Letzter Status', value: 'Stabil', subtitle: 'Frontend und Backend arbeiten gemeinsam' }
 ];
 

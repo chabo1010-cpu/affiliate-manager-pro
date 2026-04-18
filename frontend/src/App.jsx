@@ -16,6 +16,7 @@ import KeepaPage from './pages/Keepa';
 
 function App() {
   const { user } = useAuth();
+  const learningPageElement = user?.role === 'admin' ? <KeepaPage /> : <Navigate to="/generator" replace />;
 
   return (
     <Routes>
@@ -41,16 +42,26 @@ function App() {
               <Route path="publishing/workers" element={<PublishingPage />} />
               <Route path="publishing/facebook" element={<PublishingPage />} />
               <Route path="publishing/logs" element={<PublishingPage />} />
-              <Route path="keepa" element={<KeepaPage />} />
-              <Route path="keepa/manual-search" element={<KeepaPage />} />
-              <Route path="keepa/automatik" element={<KeepaPage />} />
-              <Route path="keepa/ergebnisse" element={<KeepaPage />} />
-              <Route path="keepa/benachrichtigungen" element={<KeepaPage />} />
-              <Route path="keepa/einstellungen" element={<KeepaPage />} />
-              <Route path="keepa/verbrauch-logs" element={<KeepaPage />} />
-              <Route path="keepa/fake-drop-analyse" element={<KeepaPage />} />
-              <Route path="keepa/review-queue" element={<KeepaPage />} />
-              <Route path="keepa/lern-datenbank" element={<KeepaPage />} />
+              <Route path="keepa" element={learningPageElement} />
+              <Route path="keepa/manual-search" element={learningPageElement} />
+              <Route path="keepa/automatik" element={learningPageElement} />
+              <Route path="keepa/ergebnisse" element={learningPageElement} />
+              <Route path="keepa/benachrichtigungen" element={learningPageElement} />
+              <Route path="keepa/einstellungen" element={learningPageElement} />
+              <Route path="keepa/verbrauch-logs" element={learningPageElement} />
+              <Route path="keepa/fake-drop-analyse" element={learningPageElement} />
+              <Route path="keepa/review-queue" element={learningPageElement} />
+              <Route path="keepa/lern-datenbank" element={learningPageElement} />
+              <Route path="learning" element={learningPageElement} />
+              <Route path="learning/manual-search" element={learningPageElement} />
+              <Route path="learning/automatik" element={learningPageElement} />
+              <Route path="learning/ergebnisse" element={learningPageElement} />
+              <Route path="learning/benachrichtigungen" element={learningPageElement} />
+              <Route path="learning/einstellungen" element={learningPageElement} />
+              <Route path="learning/verbrauch-logs" element={learningPageElement} />
+              <Route path="learning/fake-drop-analyse" element={learningPageElement} />
+              <Route path="learning/review-queue" element={learningPageElement} />
+              <Route path="learning/lern-datenbank" element={learningPageElement} />
               <Route path="logs" element={<LogsPage />} />
               <Route path="deal-history" element={<DealHistoryAdminPage />} />
               <Route path="settings" element={<SettingsPage />} />
