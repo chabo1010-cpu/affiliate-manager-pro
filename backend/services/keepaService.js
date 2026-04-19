@@ -1,14 +1,17 @@
 import { getDb } from '../db.js';
 import { getKeepaConfig, getTelegramConfig } from '../env.js';
 import { publishAutoDealToTelegramTestGroup } from './autoDealPublisher.js';
+import { buildAmazonAffiliateLinkRecord } from './dealHistoryService.js';
 import { loadAmazonAffiliateContext } from './amazonAffiliateService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 import { evaluateLearningRoute } from './learningLogicService.js';
 import { getComparisonAdapterCatalog, resolveComparisonFromAdapters } from './keepaComparisonAdapters.js';
 import {
+  buildKeepaChartSnapshot,
   evaluateFakeDropAlertEligibility,
   getFakeDropSettingsView,
   getFakeDropSnapshotForResult,
+  getSimilarCaseSignals,
   getFakeDropSummary,
   persistFakeDropAnalysis
 } from './keepaFakeDropService.js';
@@ -1501,6 +1504,95 @@ function inferDrawerKeyFromSellerType(value) {
   return 'AMAZON';
 }
 
+function collectManualDrawerCandidates(input = {}) {
+  const candidates = new Set();
+
+  const addCandidate = (value) => {
+    const normalized = normalizeDrawerKey(value, '');
+    if (normalized) {
+      candidates.add(normalized);
+    }
+  };
+
+  addCandidate(input.drawerKey);
+
+  if (Array.isArray(input.drawerKeys)) {
+    input.drawerKeys.forEach(addCandidate);
+  } else {
+    addCandidate(input.drawerKeys);
+  }
+
+  if (Array.isArray(input.selectedDrawers)) {
+    input.selectedDrawers.forEach(addCandidate);
+  } else if (input.selectedDrawers && typeof input.selectedDrawers === 'object') {
+    Object.entries(input.selectedDrawers).forEach(([key, enabled]) => {
+      if (parseBool(enabled, false)) {
+        addCandidate(key);
+      }
+    });
+  } else {
+    addCandidate(input.selectedDrawers);
+  }
+
+  if (input.drawers && typeof input.drawers === 'object' && !Array.isArray(input.drawers)) {
+    Object.entries(input.drawers).forEach(([key, enabled]) => {
+      if (parseBool(enabled, false)) {
+        addCandidate(key);
+      }
+    });
+  } else if (Array.isArray(input.drawers)) {
+    input.drawers.forEach(addCandidate);
+  }
+
+  if (parseBool(input.amazonEnabled, false) || parseBool(input.useAmazon, false) || parseBool(input.amazonSelected, false)) {
+    addCandidate('AMAZON');
+  }
+  if (parseBool(input.fbaEnabled, false) || parseBool(input.useFba, false) || parseBool(input.fbaSelected, false)) {
+    addCandidate('FBA');
+  }
+  if (parseBool(input.fbmEnabled, false) || parseBool(input.useFbm, false) || parseBool(input.fbmSelected, false)) {
+    addCandidate('FBM');
+  }
+
+  const sellerType = normalizeSellerType(input.sellerType);
+  if (sellerType !== 'ALL') {
+    addCandidate(sellerType);
+  }
+
+  return [...candidates];
+}
+
+function resolveManualDrawerSelection(input = {}, settings = getKeepaSettings()) {
+  const explicitDrawerKeys = collectManualDrawerCandidates(input);
+  if (explicitDrawerKeys.length > 1) {
+    logGeneratorDebug('MULTI DRAWER REQUEST BLOCKED', {
+      drawerKeys: explicitDrawerKeys
+    });
+    throw createKeepaProtectionError(
+      'Bitte genau eine Schublade fuer die manuelle Keepa-Abfrage auswaehlen: AMAZON, FBA oder FBM.',
+      'KEEPA_MULTI_DRAWER_BLOCKED',
+      409
+    );
+  }
+
+  const requestedDrawerKey = explicitDrawerKeys[0] || '';
+  const sellerType = normalizeSellerType(input.sellerType || settings.defaultSellerType);
+  const sellerTypeDrawerKey = sellerType !== 'ALL' ? inferDrawerKeyFromSellerType(sellerType) : '';
+
+  if (requestedDrawerKey && sellerTypeDrawerKey && requestedDrawerKey !== sellerTypeDrawerKey) {
+    logGeneratorDebug('MULTI DRAWER REQUEST BLOCKED', {
+      drawerKeys: [requestedDrawerKey, sellerTypeDrawerKey]
+    });
+    throw createKeepaProtectionError(
+      'Die manuelle Keepa-Abfrage hat widerspruechliche Schubladen-Angaben. Bitte genau eine Auswahl verwenden.',
+      'KEEPA_MULTI_DRAWER_BLOCKED',
+      409
+    );
+  }
+
+  return normalizeDrawerKey(requestedDrawerKey || sellerTypeDrawerKey || settings.defaultSellerType || 'AMAZON');
+}
+
 function getDrawerConfig(settings, drawerKey) {
   const resolvedDrawerKey = normalizeDrawerKey(drawerKey, 'AMAZON');
   return normalizeDrawerConfig(
@@ -1765,10 +1857,55 @@ function buildAmazonProductUrl(asin, domainId) {
   return asin ? `https://www.${domainInfo.host}/dp/${asin}` : '';
 }
 
-function buildAmazonImageUrl(imageValue) {
+function buildAmazonImageUrlFromAsin(asin = '') {
+  const normalizedAsin = cleanText(asin).toUpperCase();
+  return normalizedAsin ? `https://images-na.ssl-images-amazon.com/images/P/${normalizedAsin}.jpg` : '';
+}
+
+function buildAmazonAffiliateUrl(asin, domainId, productUrl = '') {
+  const domainInfo = getDomainInfo(domainId);
+  const linkRecord = buildAmazonAffiliateLinkRecord(productUrl || buildAmazonProductUrl(asin, domainId), {
+    asin,
+    defaultHost: domainInfo.host
+  });
+  return linkRecord.valid ? linkRecord.affiliateUrl : '';
+}
+
+function normalizeKeepaResultOrigin(value) {
+  const normalized = cleanText(value).toLowerCase();
+  if (!normalized) {
+    return 'keepa-manual';
+  }
+
+  if (normalized === 'manual' || normalized === 'keepa-manual') {
+    return 'keepa-manual';
+  }
+
+  if (normalized === 'automatic' || normalized === 'keepa-auto') {
+    return 'keepa-auto';
+  }
+
+  return normalized;
+}
+
+function getKeepaResultSourceLabel(origin) {
+  const normalized = normalizeKeepaResultOrigin(origin);
+  return (
+    {
+      'keepa-manual': 'manuell / Keepa',
+      'keepa-auto': 'automatik / Keepa'
+    }[normalized] || normalized
+  );
+}
+
+function buildKeepaHistorySnapshot(item = {}) {
+  return buildKeepaChartSnapshot(item);
+}
+
+function buildAmazonImageUrl(imageValue, asin = '') {
   const cleaned = cleanText(imageValue);
   if (!cleaned) {
-    return '';
+    return buildAmazonImageUrlFromAsin(asin);
   }
 
   if (/^https?:\/\//i.test(cleaned)) {
@@ -1777,10 +1914,187 @@ function buildAmazonImageUrl(imageValue) {
 
   const firstImage = cleaned.split(',').map((item) => item.trim()).filter(Boolean)[0];
   if (!firstImage) {
-    return '';
+    return buildAmazonImageUrlFromAsin(asin);
   }
 
   return `https://m.media-amazon.com/images/I/${firstImage}`;
+}
+
+function collectKeepaTitleCandidates(item = {}) {
+  return [
+    { value: item.title, source: 'item.title' },
+    { value: item.keepaPayload?.deal?.title, source: 'keepaPayload.deal.title' },
+    { value: item.keepaPayload?.product?.title, source: 'keepaPayload.product.title' },
+    { value: item.keepaPayload?.raw?.deal?.title, source: 'keepaPayload.raw.deal.title' },
+    { value: item.keepaPayload?.raw?.product?.title, source: 'keepaPayload.raw.product.title' },
+    { value: item.keepaPayload?.raw?.product?.itemTitle, source: 'keepaPayload.raw.product.itemTitle' },
+    { value: item.keepaPayload?.raw?.product?.groupTitle, source: 'keepaPayload.raw.product.groupTitle' },
+    { value: item.keepaPayload?.product?.productGroup, source: 'keepaPayload.product.productGroup' },
+    { value: item.asin, source: 'asin' }
+  ];
+}
+
+function resolveKeepaDealTitle(item = {}, options = {}) {
+  const asin = extractAsin(item) || cleanText(item.asin).toUpperCase();
+  const winner =
+    collectKeepaTitleCandidates(item).find((candidate) => {
+      const value = cleanText(candidate.value);
+      return Boolean(value);
+    }) || null;
+  const title = cleanText(winner?.value) || asin;
+
+  if (options.log && title) {
+    logGeneratorDebug('DEAL TITLE MAPPED', {
+      asin,
+      source: winner?.source || 'asin',
+      title
+    });
+  }
+
+  return {
+    title,
+    source: winner?.source || (asin ? 'asin' : 'missing')
+  };
+}
+
+function collectKeepaImageCandidates(item = {}) {
+  return [
+    { value: item.imageUrl || item.image_url, source: 'item.imageUrl' },
+    { value: item.keepaPayload?.imageUrl, source: 'keepaPayload.imageUrl' },
+    { value: item.keepaPayload?.product?.imageUrl, source: 'keepaPayload.product.imageUrl' },
+    { value: item.keepaPayload?.product?.imagesCSV, source: 'keepaPayload.product.imagesCSV' },
+    { value: item.keepaPayload?.deal?.image, source: 'keepaPayload.deal.image' },
+    { value: item.keepaPayload?.raw?.deal?.image, source: 'keepaPayload.raw.deal.image' },
+    { value: item.keepaPayload?.raw?.product?.imagesCSV, source: 'keepaPayload.raw.product.imagesCSV' }
+  ];
+}
+
+function resolveKeepaDealImageUrl(item = {}, options = {}) {
+  const asin = extractAsin(item) || cleanText(item.asin).toUpperCase();
+  const winner =
+    collectKeepaImageCandidates(item).find((candidate) => {
+      const value = cleanText(candidate.value);
+      return Boolean(value);
+    }) || null;
+  const imageUrl = buildAmazonImageUrl(winner?.value || '', asin);
+  const usedGeneratedImage = !winner?.value || winner.source !== 'item.imageUrl';
+
+  if (options.log && imageUrl && usedGeneratedImage) {
+    logGeneratorDebug('DEAL IMAGE URL GENERATED', {
+      asin,
+      source: winner?.source || 'asin-fallback',
+      imageUrl
+    });
+  }
+
+  return {
+    imageUrl,
+    source: winner?.source || (asin ? 'asin-fallback' : 'missing')
+  };
+}
+
+function resolveKeepaDealProductUrl(item = {}, options = {}) {
+  const asin = extractAsin(item) || cleanText(item.asin).toUpperCase();
+  const domainId = parseInteger(item.domainId ?? item.domain_id, getKeepaSettings().domainId);
+  const existingProductUrl =
+    cleanText(item.productUrl || item.product_url) ||
+    cleanText(item.keepaPayload?.productUrl) ||
+    cleanText(item.keepaPayload?.product?.productUrl) ||
+    cleanText(item.keepaPayload?.raw?.product?.productUrl);
+  const productUrl = existingProductUrl || buildAmazonProductUrl(asin, domainId);
+
+  if (options.log && productUrl && !existingProductUrl) {
+    logGeneratorDebug('DEAL PRODUCT URL GENERATED', {
+      asin,
+      domainId,
+      productUrl
+    });
+  }
+
+  return {
+    productUrl,
+    source: existingProductUrl ? 'existing' : asin ? 'asin' : 'missing'
+  };
+}
+
+function resolveKeepaDealAffiliateUrl(item = {}, productUrl = '') {
+  const asin = extractAsin(item) || cleanText(item.asin).toUpperCase();
+  const domainId = parseInteger(item.domainId ?? item.domain_id, getKeepaSettings().domainId);
+  const existingAffiliateUrl =
+    cleanText(item.affiliateUrl || item.affiliate_url) ||
+    cleanText(item.keepaPayload?.affiliateUrl) ||
+    cleanText(item.keepaPayload?.product?.affiliateUrl);
+
+  return existingAffiliateUrl || buildAmazonAffiliateUrl(asin, domainId, productUrl);
+}
+
+function enrichKeepaRecord(item = {}, options = {}) {
+  if (!item?.asin) {
+    return item;
+  }
+
+  const currentPayload =
+    item.keepaPayload && typeof item.keepaPayload === 'object' && !Array.isArray(item.keepaPayload) ? item.keepaPayload : {};
+  const titleResolution = resolveKeepaDealTitle({ ...item, keepaPayload: currentPayload }, { log: options.log === true });
+  const productResolution = resolveKeepaDealProductUrl(
+    {
+      ...item,
+      title: titleResolution.title,
+      keepaPayload: currentPayload
+    },
+    { log: options.log === true }
+  );
+  const imageResolution = resolveKeepaDealImageUrl(
+    {
+      ...item,
+      title: titleResolution.title,
+      productUrl: productResolution.productUrl,
+      keepaPayload: currentPayload
+    },
+    { log: options.log === true }
+  );
+  const affiliateUrl = resolveKeepaDealAffiliateUrl(
+    {
+      ...item,
+      title: titleResolution.title,
+      productUrl: productResolution.productUrl,
+      imageUrl: imageResolution.imageUrl,
+      keepaPayload: currentPayload
+    },
+    productResolution.productUrl
+  );
+  const history = buildKeepaHistorySnapshot({
+    ...item,
+    title: titleResolution.title,
+    productUrl: productResolution.productUrl,
+    affiliateUrl,
+    imageUrl: imageResolution.imageUrl,
+    keepaPayload: currentPayload
+  });
+
+  return {
+    ...item,
+    title: titleResolution.title,
+    productUrl: productResolution.productUrl,
+    affiliateUrl,
+    imageUrl: imageResolution.imageUrl,
+    keepaPayload: {
+      ...currentPayload,
+      title: titleResolution.title,
+      productUrl: productResolution.productUrl,
+      affiliateUrl,
+      imageUrl: imageResolution.imageUrl,
+      product: {
+        ...(currentPayload.product || {}),
+        title: cleanText(currentPayload?.product?.title) || titleResolution.title
+      },
+      deal: {
+        ...(currentPayload.deal || {}),
+        title: cleanText(currentPayload?.deal?.title) || titleResolution.title
+      },
+      history
+    }
+  };
 }
 
 function normalizeRating(value) {
@@ -2304,54 +2618,234 @@ function mapExistingResultRow(row) {
     : null;
 }
 
+function repairStoredKeepaResultRow(row) {
+  if (!row) {
+    return row;
+  }
+
+  const existingKeepaPayload = fromJson(row.keepa_payload_json, null);
+  const nextTitleCandidate = resolveKeepaDealTitle({
+    asin: row.asin,
+    title: row.title,
+    keepaPayload: existingKeepaPayload
+  }).title;
+  const hydrated = enrichKeepaRecord(
+    {
+      id: row.id,
+      asin: row.asin,
+      domainId: row.domain_id,
+      title: row.title,
+      productUrl: row.product_url,
+      imageUrl: row.image_url,
+      currentPrice: row.current_price,
+      referencePrice: row.reference_price,
+      keepaPayload: existingKeepaPayload
+    },
+    {
+      log:
+        !cleanText(row.title) ||
+        !cleanText(row.product_url) ||
+        !cleanText(row.image_url) ||
+        cleanText(nextTitleCandidate) !== cleanText(row.title)
+    }
+  );
+  const nextTitle = cleanText(hydrated.title);
+  const nextProductUrl = cleanText(hydrated.productUrl);
+  const nextImageUrl = cleanText(hydrated.imageUrl);
+  const nextKeepaPayloadJson = toJson(hydrated.keepaPayload || null);
+  const shouldPersist =
+    nextTitle !== cleanText(row.title) ||
+    nextProductUrl !== cleanText(row.product_url) ||
+    nextImageUrl !== cleanText(row.image_url) ||
+    nextKeepaPayloadJson !== (row.keepa_payload_json || null);
+
+  if (!shouldPersist) {
+    return row;
+  }
+
+  db.prepare(
+    `
+      UPDATE keepa_results
+      SET title = @title,
+          product_url = @productUrl,
+          image_url = @imageUrl,
+          keepa_payload_json = @keepaPayloadJson
+      WHERE id = @id
+    `
+  ).run({
+    id: row.id,
+    title: nextTitle || row.title,
+    productUrl: nextProductUrl || row.product_url,
+    imageUrl: nextImageUrl || row.image_url,
+    keepaPayloadJson: nextKeepaPayloadJson
+  });
+
+  logGeneratorDebug('DEAL STORED WITH IMAGE AND LINK', {
+    keepaResultId: row.id,
+    asin: row.asin,
+    hasTitle: Boolean(nextTitle),
+    hasImageUrl: Boolean(nextImageUrl),
+    hasProductUrl: Boolean(nextProductUrl),
+    hasAffiliateUrl: Boolean(cleanText(hydrated.affiliateUrl))
+  });
+
+  return db.prepare(`SELECT * FROM keepa_results WHERE id = ?`).get(row.id);
+}
+
 function buildResultDto(row) {
   if (!row) {
     return null;
   }
 
-  const fakeDrop = getFakeDropSnapshotForResult(row.id);
+  const repairedRow = repairStoredKeepaResultRow(row);
+  const keepaPayload = fromJson(repairedRow.keepa_payload_json, null);
+  const title = resolveKeepaDealTitle(
+    {
+      asin: repairedRow.asin,
+      title: repairedRow.title,
+      keepaPayload
+    },
+    {
+      log: false
+    }
+  ).title;
+  const productUrl = resolveKeepaDealProductUrl(
+    {
+      asin: repairedRow.asin,
+      domain_id: repairedRow.domain_id,
+      product_url: repairedRow.product_url,
+      keepaPayload
+    },
+    { log: false }
+  ).productUrl;
+  const imageUrl = resolveKeepaDealImageUrl(
+    {
+      asin: repairedRow.asin,
+      image_url: repairedRow.image_url,
+      keepaPayload
+    },
+    { log: false }
+  ).imageUrl;
+  const history = keepaPayload?.history || buildKeepaHistorySnapshot({ ...repairedRow, keepaPayload });
+  const fakeDrop = getFakeDropSnapshotForResult(repairedRow.id);
+  const chartPoints = Array.isArray(fakeDrop?.chartPoints) && fakeDrop.chartPoints.length ? fakeDrop.chartPoints : history?.chartPoints || [];
+  const priceSeries = history?.priceSeries || [];
+  const relevantPricePoints = history?.relevantPoints || [];
+  const currentPrice = parseNumber(repairedRow.current_price, null);
+  const referencePrice = parseNumber(repairedRow.reference_price, null);
+  const savingsAmount =
+    currentPrice !== null && referencePrice !== null && referencePrice >= currentPrice
+      ? Math.round((referencePrice - currentPrice) * 100) / 100
+      : null;
+  const normalizedOrigin = normalizeKeepaResultOrigin(repairedRow.origin);
+  const similarCaseSignals =
+    fakeDrop && repairedRow.seller_type
+      ? getSimilarCaseSignals(
+          {
+            reviewItemId: fakeDrop.reviewItemId || 0,
+            keepaResultId: repairedRow.id,
+            asin: repairedRow.asin,
+            sellerType: repairedRow.seller_type,
+            categoryName: repairedRow.category_name,
+            sourceType: normalizedOrigin,
+            currentPrice,
+            keepaDiscount: parseNumber(repairedRow.keepa_discount, null),
+            fakeDropRisk: fakeDrop.fakeDropRisk ?? null,
+            classification: fakeDrop.classification || '',
+            features: fakeDrop.features || {}
+          },
+          {
+            limit: 3,
+            minSimilarityScore: 58,
+            scanLimit: 40
+          }
+        )
+      : {
+          cases: [],
+          summary: {
+            total: 0,
+            positiveCount: 0,
+            negativeCount: 0,
+            uncertainCount: 0,
+            dominantLabel: null,
+            dominantLabelLabel: null,
+            riskAdjustment: 0,
+            scoreAdjustment: 0
+          }
+        };
+  const learningAdjustedScore = clamp(
+    (parseNumber(repairedRow.deal_score, 0) || 0) + Number(similarCaseSignals.summary?.scoreAdjustment || 0),
+    0,
+    100
+  );
+  const learningDecisionHint =
+    Number(similarCaseSignals.summary?.total || 0) > 0
+      ? `${similarCaseSignals.summary.total} aehnliche Faelle: Good ${similarCaseSignals.summary.positiveCount || 0}, kritisch ${
+          similarCaseSignals.summary.negativeCount || 0
+        }, Review ${similarCaseSignals.summary.uncertainCount || 0}.`
+      : 'Noch keine aehnlichen Lernfaelle.';
+  const affiliateUrl = resolveKeepaDealAffiliateUrl(
+    {
+      asin: repairedRow.asin,
+      domain_id: repairedRow.domain_id,
+      product_url: productUrl,
+      keepaPayload
+    },
+    productUrl
+  );
 
   return {
-    id: row.id,
-    asin: row.asin,
-    domainId: row.domain_id,
-    title: row.title,
-    productUrl: row.product_url,
-    imageUrl: row.image_url,
-    currentPrice: parseNumber(row.current_price, null),
-    referencePrice: parseNumber(row.reference_price, null),
-    referenceLabel: row.reference_label,
-    keepaDiscount: parseNumber(row.keepa_discount, null),
-    sellerType: row.seller_type,
-    categoryId: parseInteger(row.category_id, null),
-    categoryName: row.category_name,
-    rating: normalizeRating(row.rating),
-    reviewCount: parseInteger(row.review_count, null),
-    isPrime: row.is_prime === 1,
-    isInStock: row.is_in_stock === 1,
-    dealScore: parseNumber(row.deal_score, 0),
-    dealStrength: normalizeDealStrength(row.deal_strength),
-    strengthReason: row.strength_reason,
-    workflowStatus: normalizeWorkflowStatus(row.workflow_status),
-    comparisonSource: row.comparison_source,
-    comparisonStatus: row.comparison_status,
-    comparisonPrice: parseNumber(row.comparison_price, null),
-    priceDifferenceAbs: parseNumber(row.price_difference_abs, null),
-    priceDifferencePct: parseNumber(row.price_difference_pct, null),
-    comparisonCheckedAt: row.comparison_checked_at,
-    comparisonPayload: fromJson(row.comparison_payload_json, null),
-    keepaPayload: fromJson(row.keepa_payload_json, null),
-    searchPayload: fromJson(row.search_payload_json, null),
-    origin: row.origin,
-    ruleId: row.rule_id,
-    note: row.note || '',
-    alertCount: parseInteger(row.alert_count, 0),
-    lastAlertedAt: row.last_alerted_at,
-    firstSeenAt: row.first_seen_at,
-    lastSeenAt: row.last_seen_at,
-    lastSyncedAt: row.last_synced_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    id: repairedRow.id,
+    asin: repairedRow.asin,
+    domainId: repairedRow.domain_id,
+    title,
+    productUrl,
+    affiliateUrl,
+    imageUrl,
+    currentPrice,
+    referencePrice,
+    referenceLabel: repairedRow.reference_label,
+    keepaDiscount: parseNumber(repairedRow.keepa_discount, null),
+    savingsAmount,
+    sellerType: repairedRow.seller_type,
+    drawerKey: inferDrawerKeyFromSellerType(repairedRow.seller_type),
+    categoryId: parseInteger(repairedRow.category_id, null),
+    categoryName: repairedRow.category_name,
+    rating: normalizeRating(repairedRow.rating),
+    reviewCount: parseInteger(repairedRow.review_count, null),
+    isPrime: repairedRow.is_prime === 1,
+    isInStock: repairedRow.is_in_stock === 1,
+    dealScore: parseNumber(repairedRow.deal_score, 0),
+    dealStrength: normalizeDealStrength(repairedRow.deal_strength),
+    strengthReason: repairedRow.strength_reason,
+    workflowStatus: normalizeWorkflowStatus(repairedRow.workflow_status),
+    comparisonSource: repairedRow.comparison_source,
+    comparisonStatus: repairedRow.comparison_status,
+    comparisonPrice: parseNumber(repairedRow.comparison_price, null),
+    priceDifferenceAbs: parseNumber(repairedRow.price_difference_abs, null),
+    priceDifferencePct: parseNumber(repairedRow.price_difference_pct, null),
+    comparisonCheckedAt: repairedRow.comparison_checked_at,
+    comparisonPayload: fromJson(repairedRow.comparison_payload_json, null),
+    keepaPayload,
+    priceHistory: priceSeries,
+    chartPoints,
+    relevantPricePoints,
+    learningAdjustedScore,
+    learningDecisionHint,
+    similarCaseSummary: similarCaseSignals.summary,
+    similarCases: similarCaseSignals.cases,
+    searchPayload: fromJson(repairedRow.search_payload_json, null),
+    origin: normalizedOrigin,
+    sourceLabel: getKeepaResultSourceLabel(normalizedOrigin),
+    ruleId: repairedRow.rule_id,
+    note: repairedRow.note || '',
+    alertCount: parseInteger(repairedRow.alert_count, 0),
+    lastAlertedAt: repairedRow.last_alerted_at,
+    firstSeenAt: repairedRow.first_seen_at,
+    lastSeenAt: repairedRow.last_seen_at,
+    lastSyncedAt: repairedRow.last_synced_at,
+    createdAt: repairedRow.created_at,
+    updatedAt: repairedRow.updated_at,
     fakeDrop
   };
 }
@@ -3224,16 +3718,27 @@ export function updateKeepaRule(id, input = {}) {
 
 function normalizeManualSearchInput(input = {}) {
   const settings = getKeepaSettings();
-  const drawerKey = normalizeDrawerKey(input.drawerKey || inferDrawerKeyFromSellerType(input.sellerType || settings.defaultSellerType));
+  const drawerKey = resolveManualDrawerSelection(input, settings);
   const drawerConfig = getDrawerConfig(settings, drawerKey);
   const page = clamp(parseInteger(input.page, 1), 1, MAX_MANUAL_PAGE);
-  const limit = clamp(parseInteger(input.limit, settings.defaultPageSize), 1, MAX_MANUAL_PAGE_SIZE);
+  const limit = clamp(
+    parseInteger(input.limit, Math.min(settings.defaultPageSize || KEEPA_MANUAL_RESULT_LIMIT_CAP, KEEPA_MANUAL_RESULT_LIMIT_CAP)),
+    1,
+    MAX_MANUAL_PAGE_SIZE
+  );
   const minPrice = sanitizePriceBoundary(input.minPrice ?? drawerConfig.minPrice ?? settings.defaultMinPrice);
   const maxPrice = sanitizePriceBoundary(input.maxPrice ?? drawerConfig.maxPrice ?? settings.defaultMaxPrice);
 
   if (minPrice !== null && maxPrice !== null && minPrice > maxPrice) {
     throw new Error('Der Mindestpreis darf nicht groesser als der Hoechstpreis sein.');
   }
+
+  logGeneratorDebug('MANUAL KEEPA DRAWER SELECTED', {
+    drawerKey,
+    requestedSellerType: normalizeSellerType(input.sellerType || drawerKey),
+    limit,
+    page
+  });
 
   return {
     page,
@@ -3244,7 +3749,7 @@ function normalizeManualSearchInput(input = {}) {
         ? Number(input.domainId || settings.domainId)
         : settings.domainId,
     minDiscount: clamp(parseNumber(input.minDiscount, drawerConfig.minDiscount ?? settings.defaultDiscount), 0, 95),
-    sellerType: normalizeSellerType(input.sellerType ?? drawerConfig.sellerType ?? settings.defaultSellerType),
+    sellerType: drawerKey,
     categories: normalizeCategoryIds(input.categories, drawerConfig.categories ?? settings.defaultCategories),
     minPrice,
     maxPrice,
@@ -3286,12 +3791,12 @@ function normalizeDealRecord(deal, product, filters, existingRow = null) {
   const rating = normalizeRating(deal?.rating || product?.currentRating || product?.stats?.currentRating);
   const reviewCount = parseInteger(deal?.totalReviews || product?.currentRatingCount, null);
 
-  return {
+  return enrichKeepaRecord({
     asin,
     domainId: filters.domainId,
     title,
     productUrl: buildAmazonProductUrl(asin, filters.domainId),
-    imageUrl: buildAmazonImageUrl(deal?.image || product?.imagesCSV),
+    imageUrl: buildAmazonImageUrl(deal?.image || product?.imagesCSV, asin),
     currentPrice,
     referencePrice,
     referenceLabel: 'Referenzpreis / Verlauf',
@@ -3322,6 +3827,7 @@ function normalizeDealRecord(deal, product, filters, existingRow = null) {
         isFulfilledByAmazon: Boolean(deal?.isFulfilledByAmazon)
       },
       product: {
+        title: cleanText(product?.title) || title,
         imagesCSV: product?.imagesCSV || '',
         rootCategory: product?.rootCategory || category.categoryId,
         productGroup: product?.productGroup || '',
@@ -3334,6 +3840,7 @@ function normalizeDealRecord(deal, product, filters, existingRow = null) {
         deal: deal || null,
         product: product
           ? {
+              title: cleanText(product?.title) || title,
               stats: product.stats || null,
               csv: Array.isArray(product.csv) ? product.csv : null,
               offerCSV: product.offerCSV || null,
@@ -3342,7 +3849,7 @@ function normalizeDealRecord(deal, product, filters, existingRow = null) {
           : null
       }
     }
-  };
+  });
 }
 
 function extractAverageStatPrice(stats, keys = []) {
@@ -3386,12 +3893,12 @@ function normalizeProductContextRecord(product, contextInput = {}, filters = {},
   const normalizedSellerType = normalizeSellerType(contextInput.sellerType || offerSummary.sellerType || existingRow?.seller_type || 'FBM');
   const sellerType = normalizedSellerType === 'ALL' ? 'FBM' : normalizedSellerType;
 
-  return {
+  return enrichKeepaRecord({
     asin,
     domainId: filters.domainId,
     title,
     productUrl: cleanText(contextInput.productUrl) || buildAmazonProductUrl(asin, filters.domainId),
-    imageUrl: cleanText(contextInput.imageUrl) || buildAmazonImageUrl(product?.imagesCSV),
+    imageUrl: cleanText(contextInput.imageUrl) || buildAmazonImageUrl(product?.imagesCSV, asin),
     currentPrice,
     referencePrice,
     referenceLabel: 'Keepa Verlauf / avg90',
@@ -3433,7 +3940,7 @@ function normalizeProductContextRecord(product, contextInput = {}, filters = {},
         }
       }
     }
-  };
+  });
 }
 
 async function compareAgainstLegalSources(item) {
@@ -3455,7 +3962,9 @@ async function compareAgainstLegalSources(item) {
 
 function saveKeepaResult(item, meta = {}) {
   const existing = getExistingResult(item.asin, item.domainId);
-  const mergedItem = mergeExistingComparison(item, existing);
+  const mergedItem = enrichKeepaRecord(mergeExistingComparison(item, existing), {
+    log: true
+  });
   const settings = getKeepaSettings();
   const currentPrice = parseNumber(mergedItem.currentPrice, null);
   const comparisonPrice = parseNumber(mergedItem.comparisonPrice, null);
@@ -3515,7 +4024,7 @@ function saveKeepaResult(item, meta = {}) {
     comparison_payload_json: toJson(mergedItem.comparisonPayload || null),
     keepa_payload_json: toJson(mergedItem.keepaPayload || null),
     search_payload_json: toJson(meta.searchPayload || null),
-    origin: meta.origin || 'manual',
+    origin: normalizeKeepaResultOrigin(meta.origin),
     rule_id: meta.rule?.id || null,
     note: existing?.note || '',
     alert_count: parseInteger(existing?.alert_count, 0),
@@ -3666,6 +4175,25 @@ function saveKeepaResult(item, meta = {}) {
     origin: meta.origin || 'manual'
   });
 
+  if (normalizeKeepaResultOrigin(meta.origin) === 'keepa-manual') {
+    logGeneratorDebug('MANUAL DEAL STORED', {
+      keepaResultId: storedResult?.id || null,
+      asin: mergedItem.asin,
+      drawerKey: inferDrawerKeyFromSellerType(mergedItem.sellerType),
+      affiliateUrlAvailable: Boolean(storedResult?.affiliateUrl),
+      chartPointCount: Array.isArray(storedResult?.chartPoints) ? storedResult.chartPoints.length : 0
+    });
+  }
+
+  logGeneratorDebug('DEAL STORED WITH IMAGE AND LINK', {
+    keepaResultId: storedResult?.id || null,
+    asin: mergedItem.asin,
+    hasTitle: Boolean(storedResult?.title),
+    hasImageUrl: Boolean(storedResult?.imageUrl),
+    hasProductUrl: Boolean(storedResult?.productUrl),
+    hasAffiliateUrl: Boolean(storedResult?.affiliateUrl)
+  });
+
   return buildResultDto(
     db
       .prepare(`SELECT * FROM keepa_results WHERE asin = ? AND domain_id = ? LIMIT 1`)
@@ -3781,6 +4309,12 @@ async function executeSearch(filters, meta = {}) {
       origin: meta.origin || 'manual',
       rawResultCount: rawDeals.length
     });
+    if (meta.origin === 'manual') {
+      logGeneratorDebug('MANUAL KEEPA RESULTS RECEIVED', {
+        drawerKey,
+        rawResultCount: rawDeals.length
+      });
+    }
     const asins = [...new Set(rawDeals.map((deal) => extractAsin(deal)).filter(Boolean))].slice(0, rawPageSize);
     const productResponse = asins.length
       ? await keepaRequest(
@@ -3866,6 +4400,13 @@ async function executeSearch(filters, meta = {}) {
         searchPayload: filters
       })
     );
+    if (meta.origin === 'manual') {
+      logGeneratorDebug('MANUAL DEAL PREVIEW BUILT', {
+        drawerKey,
+        previewCount: savedItems.length,
+        chartReadyCount: savedItems.filter((item) => Array.isArray(item?.chartPoints) && item.chartPoints.length > 0).length
+      });
+    }
     const officialUsageValue = keepaRequestUsage.reduce((sum, entry) => sum + (entry?.officialUsageValue ?? 0), 0);
     const hasOfficialUsage = keepaRequestUsage.some((entry) => entry?.officialUsageValue !== null);
     const durationMs = Date.now() - startedAt;
@@ -4115,7 +4656,19 @@ export async function runKeepaManualSearch(input = {}) {
   const confirmed = parseBool(input.confirmed, false);
   const confirmationToken = cleanText(input.confirmationToken);
 
+  logGeneratorDebug('MANUAL KEEPA DRAWER SELECTED', {
+    drawerKey: filters.drawerKey,
+    sellerType: filters.sellerType,
+    confirmed
+  });
+
   if (!confirmed) {
+    logGeneratorDebug('MANUAL KEEPA PREVIEW START', {
+      drawerKey: filters.drawerKey,
+      sellerType: filters.sellerType,
+      limit: filters.limit,
+      trendInterval: filters.trendInterval
+    });
     const dryRun = await buildKeepaManualDryRun(filters, { confirmed: false });
     return {
       executed: false,
@@ -5119,7 +5672,14 @@ async function processRule(rule) {
     drawerAutoModeAllowed: drawerConfig.autoModeAllowed
   });
 
-  if (!drawerConfig.active || !drawerConfig.autoModeAllowed) {
+  if (!settings.schedulerEnabled || !drawerConfig.active || !drawerConfig.autoModeAllowed) {
+    logGeneratorDebug('AUTO KEEPA BLOCKED NOT EXPLICITLY ENABLED', {
+      drawerKey,
+      ruleId: rule.id,
+      schedulerEnabled: settings.schedulerEnabled,
+      drawerActive: drawerConfig.active,
+      drawerAutoModeAllowed: drawerConfig.autoModeAllowed
+    });
     recordKeepaUsage({
       action: 'automation-run',
       module: 'automation-run',
@@ -5134,7 +5694,7 @@ async function processRule(rule) {
       estimatedUsage: 0,
       ruleId: rule.id,
       meta: {
-        reason: !drawerConfig.active ? 'drawer_inactive' : 'auto_mode_disabled'
+        reason: !settings.schedulerEnabled ? 'scheduler_disabled' : !drawerConfig.active ? 'drawer_inactive' : 'auto_mode_disabled'
       }
     });
     scheduleNextRuleRun(rule);
@@ -5143,7 +5703,7 @@ async function processRule(rule) {
       payload: {
         ruleId: rule.id,
         drawerKey,
-        reason: !drawerConfig.active ? 'drawer_inactive' : 'auto_mode_disabled'
+        reason: !settings.schedulerEnabled ? 'scheduler_disabled' : !drawerConfig.active ? 'drawer_inactive' : 'auto_mode_disabled'
       }
     });
     return;
@@ -5351,6 +5911,11 @@ async function runDueRules() {
   try {
     const settings = getKeepaSettings();
     if (!settings.keepaEnabled || !settings.schedulerEnabled || !getKeepaConfig().key) {
+      if (!settings.schedulerEnabled) {
+        logGeneratorDebug('AUTO KEEPA BLOCKED NOT EXPLICITLY ENABLED', {
+          reason: 'scheduler_disabled'
+        });
+      }
       return;
     }
 

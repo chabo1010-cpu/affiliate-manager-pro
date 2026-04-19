@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { NavLink, useLocation } from 'react-router-dom';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import { useAuth } from '../context/AuthContext';
 import './Keepa.css';
@@ -7,19 +7,62 @@ import './Keepa.css';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
 const FALLBACK_IMAGE =
   'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72"><rect width="72" height="72" rx="18" fill="%230f172a"/><text x="50%" y="52%" dominant-baseline="middle" text-anchor="middle" fill="%2394a3b8" font-family="Arial" font-size="14">AM</text></svg>';
+const dealCardFallbackImageLogCache = new Set();
+const dealCardDisplayedLogCache = new Set();
+const dealChartRenderedLogCache = new Set();
 
-const keepaTabs = [
-  { label: 'Flow Dashboard', path: '/keepa' },
-  { label: 'Manuelle Suche', path: '/keepa/manual-search' },
-  { label: 'Automatik', path: '/keepa/automatik' },
-  { label: 'Ergebnisse', path: '/keepa/ergebnisse' },
-  { label: 'Benachrichtigungen', path: '/keepa/benachrichtigungen' },
-  { label: 'Verbrauch & Logs', path: '/keepa/verbrauch-logs' },
-  { label: 'Fake-Drop Analyse', path: '/keepa/fake-drop-analyse' },
-  { label: 'Review Queue', path: '/keepa/review-queue' },
-  { label: 'Lern-Datenbank', path: '/keepa/lern-datenbank' },
-  { label: 'Einstellungen', path: '/keepa/einstellungen' }
+const keepaNavigationGroups = [
+  {
+    label: 'Dashboard',
+    description: 'Status, Quellen und Deal-Flow auf einen Blick.',
+    path: '/keepa',
+    items: []
+  },
+  {
+    label: 'Deals',
+    description: 'Manuell suchen, Treffer sehen und direkt bewerten.',
+    path: '/keepa/manual-search',
+    items: [
+      { label: 'Manuelle Suche', path: '/keepa/manual-search' },
+      { label: 'Ergebnisse', path: '/keepa/ergebnisse' }
+    ]
+  },
+  {
+    label: 'Bewertung & Lernen',
+    description: 'Review Queue, Fake-Drop Analyse und Lern-Datenbank verbunden.',
+    path: '/keepa/review-queue',
+    items: [
+      { label: 'Review Queue', path: '/keepa/review-queue' },
+      { label: 'Fake-Drop Analyse', path: '/keepa/fake-drop-analyse' },
+      { label: 'Lern-Datenbank', path: '/keepa/lern-datenbank' }
+    ]
+  },
+  {
+    label: 'Automatik',
+    description: 'Auto-Modus, Alert-Output und getrennte Steuerung.',
+    path: '/keepa/automatik',
+    items: [
+      { label: 'Automatik', path: '/keepa/automatik' },
+      { label: 'Benachrichtigungen', path: '/keepa/benachrichtigungen' }
+    ]
+  },
+  {
+    label: 'Logs & Verbrauch',
+    description: 'Verbrauch, Schutz und technische Nachvollziehbarkeit.',
+    path: '/keepa/verbrauch-logs',
+    items: [{ label: 'Verbrauch & Logs', path: '/keepa/verbrauch-logs' }]
+  },
+  {
+    label: 'Einstellungen',
+    description: 'Grundwerte, Keys und sichere Standard-Konfiguration.',
+    path: '/keepa/einstellungen',
+    items: [{ label: 'Einstellungen', path: '/keepa/einstellungen' }]
+  }
 ];
+
+const keepaTabs = keepaNavigationGroups
+  .flatMap((group) => [{ path: group.path }, ...(group.items || []).map((item) => ({ path: item.path }))])
+  .filter((item, index, source) => source.findIndex((candidate) => candidate.path === item.path) === index);
 
 function normalizeLearningTabPath(pathname) {
   if (typeof pathname !== 'string' || !pathname.trim()) {
@@ -40,6 +83,18 @@ function buildLearningTabPath(basePath, canonicalPath) {
   }
 
   return canonicalPath.replace('/keepa', '/learning');
+}
+
+function isKeepaNavigationGroupActive(group, currentPath) {
+  if (!group) {
+    return false;
+  }
+
+  if (group.path === currentPath) {
+    return true;
+  }
+
+  return Array.isArray(group.items) ? group.items.some((item) => item.path === currentPath) : false;
 }
 
 const sellerTypeOptions = [
@@ -95,7 +150,7 @@ const defaultDrawerConfigs = {
     singleVariantOnly: false,
     recentPriceChangeOnly: false,
     sortBy: 'percent',
-    autoModeAllowed: true,
+    autoModeAllowed: false,
     testGroupPostingAllowed: true
   },
   FBA: {
@@ -115,7 +170,7 @@ const defaultDrawerConfigs = {
     singleVariantOnly: false,
     recentPriceChangeOnly: false,
     sortBy: 'percent',
-    autoModeAllowed: true,
+    autoModeAllowed: false,
     testGroupPostingAllowed: true
   },
   FBM: {
@@ -135,7 +190,7 @@ const defaultDrawerConfigs = {
     singleVariantOnly: true,
     recentPriceChangeOnly: false,
     sortBy: 'percent',
-    autoModeAllowed: true,
+    autoModeAllowed: false,
     testGroupPostingAllowed: true
   }
 };
@@ -172,6 +227,49 @@ const reviewLabelOptions = [
   { value: 'fake', label: 'Fake' },
   { value: 'weak', label: 'Weak' },
   { value: 'review', label: 'Review' }
+];
+
+const directDealLearningActions = [
+  {
+    key: 'good',
+    label: 'guter Deal',
+    reviewLabel: 'good',
+    tags: ['echter_deal'],
+    saveAsExample: true,
+    exampleBucket: 'positive',
+    tone: 'success',
+    targetPath: '/keepa/lern-datenbank'
+  },
+  {
+    key: 'fake',
+    label: 'fake drop',
+    reviewLabel: 'fake',
+    tags: ['fake_drop'],
+    saveAsExample: true,
+    exampleBucket: 'negative',
+    tone: 'danger',
+    targetPath: '/keepa/lern-datenbank'
+  },
+  {
+    key: 'uncertain',
+    label: 'unsicher',
+    reviewLabel: 'weak',
+    tags: ['unsicher'],
+    saveAsExample: true,
+    exampleBucket: 'unsicher',
+    tone: 'warning',
+    targetPath: '/keepa/lern-datenbank'
+  },
+  {
+    key: 'review',
+    label: 'review',
+    reviewLabel: 'review',
+    tags: ['unsicher'],
+    saveAsExample: false,
+    exampleBucket: 'unsicher',
+    tone: 'info',
+    targetPath: '/keepa/review-queue'
+  }
 ];
 
 const reviewLabelAliases = {
@@ -226,6 +324,31 @@ function getReviewOptionMeta(value) {
 
 function isNegativeReviewValue(value) {
   return ['fake', 'weak'].includes(normalizeReviewUiValue(value));
+}
+
+function getDirectDealLearningAction(actionKey) {
+  return directDealLearningActions.find((item) => item.key === actionKey) || directDealLearningActions[3];
+}
+
+function logDealCardDebug(eventName, cache, scope, item, extra = {}) {
+  const dealId = Number(item?.id || item?.keepaResultId || 0);
+  if (!dealId) {
+    return;
+  }
+
+  const cacheKey = `${scope}:${dealId}:${eventName}`;
+  if (cache.has(cacheKey)) {
+    return;
+  }
+
+  cache.add(cacheKey);
+  console.debug(eventName, {
+    scope,
+    dealId,
+    asin: item?.asin || '',
+    sellerType: item?.sellerType || '',
+    ...extra
+  });
 }
 
 function formatDateTime(value) {
@@ -327,6 +450,53 @@ function shortenText(value, maxLength = 110) {
   return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
+function buildAmazonImageUrlFromAsin(asin) {
+  const normalizedAsin = String(asin || '').trim().toUpperCase();
+  return normalizedAsin ? `https://images-na.ssl-images-amazon.com/images/P/${normalizedAsin}.jpg` : '';
+}
+
+function buildAmazonProductUrlFromAsin(asin) {
+  const normalizedAsin = String(asin || '').trim().toUpperCase();
+  return normalizedAsin ? `https://www.amazon.de/dp/${normalizedAsin}` : '';
+}
+
+function resolveDealCardTitle(item) {
+  return (
+    String(item?.title || '').trim() ||
+    String(item?.keepaPayload?.deal?.title || '').trim() ||
+    String(item?.keepaPayload?.product?.title || '').trim() ||
+    String(item?.asin || '').trim() ||
+    'Unbekannter Deal'
+  );
+}
+
+function resolveDealCardProductUrl(item) {
+  return String(item?.productUrl || '').trim() || buildAmazonProductUrlFromAsin(item?.asin);
+}
+
+function resolveDealCardImageUrl(item) {
+  const directImageUrl = String(item?.imageUrl || '').trim();
+  if (directImageUrl) {
+    return directImageUrl;
+  }
+
+  const asinImageUrl = buildAmazonImageUrlFromAsin(item?.asin);
+  if (asinImageUrl) {
+    return asinImageUrl;
+  }
+
+  const cacheKey = String(item?.id || item?.asin || Math.random());
+  if (!dealCardFallbackImageLogCache.has(cacheKey)) {
+    dealCardFallbackImageLogCache.add(cacheKey);
+    console.debug('DEAL CARD USING FALLBACK IMAGE', {
+      dealId: item?.id || null,
+      asin: item?.asin || null
+    });
+  }
+
+  return FALLBACK_IMAGE;
+}
+
 function normalizeDrawerKey(value) {
   return keepaDrawerCatalog.some((item) => item.key === value) ? value : 'AMAZON';
 }
@@ -350,9 +520,9 @@ function buildManualFilters(settings, drawerKey = 'AMAZON') {
   return {
     drawerKey: resolvedDrawerKey,
     page: 1,
-    limit: settings?.defaultPageSize || 24,
+    limit: Math.min(settings?.defaultPageSize || 12, 12),
     minDiscount: drawerConfig.minDiscount ?? (settings?.defaultDiscount || 40),
-    sellerType: drawerConfig.sellerType || settings?.defaultSellerType || 'ALL',
+    sellerType: resolvedDrawerKey,
     categories: [...(drawerConfig.categories || settings?.defaultCategories || [])],
     minPrice: drawerConfig.minPrice ?? settings?.defaultMinPrice ?? '',
     maxPrice: drawerConfig.maxPrice ?? settings?.defaultMaxPrice ?? '',
@@ -711,6 +881,7 @@ function KeepaPage() {
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin';
   const location = useLocation();
+  const navigate = useNavigate();
   const initializedRef = useRef(false);
   const ruleInitializedRef = useRef(false);
   const fakeDropSettingsInitializedRef = useRef(false);
@@ -1019,6 +1190,34 @@ function KeepaPage() {
     });
   }, [reviewQueue.items]);
 
+  useEffect(() => {
+    results.items.forEach((item) => {
+      logDealCardDebug('DEAL DISPLAYED', dealCardDisplayedLogCache, 'results', item, {
+        chartPointCount: Array.isArray(item.chartPoints) ? item.chartPoints.length : 0
+      });
+
+      if (Array.isArray(item.chartPoints) && item.chartPoints.length) {
+        logDealCardDebug('DEAL RENDERED WITH CHART', dealChartRenderedLogCache, 'results', item, {
+          chartPointCount: item.chartPoints.length
+        });
+      }
+    });
+  }, [results.items]);
+
+  useEffect(() => {
+    manualResponse.items.forEach((item) => {
+      logDealCardDebug('DEAL DISPLAYED', dealCardDisplayedLogCache, 'manual-preview', item, {
+        chartPointCount: Array.isArray(item.chartPoints) ? item.chartPoints.length : 0
+      });
+
+      if (Array.isArray(item.chartPoints) && item.chartPoints.length) {
+        logDealCardDebug('DEAL RENDERED WITH CHART', dealChartRenderedLogCache, 'manual-preview', item, {
+          chartPointCount: item.chartPoints.length
+        });
+      }
+    });
+  }, [manualResponse.items]);
+
   function toggleCategory(target, categoryId) {
     target((prev) => {
       const categories = prev.categories || prev.defaultCategories || [];
@@ -1083,10 +1282,19 @@ function KeepaPage() {
     setManualDryRun(null);
   }
 
+  function openStoredResultPreview(resultId, targetPath = '/keepa/ergebnisse') {
+    if (resultId) {
+      setSelectedResultId(resultId);
+    }
+    navigate(buildLearningTabPath(navigationBasePath, targetPath));
+  }
+
   function updateManualFilters(patch) {
     setManualFilters((prev) => ({
       ...prev,
-      ...patch
+      ...patch,
+      drawerKey: activeManualDrawer,
+      sellerType: activeManualDrawer
     }));
     updateDrawerConfig(activeManualDrawer, patch);
     setManualDryRun(null);
@@ -1137,6 +1345,12 @@ function KeepaPage() {
   }
 
   async function handleManualSearch(page = 1, confirmed = false) {
+    const enforcedDrawer = normalizeDrawerKey(activeManualDrawer);
+    if (!enforcedDrawer) {
+      setStatusMessage('Bitte genau eine Keepa-Schublade auswaehlen.');
+      return;
+    }
+
     setManualLoading(true);
     setStatusMessage('');
 
@@ -1145,6 +1359,8 @@ function KeepaPage() {
         method: 'POST',
         body: JSON.stringify({
           ...manualFilters,
+          drawerKey: enforcedDrawer,
+          sellerType: enforcedDrawer,
           page,
           confirmed,
           confirmationToken: confirmed ? manualDryRun?.confirmationToken || '' : ''
@@ -1467,6 +1683,254 @@ function KeepaPage() {
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Treffer konnte nicht aktualisiert werden.');
     }
+  }
+
+  function getDealReviewItemId(item) {
+    return Number(item?.fakeDrop?.reviewItemId || 0);
+  }
+
+  function getDealReviewDraft(item) {
+    const reviewItemId = getDealReviewItemId(item);
+    if (reviewItemId && reviewDrafts[reviewItemId]) {
+      return reviewDrafts[reviewItemId];
+    }
+
+    return {
+      note: item?.fakeDrop?.note || '',
+      tags: Array.isArray(item?.fakeDrop?.tags) ? item.fakeDrop.tags : [],
+      exampleBucket: ''
+    };
+  }
+
+  async function handleRateDeal(item, actionKey) {
+    const action = getDirectDealLearningAction(actionKey);
+    const reviewItemId = getDealReviewItemId(item);
+    if (!reviewItemId) {
+      setStatusMessage('Fuer diesen Deal ist noch kein Review-Eintrag verfuegbar.');
+      return;
+    }
+
+    setReviewBusyId(reviewItemId);
+    setStatusMessage('');
+
+    try {
+      const draft = getDealReviewDraft(item);
+      const nextTags = [...new Set([...(draft.tags || []), ...(action.tags || [])])];
+
+      await apiFetch(`/api/keepa/fake-drop/review/${reviewItemId}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          label: action.reviewLabel,
+          note: draft.note || '',
+          tags: nextTags,
+          saveAsExample: action.saveAsExample,
+          exampleBucket: action.exampleBucket || draft.exampleBucket || ''
+        })
+      });
+
+      setStatusMessage(`Bewertung gespeichert: ${action.label}.`);
+      console.debug('USER RATING APPLIED', {
+        dealId: item.id,
+        reviewItemId,
+        asin: item.asin,
+        sellerType: item.sellerType,
+        label: action.reviewLabel,
+        saveAsExample: action.saveAsExample
+      });
+
+      await loadDashboard(resultsFilters, usageFilters, false);
+      await loadReviewQueue(reviewFilters);
+      if (action.saveAsExample || currentTab === '/keepa/lern-datenbank') {
+        await loadExampleLibrary(exampleFilters);
+      }
+
+      if (action.targetPath === '/keepa/review-queue') {
+        openStoredResultPreview(item.id, action.targetPath);
+      }
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Bewertung konnte nicht gespeichert werden.');
+    } finally {
+      setReviewBusyId(0);
+    }
+  }
+
+  function renderDealFlowStrip(currentStage = 'bewerten') {
+    const steps = [
+      { key: 'quelle', label: 'Quelle', detail: 'Keepa / Scrapper / Generator' },
+      { key: 'anzeigen', label: 'Deals', detail: 'Treffer erscheinen als Karten' },
+      { key: 'bewerten', label: 'Bewertung', detail: 'Direkt am Deal labeln' },
+      { key: 'lernen', label: 'Lernen', detail: 'Fall in Lern-Datenbank schreiben' },
+      { key: 'verbessern', label: 'Verbessern', detail: 'Spaetere Entscheidungen schaerfen' }
+    ];
+
+    return (
+      <div className="keepa-flow-strip">
+        {steps.map((step) => (
+          <article key={step.key} className={`keepa-flow-pill ${step.key === currentStage ? 'active' : ''}`}>
+            <span>{step.label}</span>
+            <strong>{step.detail}</strong>
+          </article>
+        ))}
+      </div>
+    );
+  }
+
+  function renderDealLearningSummary(item) {
+    const summary = item?.similarCaseSummary || {};
+    const hasSimilarCases = Number(summary.total || 0) > 0;
+    const scoreAdjustment = Number(summary.scoreAdjustment || 0);
+    const riskAdjustment = Number(summary.riskAdjustment || 0);
+    const currentLabel = item?.fakeDrop?.currentLabel ? getReviewOptionMeta(item.fakeDrop.currentLabel).label : '';
+
+    return (
+      <div className="keepa-learning-summary">
+        <div className="keepa-card-tags">
+          {item?.fakeDrop?.classificationLabel ? (
+            <span className={`status-chip ${getFakeDropChip(item.fakeDrop.classification)}`}>{item.fakeDrop.classificationLabel}</span>
+          ) : null}
+          {currentLabel ? <span className="status-chip info">Letztes Label {currentLabel}</span> : null}
+          {typeof item?.learningAdjustedScore === 'number' ? (
+            <span className="status-chip info">Lern-Score {Math.round(item.learningAdjustedScore)}</span>
+          ) : null}
+          {scoreAdjustment !== 0 ? (
+            <span className={`status-chip ${scoreAdjustment > 0 ? 'success' : 'warning'}`}>
+              Score {scoreAdjustment > 0 ? '+' : ''}
+              {Math.round(scoreAdjustment)}
+            </span>
+          ) : null}
+          {riskAdjustment !== 0 ? (
+            <span className={`status-chip ${riskAdjustment < 0 ? 'success' : 'warning'}`}>
+              Risiko {riskAdjustment > 0 ? '+' : ''}
+              {Math.round(riskAdjustment)}
+            </span>
+          ) : null}
+        </div>
+
+        <p className="text-muted keepa-learning-summary-text">
+          {hasSimilarCases
+            ? `${summary.total} aehnliche ${item?.sellerType || 'Deal'}-Faelle gefunden. Good ${summary.positiveCount || 0}, kritisch ${summary.negativeCount || 0}, Review ${
+                summary.uncertainCount || 0
+              }.`
+            : 'Noch keine aehnlichen Lernfaelle fuer diesen Deal gefunden.'}
+        </p>
+      </div>
+    );
+  }
+
+  function renderDealLearningActions(item, context = 'results') {
+    const reviewItemId = getDealReviewItemId(item);
+    const isBusy = reviewBusyId === reviewItemId;
+
+    return (
+      <div className="keepa-learning-actions">
+        {directDealLearningActions.map((action) => (
+          <button
+            key={`${context}-${item.id}-${action.key}`}
+            className={`secondary keepa-learning-action keepa-learning-action-${action.tone}`}
+            type="button"
+            disabled={!reviewItemId || isBusy}
+            onClick={() => void handleRateDeal(item, action.key)}
+          >
+            {isBusy ? 'Speichert...' : action.label}
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  function renderDealCard(item, options = {}) {
+    const mode = options.mode || 'results';
+    const showSelect = options.showSelect === true;
+    const chartPoints = item.chartPoints || item.fakeDrop?.chartPoints || [];
+
+    return (
+      <article key={`${mode}-${item.id}`} className={`keepa-deal-card ${showSelect && selectedResultId === item.id ? 'active' : ''}`}>
+        <div className="keepa-manual-preview-top">
+          <img src={resolveDealCardImageUrl(item)} alt={resolveDealCardTitle(item)} />
+          <div className="keepa-manual-preview-head">
+            <div className="keepa-card-tags">
+              <span className="status-chip info">{item.sellerType}</span>
+              <span className="status-chip info">{item.sourceLabel || 'manuell / Keepa'}</span>
+              <span className={`status-chip ${getWorkflowChip(item.workflowStatus)}`}>
+                {workflowLabels[item.workflowStatus] || item.workflowStatus}
+              </span>
+              <span className={`status-chip ${getStrengthChip(item.dealStrength)}`}>
+                {strengthLabels[item.dealStrength] || item.dealStrength}
+              </span>
+            </div>
+            <strong>{resolveDealCardTitle(item)}</strong>
+            <p className="text-muted">
+              {item.asin} - {item.categoryName || '-'}
+            </p>
+          </div>
+        </div>
+
+        <div className="keepa-manual-preview-metrics">
+          <div>
+            <span>Aktuell</span>
+            <strong>{formatCurrency(item.currentPrice)}</strong>
+          </div>
+          <div>
+            <span>Referenz</span>
+            <strong>{formatCurrency(item.referencePrice)}</strong>
+          </div>
+          <div>
+            <span>Ersparnis</span>
+            <strong>{formatCurrency(item.savingsAmount)}</strong>
+          </div>
+          <div>
+            <span>Rabatt</span>
+            <strong>{formatPercent(item.keepaDiscount)}</strong>
+          </div>
+        </div>
+
+        <MiniPriceHistory points={chartPoints} accent={mode === 'manual' ? '#22c55e' : '#38bdf8'} />
+
+        <div className="keepa-card-tags">
+          {(item.relevantPricePoints || []).map((point) => (
+            <span key={`${mode}-${item.id}-${point.key}`} className="status-chip subtle">
+              {point.label}: {formatCurrency(point.price)}
+            </span>
+          ))}
+          <span className="status-chip info">Score {item.dealScore}</span>
+          <span className="status-chip info">{item.referenceLabel || 'Referenzpreis / Verlauf'}</span>
+        </div>
+
+        {renderDealLearningSummary(item)}
+        {renderDealLearningActions(item, mode)}
+
+        <div className="keepa-manual-preview-actions">
+          {showSelect ? (
+            <button className="secondary" type="button" onClick={() => setSelectedResultId(item.id)}>
+              Details
+            </button>
+          ) : (
+            <button className="secondary" type="button" onClick={() => openStoredResultPreview(item.id)}>
+              In Ergebnisse
+            </button>
+          )}
+          <a className="secondary keepa-link-button" href={resolveDealCardProductUrl(item)} target="_blank" rel="noreferrer">
+            Produkt
+          </a>
+          {item.affiliateUrl ? (
+            <a className="secondary keepa-link-button" href={item.affiliateUrl} target="_blank" rel="noreferrer">
+              Affiliate
+            </a>
+          ) : (
+            <button className="secondary" type="button" onClick={() => openStoredResultPreview(item.id)} title="Deal ist bereits gespeichert.">
+              Gespeichert
+            </button>
+          )}
+          <button
+            className="secondary"
+            type="button"
+            onClick={() => openStoredResultPreview(item.id, item.fakeDrop?.reviewItemId ? '/keepa/review-queue' : '/keepa/ergebnisse')}
+          >
+            Review
+          </button>
+        </div>
+      </article>
+    );
   }
 
   function renderCategoryPicker(selectedIds, onToggle) {
@@ -2175,7 +2639,8 @@ function KeepaPage() {
 
           <p className="text-muted" style={{ margin: 0 }}>
             Manuelle Keepa-Abfragen starten jetzt immer mit einem Dry-Run. Erst nach klarer Bestaetigung wird die
-            echte Query fuer AMAZON, FBA oder FBM ausgefuehrt.
+            echte Query fuer genau eine Schublade ausgefuehrt: AMAZON, FBA oder FBM. Die Live-Vorschau wird danach
+            direkt als persistierter Deal gespeichert.
           </p>
 
           {renderDrawerCards('manual')}
@@ -2327,9 +2792,8 @@ function KeepaPage() {
                 value={manualFilters.limit}
                 onChange={(event) => updateManualFilters({ limit: Number(event.target.value) })}
               >
+                <option value="6">6</option>
                 <option value="12">12</option>
-                <option value="24">24</option>
-                <option value="48">48</option>
               </select>
             </label>
 
@@ -2419,90 +2883,24 @@ function KeepaPage() {
             </p>
           </div>
 
+          {renderDealFlowStrip('anzeigen')}
+
           {manualResponse.items?.length ? (
             <>
-              <div className="keepa-table-wrap">
-                <table className="keepa-table">
-                  <thead>
-                    <tr>
-                      <th>Produkt</th>
-                      <th>ASIN</th>
-                      <th>Preis</th>
-                      <th>Rabatt</th>
-                      <th>Referenz / Verlauf</th>
-                      <th>Verkaeufer</th>
-                      <th>Kategorie</th>
-                      <th>Score</th>
-                      <th>Status</th>
-                      <th>Link</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {manualResponse.items.map((item) => (
-                      <tr key={item.id}>
-                        <td>
-                          <div className="keepa-product-cell">
-                            <img src={item.imageUrl || FALLBACK_IMAGE} alt={item.title} />
-                            <div>
-                              <strong>{item.title}</strong>
-                              <small className="text-muted">{item.comparisonSource || 'Keine Vergleichsquelle'}</small>
-                            </div>
-                          </div>
-                        </td>
-                        <td>{item.asin}</td>
-                        <td>{formatCurrency(item.currentPrice)}</td>
-                        <td>{formatPercent(item.keepaDiscount)}</td>
-                        <td>
-                          <strong>{formatCurrency(item.referencePrice)}</strong>
-                          <small className="text-muted">{item.referenceLabel}</small>
-                        </td>
-                        <td>{item.sellerType}</td>
-                        <td>{item.categoryName || '-'}</td>
-                        <td>
-                          <strong>{item.dealScore}</strong>
-                          <small className="text-muted">Risk {item.fakeDrop?.fakeDropRisk ?? '-'}</small>
-                        </td>
-                        <td>
-                          <div className="keepa-card-tags">
-                            <span className={`status-chip ${getStrengthChip(item.dealStrength)}`}>{strengthLabels[item.dealStrength]}</span>
-                            {item.fakeDrop && (
-                              <span className={`status-chip ${getFakeDropChip(item.fakeDrop.classification)}`}>{item.fakeDrop.classificationLabel}</span>
-                            )}
-                          </div>
-                        </td>
-                        <td>
-                          <a href={item.productUrl} target="_blank" rel="noreferrer">
-                            Produkt
-                          </a>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="keepa-card-metrics three">
+                <span>
+                  <strong>Persistiert:</strong> {manualResponse.items.length} Deals
+                </span>
+                <span>
+                  <strong>Quelle:</strong> {manualResponse.items[0]?.sourceLabel || 'manuell / Keepa'}
+                </span>
+                <span>
+                  <strong>Paging:</strong> Seite {manualResponse.pagination?.page || manualFilters.page || 1} von Live-Treffern
+                </span>
               </div>
 
-              <div className="keepa-results-grid mobile-only">
-                {manualResponse.items.map((item) => (
-                  <article key={item.id} className="keepa-result-card">
-                    <div className="keepa-result-top">
-                      <img src={item.imageUrl || FALLBACK_IMAGE} alt={item.title} />
-                      <div>
-                        <strong>{item.title}</strong>
-                        <p className="text-muted">{item.asin}</p>
-                      </div>
-                    </div>
-                    <div className="keepa-card-metrics">
-                      <span>{formatCurrency(item.currentPrice)}</span>
-                      <span>{formatPercent(item.keepaDiscount)}</span>
-                      <span>{item.dealScore}</span>
-                    </div>
-                    <div className="keepa-card-tags">
-                      <span className={`status-chip ${getStrengthChip(item.dealStrength)}`}>{strengthLabels[item.dealStrength]}</span>
-                      <span className="status-chip info">{item.sellerType}</span>
-                      {item.fakeDrop && <span className={`status-chip ${getFakeDropChip(item.fakeDrop.classification)}`}>{item.fakeDrop.classificationLabel}</span>}
-                    </div>
-                  </article>
-                ))}
+              <div className="keepa-manual-preview-grid">
+                {manualResponse.items.map((item) => renderDealCard(item, { mode: 'manual' }))}
               </div>
 
               <div className="keepa-pagination">
@@ -2538,7 +2936,7 @@ function KeepaPage() {
           <section className="card keepa-metric-card">
             <p className="section-title">Globaler Auto-Modus</p>
             <h2>{settingsForm.schedulerEnabled ? 'Aktiv' : 'Pausiert'}</h2>
-            <p className="text-muted">Nur aktive Schubladen duerfen im Hintergrund laden und an die Testgruppe ausgeben.</p>
+            <p className="text-muted">Keepa zieht nur dann automatisch, wenn der globale Scheduler und die jeweilige Schublade explizit aktiviert wurden.</p>
           </section>
           <section className="card keepa-metric-card">
             <p className="section-title">Vergleichs-Adapter</p>
@@ -2827,6 +3225,7 @@ function KeepaPage() {
 
   function renderResultsTab() {
     const selectedDraft = selectedResult ? resultDrafts[selectedResult.id] || {} : {};
+    const selectedSimilarCases = selectedResult?.similarCases || [];
 
     return (
       <div className="keepa-section-stack">
@@ -2874,40 +3273,23 @@ function KeepaPage() {
           </div>
         </section>
 
+        <section className="card keepa-panel">
+          <div className="keepa-panel-header">
+            <div>
+              <p className="section-title">Deal-Flow</p>
+              <h2>Deals anzeigen, bewerten und in Lernen ueberfuehren</h2>
+            </div>
+            <p className="text-muted" style={{ margin: 0 }}>
+              Jeder gespeicherte Treffer bleibt sichtbar, laesst sich direkt labeln und erweitert die Lern-Basis ohne Seitenwechsel.
+            </p>
+          </div>
+          {renderDealFlowStrip('bewerten')}
+        </section>
+
         <div className="keepa-results-layout">
           <section className="card keepa-panel">
-            <div className="keepa-list">
-              {results.items.map((item) => (
-                <button
-                  key={item.id}
-                  className={`keepa-result-card selectable ${selectedResultId === item.id ? 'active' : ''}`}
-                  onClick={() => setSelectedResultId(item.id)}
-                >
-                  <div className="keepa-result-top">
-                    <img src={item.imageUrl || FALLBACK_IMAGE} alt={item.title} />
-                    <div>
-                      <strong>{item.title}</strong>
-                      <p className="text-muted">
-                        {item.asin} - {item.categoryName || '-'}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="keepa-card-metrics">
-                    <span>{formatCurrency(item.currentPrice)}</span>
-                    <span>{formatPercent(item.keepaDiscount)}</span>
-                    <span>{item.dealScore}</span>
-                  </div>
-                  <div className="keepa-card-tags">
-                    <span className={`status-chip ${getStrengthChip(item.dealStrength)}`}>{strengthLabels[item.dealStrength]}</span>
-                    <span className={`status-chip ${getWorkflowChip(item.workflowStatus)}`}>{workflowLabels[item.workflowStatus]}</span>
-                    {item.fakeDrop && (
-                      <span className={`status-chip ${getFakeDropChip(item.fakeDrop.classification)}`}>
-                        {item.fakeDrop.classificationLabel}
-                      </span>
-                    )}
-                  </div>
-                </button>
-              ))}
+            <div className="keepa-deal-grid">
+              {results.items.map((item) => renderDealCard(item, { mode: 'results', showSelect: true }))}
               {!results.items.length && <p className="text-muted">Noch keine gespeicherten Ergebnisse gefunden.</p>}
             </div>
 
@@ -2934,7 +3316,7 @@ function KeepaPage() {
                 <div className="keepa-panel-header">
                   <div>
                     <p className="section-title">Detailansicht</p>
-                    <h2>{selectedResult.title}</h2>
+                    <h2>{resolveDealCardTitle(selectedResult)}</h2>
                   </div>
                   <div className="keepa-card-tags">
                     <span className={`status-chip ${getStrengthChip(selectedResult.dealStrength)}`}>{strengthLabels[selectedResult.dealStrength]}</span>
@@ -2947,6 +3329,7 @@ function KeepaPage() {
                     <span className="section-title">Produktdaten</span>
                     <p>ASIN: {selectedResult.asin}</p>
                     <p>Verkaeufer: {selectedResult.sellerType}</p>
+                    <p>Quelle: {selectedResult.sourceLabel || 'manuell / Keepa'}</p>
                     <p>Kategorie: {selectedResult.categoryName || '-'}</p>
                     <p>Zuletzt aktualisiert: {formatDateTime(selectedResult.updatedAt)}</p>
                   </div>
@@ -2954,9 +3337,57 @@ function KeepaPage() {
                     <span className="section-title">Preisinfo</span>
                     <p>Aktueller Preis: {formatCurrency(selectedResult.currentPrice)}</p>
                     <p>Referenz: {formatCurrency(selectedResult.referencePrice)}</p>
+                    <p>Ersparnis: {formatCurrency(selectedResult.savingsAmount)}</p>
                     <p>Keepa-Rabatt: {formatPercent(selectedResult.keepaDiscount)}</p>
                     <p>Deal-Score: {selectedResult.dealScore}</p>
                   </div>
+                </div>
+
+                <div className="keepa-info-card">
+                  <p className="section-title">Live-Vorschau</p>
+                  <div className="keepa-section-stack">
+                    <MiniPriceHistory points={selectedResult.chartPoints || selectedResult.fakeDrop?.chartPoints || []} accent="#22c55e" />
+                    <div className="keepa-card-tags">
+                      {(selectedResult.relevantPricePoints || []).map((point) => (
+                        <span key={`${selectedResult.id}-${point.key}`} className="status-chip subtle">
+                          {point.label}: {formatCurrency(point.price)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="keepa-info-card">
+                  <p className="section-title">Bewertung & Lernen</p>
+                  {renderDealLearningSummary(selectedResult)}
+                  <div className="keepa-card-tags">
+                    <span className="status-chip info">
+                      Review {selectedResult.fakeDrop?.reviewItemId ? `#${selectedResult.fakeDrop.reviewItemId}` : 'nicht verknuepft'}
+                    </span>
+                    {selectedResult.fakeDrop?.reviewStatus ? (
+                      <span className="status-chip info">Status {selectedResult.fakeDrop.reviewStatus}</span>
+                    ) : null}
+                  </div>
+                  {!!selectedSimilarCases.length ? (
+                    <div className="keepa-list">
+                      {selectedSimilarCases.slice(0, 3).map((similar) => (
+                        <div key={`${selectedResult.id}-${similar.reviewItemId}`} className="keepa-list-item static">
+                          <div>
+                            <strong>{similar.title || similar.asin}</strong>
+                            <p className="text-muted">
+                              {similar.labelLabel} - Score {similar.similarityScore} - {similar.categoryName || '-'}
+                            </p>
+                          </div>
+                          <div className="keepa-card-tags">
+                            <span className="status-chip info">{similar.sourceLabel || similar.sellerType}</span>
+                            <span className={`status-chip ${getFakeDropChip(similar.classification)}`}>{similar.classificationLabel}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-muted">Noch keine aehnlichen gespeicherten Lernfaelle gefunden.</p>
+                  )}
                 </div>
 
                 <div className="keepa-info-card">
@@ -2984,7 +3415,7 @@ function KeepaPage() {
                         <span className="status-chip info">Stability {selectedResult.fakeDrop.stabilityScore}</span>
                         <span className="status-chip info">Amazon {selectedResult.fakeDrop.amazonConfidence}</span>
                       </div>
-                      <MiniPriceHistory points={selectedResult.fakeDrop.chartPoints || []} accent="#f59e0b" />
+                      <MiniPriceHistory points={selectedResult.fakeDrop.chartPoints || selectedResult.chartPoints || []} accent="#f59e0b" />
                       <p className="text-muted">
                         {selectedResult.fakeDrop.analysisReason || 'Noch keine Analyse-Begruendung gespeichert.'}
                       </p>
@@ -3079,9 +3510,14 @@ function KeepaPage() {
                   <button className="secondary" onClick={() => void handleSaveResult(selectedResult.id, 'verworfen')}>
                     Verwerfen
                   </button>
-                  <a className="secondary keepa-link-button" href={selectedResult.productUrl} target="_blank" rel="noreferrer">
+                  <a className="secondary keepa-link-button" href={resolveDealCardProductUrl(selectedResult)} target="_blank" rel="noreferrer">
                     Produkt oeffnen
                   </a>
+                  {selectedResult.affiliateUrl && (
+                    <a className="secondary keepa-link-button" href={selectedResult.affiliateUrl} target="_blank" rel="noreferrer">
+                      Affiliate oeffnen
+                    </a>
+                  )}
                 </div>
               </>
             ) : (
@@ -4497,9 +4933,9 @@ function KeepaPage() {
       <div className="keepa-page">
         <section className="card keepa-hero">
           <div className="dashboard-hero-copy">
-            <p className="section-title">Admin-Zentrale</p>
-            <h1 className="page-title">Logik-Zentrale fuer Quellen, Regeln und Output</h1>
-            <p className="page-subtitle">Admin sieht hier den Deal-Flow kompakt, Generator und Scrapper bleiben davon getrennt.</p>
+            <p className="section-title">Affiliate Manager Pro</p>
+            <h1 className="page-title">Deals, Bewertung und Lernen in einem klaren Flow</h1>
+            <p className="page-subtitle">Quellen bleiben getrennt, die Bewertung sitzt direkt am Deal und die Lern-Logik wird sichtbar nutzbar.</p>
           </div>
           <div className="dashboard-chip-row">
             <span className="status-chip info">{isAdmin ? 'Admin sichtbar' : 'versteckt'}</span>
@@ -4510,15 +4946,28 @@ function KeepaPage() {
         </section>
 
         <section className="card keepa-tab-card">
-          <nav className="keepa-tabs">
-            {keepaTabs.map((item) => (
-              <NavLink
-                key={item.path}
-                to={buildLearningTabPath(navigationBasePath, item.path)}
-                className={() => (currentTab === item.path ? 'keepa-tab active' : 'keepa-tab')}
-              >
-                {item.label}
-              </NavLink>
+          <nav className="keepa-nav-groups">
+            {keepaNavigationGroups.map((group) => (
+              <div key={group.label} className={`keepa-nav-group ${isKeepaNavigationGroupActive(group, currentTab) ? 'active' : ''}`}>
+                <NavLink to={buildLearningTabPath(navigationBasePath, group.path)} className="keepa-nav-group-link">
+                  <span>{group.label}</span>
+                  <strong>{group.description}</strong>
+                </NavLink>
+
+                {group.items?.length ? (
+                  <div className="keepa-tab-subnav">
+                    {group.items.map((item) => (
+                      <NavLink
+                        key={item.path}
+                        to={buildLearningTabPath(navigationBasePath, item.path)}
+                        className={() => (currentTab === item.path ? 'keepa-tab active' : 'keepa-tab')}
+                      >
+                        {item.label}
+                      </NavLink>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
             ))}
           </nav>
         </section>

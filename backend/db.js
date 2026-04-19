@@ -24,7 +24,7 @@ const DEFAULT_KEEPA_DRAWER_CONFIGS_JSON = JSON.stringify({
     singleVariantOnly: false,
     recentPriceChangeOnly: false,
     sortBy: 'percent',
-    autoModeAllowed: true,
+    autoModeAllowed: false,
     testGroupPostingAllowed: true
   },
   FBA: {
@@ -43,7 +43,7 @@ const DEFAULT_KEEPA_DRAWER_CONFIGS_JSON = JSON.stringify({
     singleVariantOnly: false,
     recentPriceChangeOnly: false,
     sortBy: 'percent',
-    autoModeAllowed: true,
+    autoModeAllowed: false,
     testGroupPostingAllowed: true
   },
   FBM: {
@@ -62,7 +62,7 @@ const DEFAULT_KEEPA_DRAWER_CONFIGS_JSON = JSON.stringify({
     singleVariantOnly: true,
     recentPriceChangeOnly: false,
     sortBy: 'percent',
-    autoModeAllowed: true,
+    autoModeAllowed: false,
     testGroupPostingAllowed: true
   }
 });
@@ -278,7 +278,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS keepa_settings (
     id INTEGER PRIMARY KEY,
     keepa_enabled INTEGER NOT NULL DEFAULT 1,
-    scheduler_enabled INTEGER NOT NULL DEFAULT 1,
+    scheduler_enabled INTEGER NOT NULL DEFAULT 0,
     domain_id INTEGER NOT NULL DEFAULT 3,
     default_categories_json TEXT NOT NULL DEFAULT '[]',
     default_discount REAL NOT NULL DEFAULT 40,
@@ -631,7 +631,7 @@ ensureColumn(
 );
 ensureColumn('app_settings', 'facebookDefaultTarget', `facebookDefaultTarget TEXT`);
 
-ensureColumn('keepa_settings', 'scheduler_enabled', `scheduler_enabled INTEGER NOT NULL DEFAULT 1`);
+ensureColumn('keepa_settings', 'scheduler_enabled', `scheduler_enabled INTEGER NOT NULL DEFAULT 0`);
 ensureColumn('keepa_settings', 'domain_id', `domain_id INTEGER NOT NULL DEFAULT 3`);
 ensureColumn('keepa_settings', 'default_categories_json', `default_categories_json TEXT NOT NULL DEFAULT '[]'`);
 ensureColumn('keepa_settings', 'default_discount', `default_discount REAL NOT NULL DEFAULT 40`);
@@ -954,7 +954,7 @@ db.prepare(
     ) VALUES (
       1,
       1,
-      1,
+      0,
       3,
       '[]',
       40,
@@ -986,7 +986,7 @@ db.prepare(
   `
     UPDATE keepa_settings
     SET keepa_enabled = COALESCE(keepa_enabled, 1),
-        scheduler_enabled = COALESCE(scheduler_enabled, 1),
+        scheduler_enabled = COALESCE(scheduler_enabled, 0),
         domain_id = COALESCE(domain_id, 3),
         default_categories_json = COALESCE(default_categories_json, '[]'),
         default_discount = COALESCE(default_discount, 40),

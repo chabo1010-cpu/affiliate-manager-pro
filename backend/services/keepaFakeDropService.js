@@ -593,6 +593,68 @@ function buildChartPoints(series) {
   }));
 }
 
+function buildRelevantPricePoints(series, result) {
+  const safeSeries = Array.isArray(series) ? series.filter((item) => item?.timestamp && isFiniteNumber(item?.price)) : [];
+  if (!safeSeries.length) {
+    return [];
+  }
+
+  const currentPoint = safeSeries[safeSeries.length - 1] || null;
+  const lowestPoint = safeSeries.reduce((lowest, item) => (!lowest || item.price < lowest.price ? item : lowest), null);
+  const highestPoint = safeSeries.reduce((highest, item) => (!highest || item.price > highest.price ? item : highest), null);
+  const referencePrice = parseNumber(result.referencePrice, null);
+
+  return [
+    currentPoint
+      ? {
+          key: 'current',
+          label: 'Aktuell',
+          price: currentPoint.price,
+          timestamp: currentPoint.timestamp
+        }
+      : null,
+    lowestPoint
+      ? {
+          key: 'low',
+          label: 'Tief',
+          price: lowestPoint.price,
+          timestamp: lowestPoint.timestamp
+        }
+      : null,
+    highestPoint
+      ? {
+          key: 'high',
+          label: 'Hoch',
+          price: highestPoint.price,
+          timestamp: highestPoint.timestamp
+        }
+      : null,
+    referencePrice !== null
+      ? {
+          key: 'reference',
+          label: 'Referenz',
+          price: referencePrice,
+          timestamp: currentPoint?.timestamp || result.updatedAt || result.createdAt || nowIso()
+        }
+      : null
+  ].filter(Boolean);
+}
+
+export function buildKeepaChartSnapshot(resultInput = {}) {
+  const result = normalizeResultInput(resultInput);
+  const rawSeries = collectCandidateSeries(result.keepaPayload || {}, result.currentPrice);
+  const fallbackSeries = buildFallbackSeries(result);
+  const analysisSeries = compressSeries(rawSeries.length ? rawSeries : fallbackSeries, 120).slice(-120);
+
+  return {
+    chartSource: rawSeries.length ? 'keepa-history' : fallbackSeries.length ? 'derived-fallback' : 'empty',
+    historyPointCount: analysisSeries.length,
+    priceSeries: compressSeries(analysisSeries, 48),
+    chartPoints: buildChartPoints(analysisSeries),
+    relevantPoints: buildRelevantPricePoints(analysisSeries, result)
+  };
+}
+
 function getFeedbackAdjustments() {
   const rows = db
     .prepare(
@@ -1898,6 +1960,16 @@ export function getSimilarCaseSignals(input = {}, options = {}) {
   const summary = buildSimilarCaseSummary(similarCases);
 
   if (options.skipLog !== true) {
+    logGeneratorDebug('SIMILAR CASE CHECKED', {
+      sellerType: reference.sellerType,
+      sourceType: reference.sourceType,
+      referenceAsin: reference.asin,
+      consideredCount: rows.length,
+      matchedCount: similarCases.length,
+      positiveCount: summary.positiveCount,
+      negativeCount: summary.negativeCount,
+      uncertainCount: summary.uncertainCount
+    });
     logGeneratorDebug('SIMILAR CASES CHECKED', {
       sellerType: reference.sellerType,
       sourceType: reference.sourceType,
@@ -2198,18 +2270,31 @@ function mapExampleBucket(label, explicitBucket = '') {
 }
 
 function buildExampleSnapshot(reviewItem, resultRow, fakeDropSnapshot, label, tags, note) {
+  const keepaPayload = fromJson(resultRow?.keepa_payload_json, {});
+  const history = keepaPayload?.history && typeof keepaPayload.history === 'object' ? keepaPayload.history : {};
+
   return {
     asin: resultRow.asin,
     title: resultRow.title,
+    productUrl: resultRow.product_url || '',
+    imageUrl: resultRow.image_url || '',
     sellerType: resultRow.seller_type,
     sourceType: normalizeLearningSource(resultRow.origin),
     sourceLabel: getLearningSourceLabel(resultRow.origin),
     categoryName: resultRow.category_name,
     currentPrice: parseNumber(resultRow.current_price, null),
+    referencePrice: parseNumber(resultRow.reference_price, null),
     keepaDiscount: parseNumber(resultRow.keepa_discount, null),
+    priceHistory: Array.isArray(history.priceSeries) ? history.priceSeries : [],
+    chartPoints: Array.isArray(fakeDropSnapshot?.chartPoints)
+      ? fakeDropSnapshot.chartPoints
+      : Array.isArray(history.chartPoints)
+        ? history.chartPoints
+        : [],
     label,
     tags,
     note,
+    reviewedAt: nowIso(),
     fakeDrop: fakeDropSnapshot,
     reviewItem: {
       id: reviewItem.id,
@@ -2226,13 +2311,16 @@ function getReviewItemJoined(id) {
           kri.*,
           kr.title,
           kr.image_url,
+          kr.product_url,
           kr.current_price,
+          kr.reference_price,
           kr.keepa_discount,
           kr.deal_score,
           kr.seller_type,
           kr.category_name,
           kr.asin,
-          kr.origin
+          kr.origin,
+          kr.keepa_payload_json
         FROM keepa_review_items kri
         JOIN keepa_results kr ON kr.id = kri.keepa_result_id
         WHERE kri.id = ?
@@ -2360,8 +2448,26 @@ export function submitFakeDropReview(id, input = {}) {
       snapshotJson: toJson(buildExampleSnapshot(reviewItem, resultRow, fakeDropSnapshot, label, tags, note)),
       createdAt: timestamp
     });
+
+    logGeneratorDebug('LEARNING CASE STORED', {
+      reviewItemId: reviewItem.id,
+      keepaResultId: reviewItem.keepa_result_id,
+      asin: reviewItem.asin,
+      sellerType: reviewItem.seller_type,
+      label,
+      bucket: exampleBucket
+    });
   }
 
+  logGeneratorDebug('USER RATING APPLIED', {
+    reviewItemId: reviewItem.id,
+    keepaResultId: reviewItem.keepa_result_id,
+    asin: reviewItem.asin,
+    sellerType: reviewItem.seller_type,
+    label,
+    tags,
+    saveAsExample
+  });
   logGeneratorDebug('FEEDBACK LABEL SAVED', {
     reviewItemId: reviewItem.id,
     keepaResultId: reviewItem.keepa_result_id,
