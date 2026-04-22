@@ -2,11 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
+import { getStorageConfig } from './env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dataDir = path.join(__dirname, 'data');
-const dbPath = path.join(dataDir, 'deals.db');
+const storageConfig = getStorageConfig();
+const dataDir = storageConfig.dataDir;
+const dbPath = storageConfig.dbPath;
+const telegramUserSessionDir = storageConfig.telegramUserSessionDir;
 const DEFAULT_KEEPA_DRAWER_CONFIGS_JSON = JSON.stringify({
   AMAZON: {
     active: true,
@@ -72,6 +75,10 @@ if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
+if (!fs.existsSync(telegramUserSessionDir)) {
+  fs.mkdirSync(telegramUserSessionDir, { recursive: true });
+}
+
 const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
@@ -81,12 +88,16 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS deals_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asin TEXT,
+    dealHash TEXT,
     url TEXT NOT NULL,
     normalizedUrl TEXT NOT NULL,
     title TEXT,
     price TEXT,
     oldPrice TEXT,
     sellerType TEXT NOT NULL DEFAULT 'FBM',
+    sourceType TEXT,
+    originType TEXT NOT NULL DEFAULT 'manual',
+    queueId INTEGER,
     postedAt TEXT NOT NULL,
     channel TEXT,
     couponCode TEXT
@@ -257,6 +268,98 @@ db.exec(`
     FOREIGN KEY (target_id) REFERENCES publishing_targets(id)
   );
 
+  CREATE TABLE IF NOT EXISTS telegram_reader_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    login_mode TEXT NOT NULL DEFAULT 'phone',
+    phone_number TEXT,
+    session_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'disconnected',
+    reuse_enabled INTEGER NOT NULL DEFAULT 1,
+    last_connected_at TEXT,
+    last_message_at TEXT,
+    last_error TEXT,
+    qr_login_requested_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS telegram_reader_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
+    channel_ref TEXT NOT NULL,
+    channel_title TEXT,
+    channel_type TEXT NOT NULL DEFAULT 'group',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_seen_message_id TEXT,
+    last_seen_message_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES telegram_reader_sessions(id) ON DELETE SET NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_reader_sessions_status ON telegram_reader_sessions (status);
+  CREATE INDEX IF NOT EXISTS idx_telegram_reader_channels_active ON telegram_reader_channels (is_active, channel_type);
+
+  CREATE TABLE IF NOT EXISTS telegram_bot_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    chat_id TEXT NOT NULL UNIQUE,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    use_for_publishing INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_bot_targets_active ON telegram_bot_targets (is_active, use_for_publishing);
+
+  CREATE TABLE IF NOT EXISTS app_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key TEXT NOT NULL UNIQUE,
+    module TEXT NOT NULL,
+    session_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'inactive',
+    storage_path TEXT,
+    external_ref TEXT,
+    meta_json TEXT,
+    last_seen_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_app_sessions_module_status ON app_sessions (module, status);
+
+  CREATE TABLE IF NOT EXISTS deal_status_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deal_key TEXT NOT NULL UNIQUE,
+    asin TEXT,
+    normalized_url TEXT,
+    original_url TEXT,
+    title TEXT,
+    seller_type TEXT NOT NULL DEFAULT 'FBM',
+    source_type TEXT,
+    source_id TEXT,
+    status TEXT NOT NULL DEFAULT 'detected',
+    decision_reason TEXT,
+    queue_id INTEGER,
+    last_queue_status TEXT,
+    last_channel TEXT,
+    posted_channels_json TEXT NOT NULL DEFAULT '[]',
+    last_posted_at TEXT,
+    last_error TEXT,
+    manual_post_count INTEGER NOT NULL DEFAULT 0,
+    automatic_post_count INTEGER NOT NULL DEFAULT 0,
+    last_origin TEXT,
+    meta_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_deal_status_registry_asin ON deal_status_registry (asin);
+  CREATE INDEX IF NOT EXISTS idx_deal_status_registry_normalized_url ON deal_status_registry (normalized_url);
+  CREATE INDEX IF NOT EXISTS idx_deal_status_registry_status ON deal_status_registry (status);
+  CREATE INDEX IF NOT EXISTS idx_deal_status_registry_queue_id ON deal_status_registry (queue_id);
+
   CREATE TABLE IF NOT EXISTS settings (
     repostCooldownEnabled INTEGER NOT NULL DEFAULT 1,
     repostCooldownHours INTEGER NOT NULL DEFAULT 12,
@@ -269,6 +372,8 @@ db.exec(`
     repostCooldownHours INTEGER NOT NULL DEFAULT 12,
     telegramCopyButtonText TEXT NOT NULL DEFAULT '${DEFAULT_TELEGRAM_COPY_BUTTON_TEXT}',
     copybotEnabled INTEGER NOT NULL DEFAULT 0,
+    telegramBotEnabled INTEGER NOT NULL DEFAULT 1,
+    telegramBotDefaultRetryLimit INTEGER NOT NULL DEFAULT 3,
     facebookEnabled INTEGER NOT NULL DEFAULT 0,
     facebookSessionMode TEXT NOT NULL DEFAULT 'persistent',
     facebookDefaultRetryLimit INTEGER NOT NULL DEFAULT 3,
@@ -622,6 +727,12 @@ ensureColumn(
   `telegramCopyButtonText TEXT NOT NULL DEFAULT '${DEFAULT_TELEGRAM_COPY_BUTTON_TEXT}'`
 );
 ensureColumn('app_settings', 'copybotEnabled', `copybotEnabled INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('app_settings', 'telegramBotEnabled', `telegramBotEnabled INTEGER NOT NULL DEFAULT 1`);
+ensureColumn(
+  'app_settings',
+  'telegramBotDefaultRetryLimit',
+  `telegramBotDefaultRetryLimit INTEGER NOT NULL DEFAULT 3`
+);
 ensureColumn('app_settings', 'facebookEnabled', `facebookEnabled INTEGER NOT NULL DEFAULT 0`);
 ensureColumn('app_settings', 'facebookSessionMode', `facebookSessionMode TEXT NOT NULL DEFAULT 'persistent'`);
 ensureColumn(
@@ -745,6 +856,9 @@ ensureColumn('generator_posts', 'keepa_result_id', `keepa_result_id INTEGER`);
 ensureColumn('generator_posts', 'generator_context_json', `generator_context_json TEXT`);
 ensureColumn('generator_posts', 'telegram_message_id', `telegram_message_id TEXT`);
 ensureColumn('generator_posts', 'posted_channels_json', `posted_channels_json TEXT`);
+ensureColumn('publishing_targets', 'target_ref', `target_ref TEXT`);
+ensureColumn('publishing_targets', 'target_label', `target_label TEXT`);
+ensureColumn('publishing_targets', 'target_meta_json', `target_meta_json TEXT`);
 
 ensureColumn('keepa_review_labels', 'asin', `asin TEXT`);
 ensureColumn('keepa_review_labels', 'seller_type', `seller_type TEXT NOT NULL DEFAULT 'UNKNOWN'`);
@@ -816,7 +930,12 @@ ensureColumn('deals_history', 'productTitle', 'productTitle TEXT');
 ensureColumn('deals_history', 'currentPrice', 'currentPrice TEXT');
 ensureColumn('deals_history', 'oldPrice', 'oldPrice TEXT');
 ensureColumn('deals_history', 'sellerType', `sellerType TEXT NOT NULL DEFAULT 'FBM'`);
+ensureColumn('deals_history', 'dealHash', 'dealHash TEXT');
+ensureColumn('deals_history', 'sourceType', 'sourceType TEXT');
+ensureColumn('deals_history', 'originType', `originType TEXT NOT NULL DEFAULT 'manual'`);
+ensureColumn('deals_history', 'queueId', 'queueId INTEGER');
 ensureColumn('deals_history', 'couponCode', 'couponCode TEXT');
+db.exec(`CREATE INDEX IF NOT EXISTS idx_deals_history_dealHash ON deals_history (dealHash)`);
 
 const settingsRow = db.prepare(`SELECT COUNT(*) AS count FROM settings`).get();
 if (!settingsRow?.count) {
@@ -849,11 +968,13 @@ if (!appSettingsRow?.count) {
         repostCooldownHours,
         telegramCopyButtonText,
         copybotEnabled,
+        telegramBotEnabled,
+        telegramBotDefaultRetryLimit,
         facebookEnabled,
         facebookSessionMode,
         facebookDefaultRetryLimit,
         facebookDefaultTarget
-      ) VALUES (1, ?, ?, ?, 0, 0, 'persistent', 3, NULL)
+      ) VALUES (1, ?, ?, ?, 0, 1, 3, 0, 'persistent', 3, NULL)
     `
   ).run(
     legacySettings?.repostCooldownEnabled ?? 1,
@@ -869,6 +990,8 @@ if (!appSettingsRow?.count) {
           repostCooldownHours = COALESCE(repostCooldownHours, 12),
           telegramCopyButtonText = COALESCE(NULLIF(TRIM(telegramCopyButtonText), ''), ?),
           copybotEnabled = COALESCE(copybotEnabled, 0),
+          telegramBotEnabled = COALESCE(telegramBotEnabled, 1),
+          telegramBotDefaultRetryLimit = COALESCE(telegramBotDefaultRetryLimit, 3),
           facebookEnabled = COALESCE(facebookEnabled, 0),
           facebookSessionMode = COALESCE(NULLIF(TRIM(facebookSessionMode), ''), 'persistent'),
           facebookDefaultRetryLimit = COALESCE(facebookDefaultRetryLimit, 3)
@@ -879,12 +1002,51 @@ if (!appSettingsRow?.count) {
 
 db.exec(`
   UPDATE deals_history
-  SET originalUrl = COALESCE(NULLIF(TRIM(originalUrl), ''), url),
+  SET dealHash = COALESCE(dealHash, ''),
+      originalUrl = COALESCE(NULLIF(TRIM(originalUrl), ''), url),
       productTitle = COALESCE(NULLIF(TRIM(productTitle), ''), title),
       currentPrice = COALESCE(NULLIF(TRIM(currentPrice), ''), price),
       oldPrice = COALESCE(oldPrice, ''),
       sellerType = COALESCE(NULLIF(TRIM(sellerType), ''), 'FBM'),
+      sourceType = COALESCE(NULLIF(TRIM(sourceType), ''), 'publication'),
+      originType = COALESCE(NULLIF(TRIM(originType), ''), 'manual'),
       couponCode = COALESCE(couponCode, '')
+`);
+
+db.exec(`
+  UPDATE publishing_queue
+  SET status = CASE
+    WHEN status = 'queued' THEN 'pending'
+    WHEN status = 'processing' THEN 'sending'
+    WHEN status = 'posted' THEN 'sent'
+    ELSE status
+  END
+`);
+
+db.exec(`
+  UPDATE publishing_targets
+  SET status = CASE
+    WHEN status = 'queued' THEN 'pending'
+    WHEN status = 'processing' THEN 'sending'
+    WHEN status = 'posted' THEN 'sent'
+    ELSE status
+  END
+`);
+
+db.exec(`
+  UPDATE deal_status_registry
+  SET status = CASE
+        WHEN status = 'queued' THEN 'pending'
+        WHEN status = 'processing' THEN 'sending'
+        WHEN status = 'posted' THEN 'sent'
+        ELSE status
+      END,
+      last_queue_status = CASE
+        WHEN last_queue_status = 'queued' THEN 'pending'
+        WHEN last_queue_status = 'processing' THEN 'sending'
+        WHEN last_queue_status = 'posted' THEN 'sent'
+        ELSE last_queue_status
+      END
 `);
 
 const now = new Date().toISOString();

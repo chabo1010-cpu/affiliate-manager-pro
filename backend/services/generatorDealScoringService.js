@@ -1,6 +1,11 @@
-import { normalizeSellerType } from './dealHistoryService.js';
+import { checkDealLockStatus, normalizeSellerType } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
-import { getKeepaDrawerControlConfig, loadKeepaProductContext } from './keepaService.js';
+import { loadKeepaClientByAsin } from './keepaClientService.js';
+import {
+  getKeepaDrawerControlConfig,
+  getKeepaSettings,
+  loadStoredInternetComparisonContext
+} from './keepaService.js';
 import { evaluateLearningRoute } from './learningLogicService.js';
 
 function cleanText(value) {
@@ -30,11 +35,21 @@ export async function buildGeneratorDealContext(input = {}) {
   const sellerType = normalizeSellerType(input.sellerType);
   const currentPrice = parseNumber(input.currentPrice, null);
   const drawerControl = getKeepaDrawerControlConfig(sellerType);
+  const keepaSettings = getKeepaSettings();
+  const dealLock = checkDealLockStatus({
+    asin,
+    url: input.productUrl || input.link,
+    normalizedUrl: input.productUrl || input.link,
+    sourceType: input.source || 'generator',
+    origin: input.origin
+  });
 
   logGeneratorDebug('GENERATOR CONNECTED TO LEARNING LOGIC', {
     asin,
     sellerType,
-    source: input.source || 'generator'
+    source: input.source || 'generator',
+    dealLockBlocked: dealLock.blocked,
+    dealHash: dealLock.dealHash || null
   });
 
   let keepaContext = {
@@ -43,18 +58,43 @@ export async function buildGeneratorDealContext(input = {}) {
     cached: false,
     reason: asin ? 'Keepa noch nicht geladen.' : 'ASIN fehlt.'
   };
+  let internetContext = {
+    available: false,
+    status: 'missing_asin',
+    cached: false,
+    reason: asin ? 'Kein gespeicherter Internetvergleich gefunden.' : 'ASIN fehlt.'
+  };
 
   if (asin) {
+    internetContext = loadStoredInternetComparisonContext({
+      asin,
+      domainId: input.domainId
+    });
+
     try {
-      keepaContext = await loadKeepaProductContext({
-        asin,
-        sellerType,
-        currentPrice,
-        title: input.title,
-        productUrl: input.productUrl || input.link,
-        imageUrl: input.imageUrl || input.generatedImagePath,
-        source: input.source || 'generator'
-      });
+      if (!internetContext.available) {
+        logGeneratorDebug('KEEPA FALLBACK USED', {
+          asin,
+          sellerType,
+          reason: internetContext.reason || 'Kein Marktvergleich vorhanden.'
+        });
+
+        keepaContext = await loadKeepaClientByAsin({
+          asin,
+          sellerType,
+          currentPrice,
+          title: input.title,
+          productUrl: input.productUrl || input.link,
+          imageUrl: input.imageUrl || input.generatedImagePath,
+          source: input.source || 'generator'
+        });
+      } else {
+        logGeneratorDebug('INTERNET COMPARISON PRIMARY', {
+          asin,
+          sellerType,
+          comparisonStatus: internetContext.result?.comparisonStatus || internetContext.status
+        });
+      }
     } catch (error) {
       keepaContext = {
         available: false,
@@ -65,14 +105,20 @@ export async function buildGeneratorDealContext(input = {}) {
     }
   }
 
-  return evaluateLearningRoute({
-    asin,
-    sellerType,
-    currentPrice,
-    keepaContext,
-    sourceType: 'generator',
-    enforceDecision: false,
-    keepaRequired: false,
-    patternSupportEnabled: drawerControl.patternSupportEnabled === true
-  });
+  return {
+    ...evaluateLearningRoute({
+      asin,
+      sellerType,
+      currentPrice,
+      internetContext,
+      keepaContext,
+      sourceType: 'generator',
+      enforceDecision: false,
+      keepaRequired: false,
+      dealLockStatus: dealLock,
+      patternSupportEnabled: drawerControl.patternSupportEnabled === true,
+      marketMinGapPct: keepaSettings.strongDealMinComparisonGapPct
+    }),
+    dealLock
+  };
 }

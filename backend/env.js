@@ -25,10 +25,57 @@ export function getTelegramConfig() {
   };
 }
 
+export function getStorageConfig() {
+  const dataDir = process.env.APP_DATA_DIR?.trim() || path.join(__dirname, 'data');
+  const dbPath = process.env.APP_DB_PATH?.trim() || path.join(dataDir, 'deals.db');
+  const telegramUserSessionDir = process.env.TELEGRAM_USER_SESSION_DIR?.trim() || path.join(dataDir, 'telegram-user-sessions');
+
+  return {
+    envPath,
+    dataDir,
+    dbPath,
+    telegramUserSessionDir
+  };
+}
+
+export function getDatabaseConfig() {
+  const storage = getStorageConfig();
+
+  return {
+    envPath: storage.envPath,
+    dataDir: storage.dataDir,
+    dbPath: storage.dbPath,
+    journalMode: 'WAL'
+  };
+}
+
+export function getTelegramUserReaderConfig() {
+  const storage = getStorageConfig();
+
+  return {
+    enabled: (process.env.TELEGRAM_USER_API_ENABLED?.trim() || '0') === '1',
+    apiId: process.env.TELEGRAM_USER_API_ID?.trim() || '',
+    apiHash: normalizeSecret(process.env.TELEGRAM_USER_API_HASH, ['DEIN_API_HASH_HIER', 'YOUR_API_HASH_HERE', 'CHANGE_ME']),
+    phoneNumber: process.env.TELEGRAM_USER_PHONE?.trim() || '',
+    loginMode: (process.env.TELEGRAM_USER_LOGIN_MODE?.trim() || 'phone') === 'qr' ? 'qr' : 'phone',
+    sessionDir: storage.telegramUserSessionDir
+  };
+}
+
 export function getTelegramTestGroupConfig() {
   return {
     token: process.env.TELEGRAM_BOT_TOKEN?.trim() || '',
     chatId: process.env.TELEGRAM_TEST_CHAT_ID?.trim() || process.env.TELEGRAM_CHAT_ID?.trim() || ''
+  };
+}
+
+export function getWhatsappDeliveryConfig() {
+  return {
+    enabled: (process.env.WHATSAPP_DELIVERY_ENABLED?.trim() || '0') === '1',
+    endpoint: process.env.WHATSAPP_DELIVERY_ENDPOINT?.trim() || '',
+    token: normalizeSecret(process.env.WHATSAPP_DELIVERY_TOKEN, ['DEIN_TOKEN_HIER', 'YOUR_TOKEN_HERE', 'CHANGE_ME']),
+    sender: process.env.WHATSAPP_DELIVERY_SENDER?.trim() || '',
+    retryLimit: Number.parseInt(process.env.WHATSAPP_DELIVERY_RETRY_LIMIT || '3', 10) || 3
   };
 }
 

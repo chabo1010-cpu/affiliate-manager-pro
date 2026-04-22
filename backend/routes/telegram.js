@@ -1,7 +1,31 @@
 import { Router } from 'express';
 import { sendTelegramPost } from '../services/telegramSenderService.js';
+import {
+  completeTelegramPhoneLogin,
+  disconnectTelegramUserSession,
+  getTelegramUserClientStatus,
+  listTelegramUserDialogs,
+  startTelegramPhoneLogin,
+  startTelegramQrLogin,
+  submitTelegramQrPassword,
+  syncTelegramWatchedMessages,
+  unwatchTelegramDialog,
+  watchTelegramDialog
+} from '../services/telegramUserClientService.js';
 
 const router = Router();
+
+function getRequesterRole(req) {
+  return String(req.headers['x-user-role'] || '').trim().toLowerCase();
+}
+
+function requireAdmin(req, res, next) {
+  if (getRequesterRole(req) !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admin darf den Telegram User Client verwalten.' });
+  }
+
+  return next();
+}
 
 router.get('/send', (req, res) => {
   res.status(405).json({
@@ -46,6 +70,98 @@ router.post('/send', async (req, res) => {
           : 'Fehler beim Versenden. Bitte versuchen Sie es spaeter erneut.',
       code: 'SEND_ERROR'
     });
+  }
+});
+
+router.get('/user-client/status', requireAdmin, async (req, res) => {
+  try {
+    res.json(await getTelegramUserClientStatus());
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Status konnte nicht geladen werden.' });
+  }
+});
+
+router.post('/user-client/login/phone/start', requireAdmin, async (req, res) => {
+  try {
+    res.json(await startTelegramPhoneLogin(req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Telefon-Login konnte nicht gestartet werden.' });
+  }
+});
+
+router.post('/user-client/login/phone/complete', requireAdmin, async (req, res) => {
+  try {
+    res.json(await completeTelegramPhoneLogin(req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Telefon-Login konnte nicht abgeschlossen werden.' });
+  }
+});
+
+router.post('/user-client/login/qr/start', requireAdmin, async (req, res) => {
+  try {
+    res.json(await startTelegramQrLogin(req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'QR-Login konnte nicht gestartet werden.' });
+  }
+});
+
+router.post('/user-client/login/qr/password', requireAdmin, async (req, res) => {
+  try {
+    res.json(await submitTelegramQrPassword(req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'QR-2FA konnte nicht uebergeben werden.' });
+  }
+});
+
+router.post('/user-client/disconnect', requireAdmin, async (req, res) => {
+  try {
+    res.json(await disconnectTelegramUserSession(req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Session konnte nicht getrennt werden.' });
+  }
+});
+
+router.get('/user-client/dialogs', requireAdmin, async (req, res) => {
+  try {
+    res.json({
+      items: await listTelegramUserDialogs({
+        sessionName: req.query.sessionName,
+        limit: req.query.limit
+      })
+    });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Dialoge konnten nicht geladen werden.' });
+  }
+});
+
+router.post('/user-client/channels/watch', requireAdmin, async (req, res) => {
+  try {
+    res.json({
+      item: await watchTelegramDialog(req.body ?? {})
+    });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Channel konnte nicht uebernommen werden.' });
+  }
+});
+
+router.delete('/user-client/channels/:id', requireAdmin, (req, res) => {
+  try {
+    res.json(unwatchTelegramDialog({ channelId: req.params.id }));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Channel konnte nicht entfernt werden.' });
+  }
+});
+
+router.get('/user-client/messages/sync', requireAdmin, async (req, res) => {
+  try {
+    res.json(
+      await syncTelegramWatchedMessages({
+        sessionName: req.query.sessionName,
+        limit: req.query.limit
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Neue Nachrichten konnten nicht gelesen werden.' });
   }
 });
 

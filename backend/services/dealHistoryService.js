@@ -1,5 +1,8 @@
+import crypto from 'crypto';
 import { DEFAULT_TELEGRAM_COPY_BUTTON_TEXT, getDb } from '../db.js';
+import { upsertDealStatusState } from './databaseService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
+import { isActivePublishingQueueStatus } from './publishingQueueStateService.js';
 
 const db = getDb();
 const AMAZON_AFFILIATE_TAG = 'codeundcoup08-21';
@@ -41,6 +44,37 @@ function parseNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function parseInteger(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeOriginType(value = '') {
+  const normalized = cleanText(value).toLowerCase();
+
+  if (['manual', 'generator', 'generator_direct', 'direct', 'manual_post'].includes(normalized)) {
+    return 'manual';
+  }
+
+  if (
+    [
+      'automatic',
+      'auto',
+      'copybot',
+      'scrapper',
+      'publisher_queue',
+      'queue',
+      'keepa_auto',
+      'keepa',
+      'automation'
+    ].includes(normalized)
+  ) {
+    return 'automatic';
+  }
+
+  return normalized || 'manual';
+}
+
 function safeUrl(value) {
   try {
     return new URL(value);
@@ -70,6 +104,7 @@ function findDealsByField(field, value) {
         SELECT
           id,
           asin,
+          dealHash,
           url,
           originalUrl,
           normalizedUrl,
@@ -79,6 +114,9 @@ function findDealsByField(field, value) {
           currentPrice,
           oldPrice,
           sellerType,
+          sourceType,
+          originType,
+          queueId,
           postedAt,
           channel,
           couponCode
@@ -108,6 +146,132 @@ function buildHistorySummary(rows = []) {
     maxPrice: prices.length ? Math.max(...prices) : null,
     count: rows.length
   };
+}
+
+function buildDealLockHash({ asin = '', normalizedUrl = '', rawUrl = '' } = {}) {
+  const hashBase = asin
+    ? `asin:${cleanText(asin).toUpperCase()}`
+    : normalizedUrl
+      ? `url:${cleanText(normalizedUrl)}`
+      : cleanText(rawUrl)
+        ? `url:${cleanText(rawUrl)}`
+        : '';
+
+  return hashBase ? crypto.createHash('sha1').update(hashBase).digest('hex') : '';
+}
+
+export function buildDealLockIdentity(input = {}) {
+  const rawUrl = cleanText(input.url || input.originalUrl || '');
+  const finalUrl = cleanText(input.finalUrl || input.url || input.normalizedUrl || input.originalUrl || '');
+  const asin =
+    cleanText(input.asin).toUpperCase() ||
+    extractAsin(input.finalUrl || input.url || input.normalizedUrl || input.originalUrl || '');
+  const normalizedUrl = normalizeAmazonLink(input.normalizedUrl || finalUrl || rawUrl || '');
+  const dealHash = cleanText(input.dealHash) || buildDealLockHash({ asin, normalizedUrl, rawUrl: finalUrl || rawUrl });
+  const queueId = parseInteger(input.queueId, 0) || null;
+
+  return {
+    asin,
+    normalizedUrl,
+    rawUrl,
+    finalUrl,
+    dealHash,
+    queueId
+  };
+}
+
+function findDealsByIdentity(identity = {}) {
+  if (!identity.dealHash && !identity.asin && !identity.normalizedUrl && !identity.rawUrl) {
+    return [];
+  }
+
+  return db
+    .prepare(
+      `
+        SELECT
+          id,
+          asin,
+          dealHash,
+          url,
+          originalUrl,
+          normalizedUrl,
+          title,
+          productTitle,
+          price,
+          currentPrice,
+          oldPrice,
+          sellerType,
+          sourceType,
+          originType,
+          queueId,
+          postedAt,
+          channel,
+          couponCode
+        FROM deals_history
+        WHERE (@dealHash != '' AND dealHash = @dealHash)
+           OR (@asin != '' AND asin = @asin)
+           OR (@normalizedUrl != '' AND normalizedUrl = @normalizedUrl)
+           OR (@rawUrl != '' AND (url = @rawUrl OR originalUrl = @rawUrl))
+        ORDER BY postedAt DESC
+      `
+    )
+    .all({
+      dealHash: identity.dealHash || '',
+      asin: identity.asin || '',
+      normalizedUrl: identity.normalizedUrl || '',
+      rawUrl: identity.rawUrl || ''
+    });
+}
+
+function isActiveQueueState(value = '') {
+  return isActivePublishingQueueStatus(value) || cleanText(value).toLowerCase() === 'posting';
+}
+
+function findActiveDealRegistryEntry(identity = {}) {
+  if (!identity.asin && !identity.normalizedUrl && !identity.rawUrl) {
+    return null;
+  }
+
+  const rows = db
+    .prepare(
+      `
+        SELECT
+          id,
+          deal_key,
+          asin,
+          normalized_url,
+          original_url,
+          status,
+          queue_id,
+          last_queue_status,
+          last_channel,
+          decision_reason,
+          last_posted_at,
+          last_origin,
+          updated_at
+        FROM deal_status_registry
+        WHERE (@asin != '' AND asin = @asin)
+           OR (@normalizedUrl != '' AND normalized_url = @normalizedUrl)
+           OR (@rawUrl != '' AND original_url = @rawUrl)
+        ORDER BY updated_at DESC
+      `
+    )
+    .all({
+      asin: identity.asin || '',
+      normalizedUrl: identity.normalizedUrl || '',
+      rawUrl: identity.rawUrl || ''
+    });
+
+  return (
+    rows.find((row) => {
+      const queueId = parseInteger(row.queue_id, 0);
+      if (identity.queueId && queueId && identity.queueId === queueId) {
+        return false;
+      }
+
+      return isActiveQueueState(row.status) || isActiveQueueState(row.last_queue_status);
+    }) || null
+  );
 }
 
 function getDealMatchClause(asin, normalizedUrl) {
@@ -401,6 +565,7 @@ export function getDealHistorySummary({ asin = '', normalizedUrl = '' } = {}) {
         SELECT
           id,
           asin,
+          dealHash,
           url,
           originalUrl,
           normalizedUrl,
@@ -410,6 +575,9 @@ export function getDealHistorySummary({ asin = '', normalizedUrl = '' } = {}) {
           currentPrice,
           oldPrice,
           sellerType,
+          sourceType,
+          originType,
+          queueId,
           postedAt,
           channel,
           couponCode
@@ -423,29 +591,27 @@ export function getDealHistorySummary({ asin = '', normalizedUrl = '' } = {}) {
   return buildHistorySummary(rows);
 }
 
-export function checkDealCooldown(input = {}) {
-  const rawUrl = cleanText(input.url || '');
-  const finalUrl = cleanText(input.finalUrl || input.url || '');
-  const asin =
-    cleanText(input.asin).toUpperCase() || extractAsin(input.finalUrl || input.url || input.normalizedUrl || '');
-  const normalizedUrl = normalizeAmazonLink(input.normalizedUrl || input.finalUrl || input.url || '');
-  const matchesByAsin = asin ? findDealsByField('asin', asin) : [];
-  const matchesByNormalizedUrl = normalizedUrl ? findDealsByField('normalizedUrl', normalizedUrl) : [];
-  const matchesByUrl =
-    !matchesByAsin.length && !matchesByNormalizedUrl.length && rawUrl ? findDealsByField('url', rawUrl) : [];
-  const historyRows = matchesByAsin.length
-    ? matchesByAsin
-    : matchesByNormalizedUrl.length
-      ? matchesByNormalizedUrl
-      : matchesByUrl;
-
+export function checkDealLockStatus(input = {}) {
+  const identity = buildDealLockIdentity(input);
+  const historyRows = findDealsByIdentity(identity);
   const summary = buildHistorySummary(historyRows);
   const settings = getRepostSettings();
+  const activeRegistryLock = findActiveDealRegistryEntry(identity);
   const lastPostedAt = summary.latest?.postedAt || null;
+  const sameQueuePublication =
+    Boolean(identity.queueId) && Boolean(parseInteger(summary.latest?.queueId, 0)) && identity.queueId === parseInteger(summary.latest?.queueId, 0);
   let blocked = false;
   let remainingSeconds = 0;
+  let blockCode = '';
+  let blockReason = '';
 
-  if (settings.repostCooldownEnabled && lastPostedAt) {
+  if (activeRegistryLock) {
+    blocked = true;
+    blockCode = 'DEAL_LOCK_ACTIVE_QUEUE';
+    blockReason = 'Deal-Lock aktiv: Der Deal ist bereits in Queue oder Verarbeitung.';
+  }
+
+  if (!blocked && settings.repostCooldownEnabled && lastPostedAt && !sameQueuePublication) {
     const nowMs = Date.now();
     const lastPostedMs = new Date(lastPostedAt).getTime();
     const cooldownMs = settings.repostCooldownHours * 60 * 60 * 1000;
@@ -453,13 +619,16 @@ export function checkDealCooldown(input = {}) {
     if (Number.isFinite(lastPostedMs) && nowMs - lastPostedMs < cooldownMs) {
       blocked = true;
       remainingSeconds = Math.ceil((cooldownMs - (nowMs - lastPostedMs)) / 1000);
+      blockCode = 'DEAL_LOCK_COOLDOWN';
+      blockReason = 'Deal-Lock aktiv: Sperrzeit fuer diesen Deal laeuft noch.';
     }
   }
 
   return {
-    asin,
-    normalizedUrl,
+    ...identity,
     blocked,
+    blockCode,
+    blockReason,
     remainingSeconds,
     repostCooldownEnabled: settings.repostCooldownEnabled,
     repostCooldownHours: settings.repostCooldownHours,
@@ -467,33 +636,65 @@ export function checkDealCooldown(input = {}) {
     minPrice: summary.minPrice,
     maxPrice: summary.maxPrice,
     postingCount: summary.count,
-    finalUrl
+    activeRegistryLock: activeRegistryLock
+      ? {
+          id: activeRegistryLock.id,
+          status: activeRegistryLock.status,
+          queueId: activeRegistryLock.queue_id || null,
+          lastQueueStatus: activeRegistryLock.last_queue_status || '',
+          channel: activeRegistryLock.last_channel || '',
+          decisionReason: activeRegistryLock.decision_reason || '',
+          updatedAt: activeRegistryLock.updated_at || null
+        }
+      : null
   };
 }
 
+export function checkDealCooldown(input = {}) {
+  return checkDealLockStatus(input);
+}
+
+export function assertDealNotLocked(input = {}) {
+  const lockStatus = checkDealLockStatus(input);
+
+  if (!lockStatus.blocked) {
+    return lockStatus;
+  }
+
+  const error = new Error(lockStatus.blockReason || 'Deal-Lock aktiv.');
+  error.code = lockStatus.blockCode || 'DEAL_LOCK_ACTIVE';
+  error.retryable = false;
+  error.dealLock = lockStatus;
+  throw error;
+}
+
 export function savePostedDeal(input = {}) {
-  const asin =
-    cleanText(input.asin).toUpperCase() ||
-    extractAsin(input.finalUrl || input.url || input.normalizedUrl || input.originalUrl || '');
+  const identity = buildDealLockIdentity(input);
   const originalUrl = cleanText(input.originalUrl || input.url || input.finalUrl || input.normalizedUrl);
   const url = cleanText(input.finalUrl || input.url || input.normalizedUrl || input.originalUrl);
-  const normalizedUrl = normalizeAmazonLink(input.normalizedUrl || url || originalUrl);
   const productTitle = cleanText(input.productTitle || input.title);
   const currentPrice = cleanText(input.currentPrice || input.price);
   const oldPrice = cleanText(input.oldPrice);
   const sellerType = normalizeSellerType(input.sellerType);
   const postedAt = cleanText(input.postedAt) || new Date().toISOString();
+  const sourceType = cleanText(input.sourceType) || 'publication';
+  const originType = normalizeOriginType(input.origin || input.originType || sourceType);
+  const queueId = parseInteger(input.queueId, 0) || null;
   const payload = {
-    asin,
+    asin: identity.asin,
+    dealHash: identity.dealHash,
     url,
     originalUrl,
-    normalizedUrl,
+    normalizedUrl: identity.normalizedUrl,
     title: productTitle,
     productTitle,
     price: currentPrice,
     currentPrice,
     oldPrice,
     sellerType,
+    sourceType,
+    originType,
+    queueId,
     postedAt,
     channel: cleanText(input.channel),
     couponCode: cleanText(input.couponCode)
@@ -504,6 +705,7 @@ export function savePostedDeal(input = {}) {
       `
         INSERT INTO deals_history (
           asin,
+          dealHash,
           url,
           originalUrl,
           normalizedUrl,
@@ -513,11 +715,15 @@ export function savePostedDeal(input = {}) {
           currentPrice,
           oldPrice,
           sellerType,
+          sourceType,
+          originType,
+          queueId,
           postedAt,
           channel,
           couponCode
         ) VALUES (
           @asin,
+          @dealHash,
           @url,
           @originalUrl,
           @normalizedUrl,
@@ -527,6 +733,9 @@ export function savePostedDeal(input = {}) {
           @currentPrice,
           @oldPrice,
           @sellerType,
+          @sourceType,
+          @originType,
+          @queueId,
           @postedAt,
           @channel,
           @couponCode
@@ -535,10 +744,34 @@ export function savePostedDeal(input = {}) {
     )
     .run(payload);
 
+  upsertDealStatusState({
+    asin: identity.asin,
+    normalizedUrl: identity.normalizedUrl,
+    originalUrl,
+    title: productTitle,
+    sellerType,
+    sourceType,
+    sourceId: input.sourceId ?? result.lastInsertRowid,
+    status: 'sent',
+    decisionReason: cleanText(input.decisionReason) || 'Deal veroeffentlicht.',
+    queueId,
+    channel: payload.channel,
+    postedAt,
+    origin: originType,
+    registerPost: true,
+    meta: {
+      dealHash: identity.dealHash,
+      sourceType,
+      originType,
+      ...(input.meta && typeof input.meta === 'object' ? input.meta : {})
+    }
+  });
+
   return {
     id: result.lastInsertRowid,
-    asin,
-    normalizedUrl,
+    asin: identity.asin,
+    normalizedUrl: identity.normalizedUrl,
+    dealHash: identity.dealHash,
     postedAt
   };
 }
@@ -598,6 +831,7 @@ export function listDealsHistory({
         SELECT
           id,
           asin,
+          dealHash,
           url,
           originalUrl,
           normalizedUrl,
@@ -607,6 +841,9 @@ export function listDealsHistory({
           currentPrice,
           oldPrice,
           sellerType,
+          sourceType,
+          originType,
+          queueId,
           postedAt,
           channel,
           couponCode
@@ -618,4 +855,4 @@ export function listDealsHistory({
     .all(params);
 }
 
-export { cleanText, parseEnabledFlag, parseNumber };
+export { cleanText, normalizeOriginType, parseEnabledFlag, parseNumber };

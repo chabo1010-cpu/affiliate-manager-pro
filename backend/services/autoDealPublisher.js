@@ -4,11 +4,11 @@ import { getTelegramTestGroupConfig } from '../env.js';
 import {
   buildAmazonAffiliateLinkRecord,
   checkDealCooldown,
-  normalizeSellerType,
-  savePostedDeal
+  normalizeSellerType
 } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
-import { sendTelegramPost } from './telegramSenderService.js';
+import { createPublishingEntry, processPublishingQueueEntry } from './publisherService.js';
+import { isFailedPublishingQueueStatus, normalizePublishingQueueStatus } from './publishingQueueStateService.js';
 
 const db = getDb();
 
@@ -167,7 +167,7 @@ function insertAutoAlertLog({
 }) {
   db.prepare(
     `
-      INSERT OR IGNORE INTO keepa_alerts (
+      INSERT INTO keepa_alerts (
         keepa_result_id,
         asin,
         channel_type,
@@ -192,6 +192,12 @@ function insertAutoAlertLog({
         @createdAt,
         @sentAt
       )
+      ON CONFLICT(dedupe_key) DO UPDATE SET
+        status = excluded.status,
+        message_preview = excluded.message_preview,
+        payload_json = excluded.payload_json,
+        error_message = excluded.error_message,
+        sent_at = excluded.sent_at
     `
   ).run({
     keepaResultId: result.id || null,
@@ -234,6 +240,74 @@ function updateKeepaResultState(resultId, nextState = {}) {
     lastAlertedAt: cleanText(nextState.lastAlertedAt),
     updatedAt: nowIso()
   });
+}
+
+function buildAutoDealPublishingPayload({
+  result,
+  message,
+  decisionReasonText,
+  finalDecisionStatus,
+  learningContext,
+  sourceType
+}) {
+  const testGroupConfig = getTelegramTestGroupConfig();
+  const standardImage = cleanText(result?.imageUrl);
+
+  return {
+    title: cleanText(result?.title) || cleanText(result?.asin) || 'Unbenannter Deal',
+    link: message.affiliateProductUrl || result?.productUrl || '',
+    normalizedUrl: message.normalizedProductUrl || result?.productUrl || '',
+    asin: cleanText(result?.asin).toUpperCase(),
+    currentPrice: result?.currentPrice === null || result?.currentPrice === undefined ? '' : String(result.currentPrice),
+    oldPrice: '',
+    sellerType: normalizeSellerType(result?.sellerType),
+    couponCode: '',
+    textByChannel: {
+      telegram: message.text
+    },
+    telegramChatIds: testGroupConfig.chatId ? [String(testGroupConfig.chatId)] : [],
+    imageVariants: {
+      standard: standardImage,
+      upload: ''
+    },
+    targetImageSources: {
+      telegram: standardImage ? 'standard' : 'none'
+    },
+    learningContext,
+    autoDecision: {
+      status: finalDecisionStatus,
+      reason: decisionReasonText,
+      sourceType
+    }
+  };
+}
+
+function buildAutoDealPublishingTargets(result) {
+  return [
+    {
+      channelType: 'telegram',
+      isEnabled: true,
+      imageSource: cleanText(result?.imageUrl) ? 'standard' : 'none'
+    }
+  ];
+}
+
+function summarizeAutoDealQueue(queueProcessingResult = {}, queueEntry = null) {
+  const queue = queueProcessingResult.queue || queueEntry || null;
+  const results = Array.isArray(queueProcessingResult.results) ? queueProcessingResult.results : [];
+  const telegramDeliveries = results
+    .filter((entry) => entry.channelType === 'telegram')
+    .flatMap((entry) => (Array.isArray(entry.workerResult?.targets) ? entry.workerResult.targets : []));
+  const firstDelivery = telegramDeliveries[0] || null;
+  const sentTarget = (queue?.targets || []).find((target) => normalizePublishingQueueStatus(target.status) === 'sent') || null;
+
+  return {
+    queue,
+    queueStatus: normalizePublishingQueueStatus(queue?.status, queue?.status || 'pending'),
+    telegramDeliveries,
+    firstDelivery,
+    sentAt: sentTarget?.posted_at || null
+  };
 }
 
 export async function publishAutoDealToTelegramTestGroup({
@@ -453,7 +527,7 @@ export async function publishAutoDealToTelegramTestGroup({
     normalizedUrl: message.normalizedProductUrl || result?.productUrl
   });
   if (repostCheck.blocked) {
-    const repostReason = 'Repost-Sperre blockiert den automatischen Testgruppen-Post.';
+    const repostReason = repostCheck.blockReason || 'Deal-Lock blockiert den automatischen Testgruppen-Post.';
     insertAutoAlertLog({
       result,
       rule,
@@ -496,7 +570,14 @@ export async function publishAutoDealToTelegramTestGroup({
   }
 
   const testGroupConfig = getTelegramTestGroupConfig();
-  const postedAt = nowIso();
+  const queuePayload = buildAutoDealPublishingPayload({
+    result,
+    message,
+    decisionReasonText,
+    finalDecisionStatus,
+    learningContext,
+    sourceType
+  });
 
   logGeneratorDebug('AUTO DEAL TELEGRAM OUTPUT START', {
     keepaResultId: result?.id || null,
@@ -506,25 +587,106 @@ export async function publishAutoDealToTelegramTestGroup({
   });
 
   try {
-    const telegramResult = await sendTelegramPost({
-      text: message.text,
-      imageUrl: cleanText(result?.imageUrl) || undefined,
-      disableWebPagePreview: !cleanText(result?.imageUrl),
-      chatId: testGroupConfig.chatId
+    const queueEntry = createPublishingEntry({
+      sourceType: 'keepa_auto',
+      sourceId: result?.id || null,
+      originOverride: 'automatic',
+      payload: queuePayload,
+      targets: buildAutoDealPublishingTargets(result)
     });
 
-    savePostedDeal({
-      asin: result?.asin || '',
-      originalUrl: result?.productUrl || message.normalizedProductUrl || '',
-      finalUrl: message.affiliateProductUrl || result?.productUrl || '',
-      normalizedUrl: message.normalizedProductUrl || result?.productUrl || '',
-      title: result?.title || '',
-      currentPrice: result?.currentPrice === null || result?.currentPrice === undefined ? '' : String(result.currentPrice),
-      oldPrice: '',
+    logGeneratorDebug('AUTO DEAL SAVED TO QUEUE', {
+      keepaResultId: result?.id || null,
+      asin: cleanText(result?.asin).toUpperCase(),
       sellerType,
-      postedAt,
-      channel: 'TELEGRAM'
+      queueId: queueEntry?.id || null
     });
+
+    const queueProcessingResult = await processPublishingQueueEntry(queueEntry.id);
+    const summary = summarizeAutoDealQueue(queueProcessingResult, queueEntry);
+
+    if (isFailedPublishingQueueStatus(summary.queueStatus)) {
+      const failedTarget = (summary.queue?.targets || []).find((target) => normalizePublishingQueueStatus(target.status) === 'failed') || null;
+      const failedReason = failedTarget?.error_message || 'Publisher konnte den Auto-Deal nicht versenden.';
+
+      insertAutoAlertLog({
+        result,
+        rule,
+        message,
+        status: 'failed',
+        payload: {
+          ...basePayload,
+          telegramStatus: 'failed',
+          queueId: summary.queue?.id || null,
+          queueStatus: summary.queueStatus
+        },
+        errorMessage: failedReason
+      });
+      updateKeepaResultState(result?.id, {
+        workflowStatus: 'geprueft'
+      });
+
+      logGeneratorDebug('AUTO DEAL TELEGRAM OUTPUT BLOCKED', {
+        keepaResultId: result?.id || null,
+        asin: cleanText(result?.asin).toUpperCase(),
+        sellerType,
+        decisionStatus: finalDecisionStatus,
+        reason: failedReason,
+        queueId: summary.queue?.id || null
+      });
+      logGeneratorDebug('TELEGRAM OUTPUT FAILED', {
+        sourceType,
+        keepaResultId: result?.id || null,
+        asin: cleanText(result?.asin).toUpperCase(),
+        reason: failedReason,
+        queueId: summary.queue?.id || null
+      });
+
+      return {
+        channelType: 'telegram_test_group',
+        status: 'failed',
+        decisionStatus: finalDecisionStatus,
+        reason: failedReason,
+        queueId: summary.queue?.id || null,
+        queueStatus: summary.queueStatus
+      };
+    }
+
+    if (summary.queueStatus !== 'sent') {
+      insertAutoAlertLog({
+        result,
+        rule,
+        message,
+        status: 'stored',
+        payload: {
+          ...basePayload,
+          telegramStatus: summary.queueStatus,
+          queueId: summary.queue?.id || null,
+          queueStatus: summary.queueStatus
+        }
+      });
+      updateKeepaResultState(result?.id, {
+        workflowStatus: 'geprueft'
+      });
+
+      logGeneratorDebug('AUTO DEAL FLOW CONNECTED TO PUBLISHER', {
+        keepaResultId: result?.id || null,
+        asin: cleanText(result?.asin).toUpperCase(),
+        sellerType,
+        queueId: summary.queue?.id || null,
+        queueStatus: summary.queueStatus
+      });
+
+      return {
+        channelType: 'telegram_test_group',
+        status: 'stored',
+        decisionStatus: finalDecisionStatus,
+        reason: decisionReasonText,
+        queueId: summary.queue?.id || null,
+        queueStatus: summary.queueStatus,
+        messagePreview: message.preview
+      };
+    }
 
     insertAutoAlertLog({
       result,
@@ -534,35 +696,47 @@ export async function publishAutoDealToTelegramTestGroup({
       payload: {
         ...basePayload,
         telegramStatus: 'sent',
-        telegramMessageId: telegramResult?.messageId || null,
-        telegramChatId: telegramResult?.chatId || testGroupConfig.chatId || null
+        queueId: summary.queue?.id || null,
+        queueStatus: summary.queueStatus,
+        telegramMessageId: summary.firstDelivery?.messageId || null,
+        telegramChatId: summary.firstDelivery?.chatId || summary.firstDelivery?.targetChatId || testGroupConfig.chatId || null
       }
     });
     updateKeepaResultState(result?.id, {
       workflowStatus: 'alert_gesendet',
       incrementAlertCount: true,
-      lastAlertedAt: postedAt
+      lastAlertedAt: summary.sentAt || nowIso()
     });
 
+    logGeneratorDebug('AUTO DEAL FLOW CONNECTED TO PUBLISHER', {
+      keepaResultId: result?.id || null,
+      asin: cleanText(result?.asin).toUpperCase(),
+      sellerType,
+      queueId: summary.queue?.id || null,
+      queueStatus: summary.queueStatus
+    });
     logGeneratorDebug('AUTO DEAL TELEGRAM OUTPUT SENT', {
       keepaResultId: result?.id || null,
       asin: cleanText(result?.asin).toUpperCase(),
       sellerType,
-      messageId: telegramResult?.messageId || null,
-      chatId: telegramResult?.chatId || testGroupConfig.chatId || null
+      messageId: summary.firstDelivery?.messageId || null,
+      chatId: summary.firstDelivery?.chatId || summary.firstDelivery?.targetChatId || testGroupConfig.chatId || null,
+      queueId: summary.queue?.id || null
     });
     logGeneratorDebug('TELEGRAM OUTPUT SENT', {
       sourceType,
       keepaResultId: result?.id || null,
       asin: cleanText(result?.asin).toUpperCase(),
-      chatId: telegramResult?.chatId || testGroupConfig.chatId || null
+      chatId: summary.firstDelivery?.chatId || summary.firstDelivery?.targetChatId || testGroupConfig.chatId || null,
+      queueId: summary.queue?.id || null
     });
     logGeneratorDebug('TELEGRAM TEST POST SENT', {
       keepaResultId: result?.id || null,
       asin: cleanText(result?.asin).toUpperCase(),
       sellerType,
-      messageId: telegramResult?.messageId || null,
-      chatId: telegramResult?.chatId || testGroupConfig.chatId || null
+      messageId: summary.firstDelivery?.messageId || null,
+      chatId: summary.firstDelivery?.chatId || summary.firstDelivery?.targetChatId || testGroupConfig.chatId || null,
+      queueId: summary.queue?.id || null
     });
 
     return {
@@ -570,21 +744,25 @@ export async function publishAutoDealToTelegramTestGroup({
       status: 'sent',
       decisionStatus: finalDecisionStatus,
       reason: decisionReasonText,
-      sentAt: postedAt,
-      chatId: telegramResult?.chatId || testGroupConfig.chatId || null,
-      messageId: telegramResult?.messageId || null,
+      sentAt: summary.sentAt || null,
+      chatId: summary.firstDelivery?.chatId || summary.firstDelivery?.targetChatId || testGroupConfig.chatId || null,
+      messageId: summary.firstDelivery?.messageId || null,
+      queueId: summary.queue?.id || null,
+      queueStatus: summary.queueStatus,
       messagePreview: message.preview
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Telegram-Testgruppen-Output fehlgeschlagen.';
+    const isDealLockError = error instanceof Error && typeof error.code === 'string' && error.code.startsWith('DEAL_LOCK_');
+
     insertAutoAlertLog({
       result,
       rule,
       message,
-      status: 'failed',
+      status: isDealLockError ? 'blocked' : 'failed',
       payload: {
         ...basePayload,
-        telegramStatus: 'failed'
+        telegramStatus: isDealLockError ? 'blocked' : 'failed'
       },
       errorMessage
     });
@@ -599,23 +777,16 @@ export async function publishAutoDealToTelegramTestGroup({
       decisionStatus: finalDecisionStatus,
       reason: errorMessage
     });
-    logGeneratorDebug('TELEGRAM OUTPUT FAILED', {
+    logGeneratorDebug(isDealLockError ? 'TELEGRAM TEST POST BLOCKED' : 'TELEGRAM OUTPUT FAILED', {
       sourceType,
       keepaResultId: result?.id || null,
       asin: cleanText(result?.asin).toUpperCase(),
       reason: errorMessage
     });
-    logGeneratorDebug('TELEGRAM TEST POST BLOCKED', {
-      keepaResultId: result?.id || null,
-      asin: cleanText(result?.asin).toUpperCase(),
-      sellerType,
-      decisionStatus: finalDecisionStatus,
-      reason: errorMessage
-    });
 
     return {
       channelType: 'telegram_test_group',
-      status: 'failed',
+      status: isDealLockError ? 'blocked' : 'failed',
       decisionStatus: finalDecisionStatus,
       reason: errorMessage
     };

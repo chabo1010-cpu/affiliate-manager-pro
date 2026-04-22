@@ -1,4 +1,5 @@
 import { getDb } from '../db.js';
+import { cleanText, savePostedDeal } from './dealHistoryService.js';
 
 const db = getDb();
 
@@ -15,6 +16,24 @@ export async function processFacebookPublishingTarget(target, queuePayload) {
       : target.image_source === 'upload'
         ? queuePayload.imageVariants?.upload || ''
         : '';
+
+  savePostedDeal({
+    asin: queuePayload.asin || '',
+    originalUrl: queuePayload.link,
+    normalizedUrl: queuePayload.normalizedUrl || queuePayload.link,
+    title: queuePayload.title,
+    currentPrice: queuePayload.currentPrice || '',
+    oldPrice: queuePayload.oldPrice || '',
+    sellerType: queuePayload.sellerType || 'FBM',
+    postedAt: new Date().toISOString(),
+    channel: 'FACEBOOK',
+    couponCode: queuePayload.couponCode || '',
+    sourceType: cleanText(queuePayload.databaseSourceType) || 'publisher_queue',
+    sourceId: queuePayload.generatorPostId || queuePayload.sourceId || null,
+    queueId: target.queue_id,
+    origin: cleanText(queuePayload.databaseOrigin) || 'automatic',
+    decisionReason: 'Facebook Queue-Target erfolgreich verarbeitet.'
+  });
 
   return {
     status: 'facebook-session-ready',

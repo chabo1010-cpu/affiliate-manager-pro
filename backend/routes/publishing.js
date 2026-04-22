@@ -14,6 +14,7 @@ import {
   runPublishingWorkers,
   saveFacebookWorkerSettings
 } from '../services/publisherService.js';
+import { getTelegramBotClientConfig, saveTelegramBotClientConfig } from '../services/telegramBotClientService.js';
 
 const router = Router();
 
@@ -39,6 +40,10 @@ router.get('/logs', (req, res) => {
 
 router.get('/workers/status', (req, res) => {
   res.json(getWorkerStatus());
+});
+
+router.get('/telegram-bot-client', requireAdmin, (req, res) => {
+  res.json({ item: getTelegramBotClientConfig() });
 });
 
 router.post('/generator', (req, res) => {
@@ -67,7 +72,12 @@ router.post('/generator', (req, res) => {
       error: error instanceof Error ? error.message : 'Generator-Queue konnte nicht erstellt werden.',
       ...debugPayload
     });
-    res.status(400).json({ error: error instanceof Error ? error.message : 'Generator-Queue konnte nicht erstellt werden.' });
+    const statusCode =
+      error instanceof Error && typeof error.code === 'string' && error.code.startsWith('DEAL_LOCK_') ? 409 : 400;
+    res.status(statusCode).json({
+      error: error instanceof Error ? error.message : 'Generator-Queue konnte nicht erstellt werden.',
+      dealLock: error instanceof Error && error.dealLock ? error.dealLock : null
+    });
   }
 });
 
@@ -86,6 +96,10 @@ router.post('/queue/:id/retry', requireAdmin, (req, res) => {
 
 router.put('/facebook-worker', requireAdmin, (req, res) => {
   res.json({ item: saveFacebookWorkerSettings(req.body ?? {}) });
+});
+
+router.put('/telegram-bot-client', requireAdmin, (req, res) => {
+  res.json({ item: saveTelegramBotClientConfig(req.body ?? {}) });
 });
 
 export default router;

@@ -133,6 +133,8 @@ router.post('/check', async (req, res) => {
   });
   const responsePayload = {
     blocked: result.blocked === true,
+    blockCode: result.blockCode || '',
+    blockReason: result.blockReason || '',
     lastPostedAt: result.lastDeal?.postedAt || null,
     minPrice: result.minPrice ?? null,
     maxPrice: result.maxPrice ?? null,
@@ -140,9 +142,11 @@ router.post('/check', async (req, res) => {
     remainingSeconds: Number.isFinite(result.remainingSeconds) ? result.remainingSeconds : 0,
     postingCount: result.postingCount ?? 0,
     asin: result.asin || null,
+    dealHash: result.dealHash || null,
     normalizedUrl: result.normalizedUrl || null,
     resolvedFinalUrl: identity.resolvedFinalUrl || null,
-    lastDeal: result.lastDeal || null
+    lastDeal: result.lastDeal || null,
+    activeRegistryLock: result.activeRegistryLock || null
   };
 
   try {

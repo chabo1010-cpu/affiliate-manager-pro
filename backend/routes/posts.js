@@ -66,9 +66,19 @@ router.post('/direct', upload.single('uploadedImageFile'), async (req, res) => {
       error: error instanceof Error ? error.message : 'Direkt-Posting fehlgeschlagen',
       ...debugPayload
     });
-    return res.status(500).json({
+    const statusCode =
+      error instanceof Error && typeof error.code === 'string'
+        ? error.code.startsWith('DEAL_LOCK_')
+          ? 409
+          : error.code === 'PUBLISHING_QUEUE_FAILED'
+            ? 502
+            : 500
+        : 500;
+    return res.status(statusCode).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Direkt-Posting fehlgeschlagen'
+      error: error instanceof Error ? error.message : 'Direkt-Posting fehlgeschlagen',
+      dealLock: error instanceof Error && error.dealLock ? error.dealLock : null,
+      queue: error instanceof Error && error.queue ? error.queue : null
     });
   }
 });

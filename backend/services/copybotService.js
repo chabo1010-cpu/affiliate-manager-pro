@@ -9,8 +9,14 @@ import {
   normalizeSellerType,
   parseNumber
 } from './dealHistoryService.js';
+import { syncImportedDealState } from './databaseService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
-import { getKeepaDrawerControlConfig, loadKeepaProductContext } from './keepaService.js';
+import { loadKeepaClientByAsin } from './keepaClientService.js';
+import {
+  getKeepaDrawerControlConfig,
+  getKeepaSettings,
+  loadStoredInternetComparisonContext
+} from './keepaService.js';
 import { evaluateLearningRoute } from './learningLogicService.js';
 import { enqueueCopybotPublishing } from './publisherService.js';
 
@@ -665,6 +671,90 @@ function decideStatus({
   };
 }
 
+function buildCopybotReglerContext({
+  source,
+  pricingRule,
+  samplingRule,
+  sellerType,
+  score,
+  discount,
+  sellerRating,
+  baseDecision,
+  reviewStatuses
+}) {
+  const sellerConfig = getSellerTypeConfig(pricingRule, sellerType);
+  const sourceSampling = getSamplingThreshold(samplingRule, sellerType);
+  const ruleSampling = Number(sellerConfig.sampling ?? 100);
+
+  return {
+    mode: 'pricing_sampling_and_seller_type',
+    stage: 'pre_queue',
+    decisionStatus: baseDecision?.status || 'review',
+    decisionReason: baseDecision?.reason || '',
+    score,
+    discount,
+    sellerRating,
+    sampleValue: baseDecision?.samplingValue ?? null,
+    keepaOk: reviewStatuses?.keepaOk === true,
+    internetOk: reviewStatuses?.idealoOk === true,
+    source: source
+      ? {
+          id: source.id ?? null,
+          name: cleanText(source.name),
+          platform: cleanText(source.platform),
+          sourceType: cleanText(source.source_type)
+        }
+      : null,
+    pricingRule: pricingRule
+      ? {
+          id: pricingRule.id ?? null,
+          name: cleanText(pricingRule.name),
+          keepaRequired: pricingRule.keepa_required === 1,
+          internetRequired: pricingRule.idealo_required === 1,
+          autopostAboveScore: Number(pricingRule.autopost_above_score ?? 0),
+          manualReviewBelowScore: Number(pricingRule.manual_review_below_score ?? 0),
+          sellerThresholds: {
+            allow: sellerConfig.allow === true,
+            minDiscount: Number(sellerConfig.minDiscount ?? 0),
+            minScore: Number(sellerConfig.minScore ?? 0),
+            sampling: ruleSampling
+          },
+          fbmRequiresManualReview: sellerType === 'FBM' && pricingRule.fbm_requires_manual_review === 1,
+          minSellerRating:
+            sellerType === 'FBM' && pricingRule.min_seller_rating_fbm !== null && pricingRule.min_seller_rating_fbm !== undefined
+              ? Number(pricingRule.min_seller_rating_fbm)
+              : null
+        }
+      : null,
+    samplingRule: samplingRule
+      ? {
+          id: samplingRule.id ?? null,
+          name: cleanText(samplingRule.name),
+          defaultSampling: Number(samplingRule.default_sampling ?? 100),
+          sourceSampling,
+          finalSampling: Math.min(sourceSampling, ruleSampling),
+          minScore: samplingRule.min_score === null || samplingRule.min_score === undefined ? null : Number(samplingRule.min_score),
+          minDiscount:
+            samplingRule.min_discount === null || samplingRule.min_discount === undefined ? null : Number(samplingRule.min_discount),
+          dailyLimit: samplingRule.daily_limit === null || samplingRule.daily_limit === undefined ? null : Number(samplingRule.daily_limit)
+        }
+      : null
+  };
+}
+
+function buildCopybotQueueContext(source) {
+  return {
+    required: true,
+    mode: 'publisher_queue',
+    currentStatus: 'not_enqueued',
+    splitByPlatform: true,
+    preSendPersistence: true,
+    recoveryEnabled: true,
+    routeType: 'automatic',
+    channels: source?.platform ? [source.platform] : ['telegram']
+  };
+}
+
 export async function processImportedDeal(sourceId, input = {}) {
   const source = loadSourceById(sourceId);
   if (!source) {
@@ -758,21 +848,60 @@ export async function processImportedDeal(sourceId, input = {}) {
     sellerRating,
     title
   });
-  const keepaContext = await loadKeepaProductContext({
-    asin,
+  const reglerContext = buildCopybotReglerContext({
+    source,
+    pricingRule,
+    samplingRule,
     sellerType,
-    currentPrice,
-    title,
-    productUrl: affiliateUrl || normalizedUrl || resolvedOriginalUrl || originalUrl,
-    imageUrl: cleanText(input.imageUrl),
-    source: 'scrapper_import'
+    score,
+    discount: detectedDiscount,
+    sellerRating,
+    baseDecision,
+    reviewStatuses
   });
+  const keepaSettings = getKeepaSettings();
+  const internetContext = loadStoredInternetComparisonContext({
+    asin
+  });
+  let effectiveKeepaContext = {
+    available: false,
+    status: 'fallback_not_required',
+    cached: false,
+    reason: 'Marktvergleich liegt bereits vor.'
+  };
+
+  if (internetContext.available) {
+    logGeneratorDebug('INTERNET COMPARISON PRIMARY', {
+      sourceId,
+      asin,
+      sellerType,
+      comparisonStatus: internetContext.result?.comparisonStatus || internetContext.status
+    });
+  } else {
+    effectiveKeepaContext = await loadKeepaClientByAsin({
+      asin,
+      sellerType,
+      currentPrice,
+      title,
+      productUrl: affiliateUrl || normalizedUrl || resolvedOriginalUrl || originalUrl,
+      imageUrl: cleanText(input.imageUrl),
+      source: 'scrapper_import'
+    });
+
+    logGeneratorDebug('KEEPA FALLBACK USED', {
+      sourceId,
+      asin,
+      sellerType,
+      reason: internetContext.reason || 'Kein gespeicherter Marktvergleich vorhanden.'
+    });
+  }
 
   logGeneratorDebug('SCRAPPER CONNECTED TO LEARNING LOGIC', {
     sourceId,
     asin,
     sellerType,
-    keepaStatus: keepaContext?.status || 'missing'
+    keepaStatus: effectiveKeepaContext?.status || 'missing',
+    internetStatus: internetContext?.status || 'missing'
   });
 
   const learningContext = evaluateLearningRoute({
@@ -782,8 +911,13 @@ export async function processImportedDeal(sourceId, input = {}) {
     asin,
     sellerType,
     currentPrice,
-    keepaContext,
-    patternSupportEnabled: getKeepaDrawerControlConfig(sellerType).patternSupportEnabled === true
+    internetContext,
+    keepaContext: effectiveKeepaContext,
+    dealLockStatus: history,
+    reglerContext,
+    queueContext: buildCopybotQueueContext(source),
+    patternSupportEnabled: getKeepaDrawerControlConfig(sellerType).patternSupportEnabled === true,
+    marketMinGapPct: keepaSettings.strongDealMinComparisonGapPct
   });
   const timestamp = nowIso();
   const learningDecision = learningContext?.learning?.routingDecision || 'review';
@@ -805,7 +939,7 @@ export async function processImportedDeal(sourceId, input = {}) {
 
   if (history.blocked && finalStatus === 'posted') {
     finalStatus = 'review';
-    finalReason = 'Repost-Sperre blockiert Auto-Post.';
+    finalReason = history.blockReason || 'Deal-Lock blockiert Auto-Post.';
   }
 
   const result = db
@@ -937,6 +1071,25 @@ export async function processImportedDeal(sourceId, input = {}) {
     }
   });
 
+  syncImportedDealState({
+    sourceId: importedDealId,
+    asin,
+    normalizedUrl,
+    originalUrl,
+    title,
+    sellerType,
+    status: queueEntryId ? 'queued' : finalStatus,
+    queueId: queueEntryId,
+    decisionReason: finalReason,
+    origin: 'automatic',
+    meta: {
+      importedDealStatus: finalStatus,
+      learningDecision,
+      score,
+      detectedDiscount
+    }
+  });
+
   return {
     id: importedDealId,
     status: finalStatus,
@@ -990,7 +1143,7 @@ export function updateReviewDecision(id, action) {
       resolvedUrl: deal.normalized_url,
       asin: deal.asin
     });
-    enqueueCopybotPublishing({
+    const queueEntry = enqueueCopybotPublishing({
       sourceId: deal.id,
       payload: {
         title: deal.title,
@@ -1019,6 +1172,31 @@ export function updateReviewDecision(id, action) {
         { channelType: 'telegram', isEnabled: source?.platform === 'telegram', imageSource: 'standard' },
         { channelType: 'whatsapp', isEnabled: source?.platform === 'whatsapp', imageSource: 'standard' }
       ]
+    });
+
+    syncImportedDealState({
+      sourceId: deal.id,
+      asin: deal.asin,
+      normalizedUrl: linkRecord.valid ? linkRecord.normalizedUrl : deal.normalized_url,
+      originalUrl: linkRecord.valid ? linkRecord.affiliateUrl : deal.original_url,
+      title: deal.title,
+      sellerType: deal.seller_type,
+      status: 'queued',
+      queueId: queueEntry?.id ?? null,
+      decisionReason: 'Deal manuell freigegeben und in Queue gelegt.',
+      origin: 'manual'
+    });
+  } else {
+    syncImportedDealState({
+      sourceId: deal.id,
+      asin: deal.asin,
+      normalizedUrl: deal.normalized_url,
+      originalUrl: deal.original_url,
+      title: deal.title,
+      sellerType: deal.seller_type,
+      status: 'rejected',
+      decisionReason: 'Deal manuell verworfen.',
+      origin: 'manual'
     });
   }
 

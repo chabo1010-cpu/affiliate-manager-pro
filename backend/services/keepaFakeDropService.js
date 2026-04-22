@@ -655,6 +655,39 @@ export function buildKeepaChartSnapshot(resultInput = {}) {
   };
 }
 
+function roundMetricPrice(value) {
+  const numeric = parseNumber(value, null);
+  return numeric === null ? null : Math.round(numeric * 100) / 100;
+}
+
+export function extractKeepaFallbackMetrics(resultInput = {}) {
+  const result = normalizeResultInput(resultInput);
+  const payload = result.keepaPayload || {};
+  const stats = payload?.raw?.product?.stats || payload?.product?.stats || {};
+  const rawSeries = collectCandidateSeries(payload, result.currentPrice);
+  const fallbackSeries = buildFallbackSeries(result);
+  const analysisSeries = (rawSeries.length ? rawSeries : fallbackSeries).slice(-720);
+  const last90Series = getSeriesWindow(analysisSeries, 90);
+  const last180Series = getSeriesWindow(analysisSeries, 180);
+  const last90Prices = last90Series.map((item) => item.price).filter((item) => isFiniteNumber(item) && item > 0);
+  const last180Prices = last180Series.map((item) => item.price).filter((item) => isFiniteNumber(item) && item > 0);
+  const avg90 = average(last90Prices) ?? extractAverage(stats, ['avg90', 'avg']);
+  const avg180 = average(last180Prices) ?? extractAverage(stats, ['avg180', 'avg90', 'avg']);
+  const min90 = last90Prices.length ? Math.min(...last90Prices) : extractAverage(stats, ['min', 'current']);
+  const currentPrice = parseNumber(result.currentPrice, null);
+
+  return {
+    available: avg90 !== null || avg180 !== null || min90 !== null,
+    avg90: roundMetricPrice(avg90),
+    avg180: roundMetricPrice(avg180),
+    min90: roundMetricPrice(min90),
+    isLowest90: currentPrice !== null && min90 !== null ? currentPrice <= min90 + 0.01 : false,
+    currentPrice: roundMetricPrice(currentPrice),
+    historyPointCount: analysisSeries.length,
+    historySource: rawSeries.length ? 'keepa-history' : fallbackSeries.length ? 'derived-fallback' : 'empty'
+  };
+}
+
 function getFeedbackAdjustments() {
   const rows = db
     .prepare(

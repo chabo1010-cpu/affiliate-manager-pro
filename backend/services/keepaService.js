@@ -1,7 +1,7 @@
 import { getDb } from '../db.js';
 import { getKeepaConfig, getTelegramConfig } from '../env.js';
 import { publishAutoDealToTelegramTestGroup } from './autoDealPublisher.js';
-import { buildAmazonAffiliateLinkRecord } from './dealHistoryService.js';
+import { buildAmazonAffiliateLinkRecord, checkDealLockStatus } from './dealHistoryService.js';
 import { loadAmazonAffiliateContext } from './amazonAffiliateService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 import { evaluateLearningRoute } from './learningLogicService.js';
@@ -4651,6 +4651,54 @@ export async function loadKeepaProductContext(input = {}) {
   }
 }
 
+export function loadStoredInternetComparisonContext(input = {}) {
+  const asin = cleanText(input.asin).toUpperCase();
+  const settings = getKeepaSettings();
+  const requestedAt = nowIso();
+  const domainId =
+    DOMAIN_OPTIONS.some((item) => item.id === Number(input.domainId || settings.domainId))
+      ? Number(input.domainId || settings.domainId)
+      : settings.domainId;
+
+  if (!asin) {
+    return {
+      available: false,
+      status: 'missing_asin',
+      cached: false,
+      requestedAt,
+      reason: 'ASIN fehlt fuer den Internetvergleich.'
+    };
+  }
+
+  const existingRow = db.prepare(`SELECT * FROM keepa_results WHERE asin = ? AND domain_id = ? LIMIT 1`).get(asin, domainId);
+  const existingResult = existingRow ? buildResultDto(existingRow) : null;
+  const hasStoredMarketComparison = Boolean(
+    existingResult &&
+      ((existingResult.comparisonPrice !== null && existingResult.comparisonPrice > 0) ||
+        existingResult.priceDifferencePct !== null ||
+        cleanText(existingResult.comparisonSource))
+  );
+
+  if (!hasStoredMarketComparison) {
+    return {
+      available: false,
+      status: existingResult ? 'missing_market_comparison' : 'missing',
+      cached: Boolean(existingResult),
+      requestedAt,
+      result: existingResult,
+      reason: existingResult ? 'Kein gespeicherter Marktvergleich gefunden.' : 'Noch kein Produktkontext gespeichert.'
+    };
+  }
+
+  return {
+    available: true,
+    status: 'stored_market_comparison',
+    cached: true,
+    requestedAt,
+    result: existingResult
+  };
+}
+
 export async function runKeepaManualSearch(input = {}) {
   const filters = normalizeManualSearchInput(input);
   const confirmed = parseBool(input.confirmed, false);
@@ -4934,6 +4982,13 @@ async function maybeSendAlertsForResult(result, rule) {
           ...result,
           amazonAffiliate: amazonContext?.result || null
         };
+  const dealLockStatus = checkDealLockStatus({
+    asin: result.asin,
+    url: enrichedResult.productUrl || result.productUrl,
+    normalizedUrl: enrichedResult.productUrl || result.productUrl,
+    sourceType: 'auto_deals',
+    origin: 'automatic'
+  });
 
   const learningContext = evaluateLearningRoute({
     sourceType: 'auto_deals',
@@ -4942,9 +4997,31 @@ async function maybeSendAlertsForResult(result, rule) {
     asin: result.asin,
     sellerType: result.sellerType,
     currentPrice: result.currentPrice,
+    internetContext: {
+      available: Boolean(
+        (result.comparisonPrice !== null && result.comparisonPrice !== undefined) ||
+          result.priceDifferencePct !== null ||
+          cleanText(result.comparisonSource)
+      ),
+      status: cleanText(result.comparisonStatus) || 'not_connected',
+      requestedAt: nowIso(),
+      result
+    },
     keepaResultRecord: result,
     amazonContext,
-    patternSupportEnabled: drawerConfig.patternSupportEnabled === true
+    dealLockStatus,
+    queueContext: {
+      required: true,
+      mode: 'publisher_queue',
+      currentStatus: 'not_enqueued',
+      splitByPlatform: true,
+      preSendPersistence: true,
+      recoveryEnabled: true,
+      routeType: 'automatic',
+      channels: ['telegram']
+    },
+    patternSupportEnabled: drawerConfig.patternSupportEnabled === true,
+    marketMinGapPct: settings.strongDealMinComparisonGapPct
   });
 
   logGeneratorDebug('AUTO DEAL ROUTED THROUGH LEARNING LOGIC', {
