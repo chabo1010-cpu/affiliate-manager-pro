@@ -8,9 +8,32 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000
 const tabs = [
   { label: 'Queue', path: '/publishing' },
   { label: 'Worker Status', path: '/publishing/workers' },
+  { label: 'Telegram Bot', path: '/publishing/telegram' },
+  { label: 'WhatsApp Client', path: '/publishing/whatsapp' },
   { label: 'Facebook Worker', path: '/publishing/facebook' },
   { label: 'Logs', path: '/publishing/logs' }
 ];
+
+function getDefaultTelegramBotConfig() {
+  return {
+    enabled: true,
+    defaultRetryLimit: 3,
+    tokenConfigured: false,
+    fallbackChatConfigured: false,
+    targets: [],
+    effectiveTargets: []
+  };
+}
+
+function getDefaultWhatsappClientConfig() {
+  return {
+    enabled: false,
+    endpointConfigured: false,
+    senderConfigured: false,
+    sender: '',
+    retryLimit: 3
+  };
+}
 
 function PublishingPage() {
   const { user } = useAuth();
@@ -21,6 +44,8 @@ function PublishingPage() {
   const [workerStatus, setWorkerStatus] = useState(null);
   const [status, setStatus] = useState('');
   const [loading, setLoading] = useState(true);
+  const [telegramBotConfig, setTelegramBotConfig] = useState(getDefaultTelegramBotConfig);
+  const [whatsappClientConfig, setWhatsappClientConfig] = useState(getDefaultWhatsappClientConfig);
   const [facebookSettings, setFacebookSettings] = useState({
     facebookEnabled: false,
     facebookSessionMode: 'persistent',
@@ -49,14 +74,23 @@ function PublishingPage() {
   async function loadAll() {
     setLoading(true);
     try {
-      const [queueData, logsData, workerData] = await Promise.all([
+      const [queueData, logsData, workerData, telegramBotData] = await Promise.all([
         apiFetch('/api/publishing/queue'),
         apiFetch('/api/publishing/logs'),
-        apiFetch('/api/publishing/workers/status')
+        apiFetch('/api/publishing/workers/status'),
+        isAdmin ? apiFetch('/api/publishing/telegram-bot-client') : Promise.resolve(null)
       ]);
       setQueue(queueData.items || []);
       setLogs(logsData.items || []);
       setWorkerStatus(workerData);
+      setTelegramBotConfig({
+        ...getDefaultTelegramBotConfig(),
+        ...(telegramBotData?.item || {})
+      });
+      setWhatsappClientConfig({
+        ...getDefaultWhatsappClientConfig(),
+        ...(workerData?.whatsapp || {})
+      });
       setFacebookSettings({
         facebookEnabled: Boolean(workerData?.facebook?.enabled),
         facebookSessionMode: workerData?.facebook?.sessionMode || 'persistent',
@@ -72,7 +106,7 @@ function PublishingPage() {
 
   useEffect(() => {
     void loadAll();
-  }, [user?.role]);
+  }, [isAdmin, user?.role]);
 
   async function runWorkers(channelType) {
     if (!isAdmin) {
@@ -121,6 +155,65 @@ function PublishingPage() {
     }
   }
 
+  function addTelegramTarget() {
+    setTelegramBotConfig((prev) => ({
+      ...prev,
+      targets: [
+        ...(prev.targets || []),
+        {
+          id: `new-${Date.now()}-${prev.targets?.length || 0}`,
+          name: '',
+          chatId: '',
+          isActive: true,
+          useForPublishing: true
+        }
+      ]
+    }));
+  }
+
+  function updateTelegramTarget(index, patch) {
+    setTelegramBotConfig((prev) => ({
+      ...prev,
+      targets: (prev.targets || []).map((target, targetIndex) =>
+        targetIndex === index ? { ...target, ...patch } : target
+      )
+    }));
+  }
+
+  function removeTelegramTarget(index) {
+    setTelegramBotConfig((prev) => ({
+      ...prev,
+      targets: (prev.targets || []).filter((_, targetIndex) => targetIndex !== index)
+    }));
+  }
+
+  async function saveTelegramBotClient() {
+    if (!isAdmin) {
+      return;
+    }
+
+    try {
+      await apiFetch('/api/publishing/telegram-bot-client', {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: telegramBotConfig.enabled,
+          defaultRetryLimit: telegramBotConfig.defaultRetryLimit,
+          targets: (telegramBotConfig.targets || []).map((target) => ({
+            id: typeof target.id === 'number' ? target.id : undefined,
+            name: target.name,
+            chatId: target.chatId,
+            isActive: target.isActive,
+            useForPublishing: target.useForPublishing
+          }))
+        })
+      });
+      setStatus('Telegram Bot Client gespeichert.');
+      void loadAll();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Telegram Bot Client konnte nicht gespeichert werden.');
+    }
+  }
+
   return (
     <Layout>
       <div style={{ display: 'grid', gap: '1rem' }}>
@@ -130,8 +223,8 @@ function PublishingPage() {
               <p className="section-title">Publishing / Output</p>
               <h1 className="page-title">Versand, Queue und Worker getrennt vom Generator</h1>
               <p className="text-muted" style={{ margin: '0.35rem 0 0' }}>
-                Dieser Bereich ist fuer Ausgabe, Versandstatus und Worker gedacht. Generator und Logik-Zentrale
-                liefern Inhalte und Entscheidungen, Publishing uebernimmt den eigentlichen Output.
+                Dieser Bereich ist fuer Ausgabe, Versandstatus und Worker gedacht. Generator und Templates
+                liefern Inhalte, Publishing uebernimmt den eigentlichen Output.
               </p>
             </div>
             <span className="badge">Entscheidung -&gt; Queue -&gt; Worker -&gt; Zielkanal</span>
@@ -171,7 +264,12 @@ function PublishingPage() {
                   {item.source_type} · Retry {item.retry_count} · erstellt {new Date(item.created_at).toLocaleString('de-DE')}
                 </p>
                 <p className="text-muted" style={{ margin: 0 }}>
-                  Targets: {(item.targets || []).map((target) => `${target.channel_type}:${target.image_source}:${target.status}`).join(' | ')}
+                  Targets: {(item.targets || [])
+                    .map((target) => {
+                      const targetLabel = target.target_label ? `/${target.target_label}` : '';
+                      return `${target.channel_type}${targetLabel}:${target.image_source}:${target.status}`;
+                    })
+                    .join(' | ')}
                 </p>
                 {isAdmin && <button className="secondary" onClick={() => void retryQueue(item.id)}>Erneut senden</button>}
               </div>
@@ -187,17 +285,196 @@ function PublishingPage() {
               <h1 className="page-title">Dispatcher und Kanal-Worker</h1>
             </div>
             <div className="responsive-grid">
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Telegram Bot Client</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {workerStatus?.telegramBot?.publishTargets || 0} aktive Ziele bei {workerStatus?.telegramBot?.configuredTargets || 0} gespeicherten Gruppen
+                </p>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  Retry Limit {workerStatus?.telegramBot?.retryLimit || 0} Â· Token {workerStatus?.telegramBot?.tokenConfigured ? 'vorhanden' : 'fehlt'}
+                </p>
+              </div>
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>WhatsApp Client</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {workerStatus?.whatsapp?.enabled ? 'Output aktiv' : 'Output deaktiviert'} · Endpoint {workerStatus?.whatsapp?.endpointConfigured ? 'vorhanden' : 'fehlt'}
+                </p>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  Retry Limit {workerStatus?.whatsapp?.retryLimit || 0} · Sender {workerStatus?.whatsapp?.senderConfigured ? 'vorhanden' : 'optional'}
+                </p>
+              </div>
+            </div>
+            <div className="responsive-grid">
               {(workerStatus?.channels || []).map((item) => (
                 <div key={item.channel_type} className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
                   <strong>{item.channel_type}</strong>
-                  <p className="text-muted" style={{ margin: 0 }}>waiting {item.waiting || 0}</p>
-                  <p className="text-muted" style={{ margin: 0 }}>processing {item.processing || 0}</p>
-                  <p className="text-muted" style={{ margin: 0 }}>posted {item.posted || 0}</p>
+                  <p className="text-muted" style={{ margin: 0 }}>pending {item.pending ?? item.waiting ?? 0}</p>
+                  <p className="text-muted" style={{ margin: 0 }}>sending {item.sending ?? item.processing ?? 0}</p>
+                  <p className="text-muted" style={{ margin: 0 }}>retry {item.retry || 0}</p>
+                  <p className="text-muted" style={{ margin: 0 }}>sent {item.sent ?? item.posted ?? 0}</p>
                   <p className="text-muted" style={{ margin: 0 }}>failed {item.failed || 0}</p>
                   {isAdmin && <button className="secondary" onClick={() => void runWorkers(item.channel_type)}>Worker starten</button>}
                 </div>
               ))}
             </div>
+          </section>
+        )}
+
+        {!loading && currentTab === '/publishing/telegram' && (
+          <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
+              <div>
+                <p className="section-title">Telegram Bot Client</p>
+                <h1 className="page-title">Output-Ziele, Retry und Publisher-Anbindung</h1>
+              </div>
+              {isAdmin && <button className="secondary" onClick={addTelegramTarget}>Zielgruppe hinzufuegen</button>}
+            </div>
+
+            {!isAdmin && (
+              <p className="text-muted" style={{ margin: 0 }}>
+                Nur Admin kann den Telegram Bot Client konfigurieren.
+              </p>
+            )}
+
+            <label className="checkbox-card">
+              <span>Telegram Output aktiv</span>
+              <input
+                type="checkbox"
+                checked={telegramBotConfig.enabled}
+                disabled={!isAdmin}
+                onChange={(event) => setTelegramBotConfig((prev) => ({ ...prev, enabled: event.target.checked }))}
+              />
+            </label>
+
+            <div className="form-row">
+              <input
+                type="number"
+                min="0"
+                value={telegramBotConfig.defaultRetryLimit}
+                disabled={!isAdmin}
+                placeholder="Retry Limit"
+                onChange={(event) =>
+                  setTelegramBotConfig((prev) => ({
+                    ...prev,
+                    defaultRetryLimit: Number(event.target.value || 0)
+                  }))
+                }
+              />
+            </div>
+
+            <div className="responsive-grid">
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Bot Token</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {telegramBotConfig.tokenConfigured ? 'vorhanden' : 'fehlt'}
+                </p>
+              </div>
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>ENV Fallback</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {telegramBotConfig.fallbackChatConfigured ? 'Telegram Chat per ENV vorhanden' : 'kein ENV Chat gesetzt'}
+                </p>
+              </div>
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Aktive Publisher-Ziele</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {telegramBotConfig.effectiveTargets?.length || 0} Ziele werden vom Publisher angesteuert.
+                </p>
+              </div>
+            </div>
+
+            {(telegramBotConfig.targets || []).map((target, index) => (
+              <div key={target.id || index} className="radio-card" style={{ display: 'grid', gap: '0.75rem' }}>
+                <div className="form-row">
+                  <input
+                    value={target.name || ''}
+                    disabled={!isAdmin}
+                    placeholder="Name der Zielgruppe"
+                    onChange={(event) => updateTelegramTarget(index, { name: event.target.value })}
+                  />
+                  <input
+                    value={target.chatId || ''}
+                    disabled={!isAdmin}
+                    placeholder="Chat ID / Channel ID"
+                    onChange={(event) => updateTelegramTarget(index, { chatId: event.target.value })}
+                  />
+                </div>
+                <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                  <label className="checkbox-card" style={{ flex: 1 }}>
+                    <span>Ziel aktiv</span>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(target.isActive)}
+                      disabled={!isAdmin}
+                      onChange={(event) => updateTelegramTarget(index, { isActive: event.target.checked })}
+                    />
+                  </label>
+                  <label className="checkbox-card" style={{ flex: 1 }}>
+                    <span>Fuer Publisher verwenden</span>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(target.useForPublishing)}
+                      disabled={!isAdmin}
+                      onChange={(event) => updateTelegramTarget(index, { useForPublishing: event.target.checked })}
+                    />
+                  </label>
+                </div>
+                {isAdmin && (
+                  <button className="secondary" onClick={() => removeTelegramTarget(index)}>
+                    Zielgruppe entfernen
+                  </button>
+                )}
+              </div>
+            ))}
+
+            {!telegramBotConfig.targets?.length && (
+              <p className="text-muted" style={{ margin: 0 }}>
+                Noch keine persistenten Telegram-Zielgruppen gespeichert. Wenn keine Zielgruppe hinterlegt ist, nutzt der
+                Publisher automatisch den ENV Fallback.
+              </p>
+            )}
+
+            {isAdmin && <button className="primary" onClick={() => void saveTelegramBotClient()}>Speichern</button>}
+          </section>
+        )}
+
+        {!loading && currentTab === '/publishing/whatsapp' && (
+          <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>
+            <div>
+              <p className="section-title">WhatsApp Client</p>
+              <h1 className="page-title">Queue, Retry und Gateway-Anbindung</h1>
+            </div>
+            <div className="responsive-grid">
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Status</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {whatsappClientConfig.enabled ? 'WhatsApp Output aktiviert' : 'WhatsApp Output deaktiviert'}
+                </p>
+              </div>
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Gateway Endpoint</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {whatsappClientConfig.endpointConfigured ? 'Endpoint konfiguriert' : 'Endpoint fehlt in der ENV'}
+                </p>
+              </div>
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Retry Limit</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {whatsappClientConfig.retryLimit || 0} Wiederholungen pro Queue-Target
+                </p>
+              </div>
+              <div className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
+                <strong>Sender</strong>
+                <p className="text-muted" style={{ margin: 0 }}>
+                  {whatsappClientConfig.senderConfigured ? whatsappClientConfig.sender || 'gesetzt' : 'nicht gesetzt'}
+                </p>
+              </div>
+            </div>
+            <p className="text-muted" style={{ margin: 0 }}>
+              Der WhatsApp Client speichert Deals zuerst in der Queue, sendet danach an das konfigurierte Gateway und
+              laesst Fehler ueber Retry oder Recovery im Publisher weiterlaufen. Die Konfiguration selbst kommt aus der
+              Backend-ENV.
+            </p>
           </section>
         )}
 

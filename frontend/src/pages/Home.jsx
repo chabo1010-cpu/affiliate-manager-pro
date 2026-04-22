@@ -1,138 +1,111 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import Layout from '../components/layout/Layout';
-import { useAuth } from '../context/AuthContext';
-import './Home.css';
+import { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
+import Layout from '../components/layout/Layout'
+import { useAuth } from '../context/AuthContext'
+import './Home.css'
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'
 
 function toNumber(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function getStatusTone(status) {
-  const normalized = String(status || '').trim().toLowerCase();
-
-  if (
-    normalized.includes('fehler') ||
-    normalized.includes('kritisch') ||
-    normalized.includes('ausfall') ||
-    normalized.includes('auth_')
-  ) {
-    return 'danger';
-  }
-
-  if (
-    normalized.includes('review') ||
-    normalized.includes('warn') ||
-    normalized.includes('vorbereitet') ||
-    normalized.includes('deaktiviert') ||
-    normalized.includes('nicht')
-  ) {
-    return 'warning';
-  }
-
-  if (normalized.includes('live') || normalized.includes('fokus') || normalized.includes('testgruppe')) {
-    return 'info';
-  }
-
-  if (
-    normalized.includes('aktiv') ||
-    normalized.includes('verbunden') ||
-    normalized.includes('stabil') ||
-    normalized.includes('ok') ||
-    normalized.includes('bereit') ||
-    normalized.includes('pflicht')
-  ) {
-    return 'success';
-  }
-
-  return 'info';
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
 }
 
 function formatDateTime(value) {
   if (!value) {
-    return '-';
+    return '-'
   }
 
-  const parsed = new Date(value);
+  const parsed = new Date(value)
   if (Number.isNaN(parsed.getTime())) {
-    return value;
+    return value
   }
 
   return new Intl.DateTimeFormat('de-DE', {
     dateStyle: 'short',
     timeStyle: 'short'
-  }).format(parsed);
+  }).format(parsed)
 }
 
-function toTimestamp(value) {
+function shortenText(value, maxLength = 84) {
   if (!value) {
-    return 0;
+    return '-'
   }
 
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? 0 : parsed.getTime();
-}
-
-function shortenText(value, maxLength = 96) {
-  if (!value) {
-    return '-';
-  }
-
-  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  const normalized = String(value).replace(/\s+/g, ' ').trim()
   if (normalized.length <= maxLength) {
-    return normalized;
+    return normalized
   }
 
-  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`
 }
 
-function formatLogTitle(log) {
-  const worker = String(log?.worker_type || '').trim().toLowerCase();
-  const workerLabel = worker ? worker.charAt(0).toUpperCase() + worker.slice(1) : 'System';
-
-  if (log?.event_type === 'target.posted') {
-    return `${workerLabel} Output`;
-  }
-
-  if (log?.event_type === 'target.failed') {
-    return `${workerLabel} Fehler`;
-  }
-
-  if (log?.event_type === 'queue.created') {
-    return 'Queue erstellt';
-  }
-
-  if (log?.event_type === 'target.retry') {
-    return `${workerLabel} Retry`;
-  }
-
-  return worker ? workerLabel : 'Systemevent';
+function sortByTimeDesc(items = []) {
+  return [...items].sort((left, right) => {
+    const leftTime = new Date(left.time || left.createdAt || left.updatedAt || 0).getTime()
+    const rightTime = new Date(right.time || right.createdAt || right.updatedAt || 0).getTime()
+    return rightTime - leftTime
+  })
 }
 
-function pickLatest(items = []) {
-  return [...items]
-    .filter((item) => item && item.at)
-    .sort((left, right) => toTimestamp(right.at) - toTimestamp(left.at))[0] || null;
+function getStatusTone(status) {
+  const normalized = String(status || '').trim().toLowerCase()
+
+  if (
+    normalized.includes('fehler') ||
+    normalized.includes('kritisch') ||
+    normalized.includes('failed') ||
+    normalized.includes('error') ||
+    normalized.includes('block')
+  ) {
+    return 'danger'
+  }
+
+  if (
+    normalized.includes('warn') ||
+    normalized.includes('deaktiviert') ||
+    normalized.includes('leer') ||
+    normalized.includes('pending') ||
+    normalized.includes('retry') ||
+    normalized.includes('konfiguration')
+  ) {
+    return 'warning'
+  }
+
+  if (
+    normalized.includes('aktiv') ||
+    normalized.includes('verbunden') ||
+    normalized.includes('bereit') ||
+    normalized.includes('geschuetzt') ||
+    normalized.includes('sent') ||
+    normalized.includes('ok')
+  ) {
+    return 'success'
+  }
+
+  return 'info'
 }
 
 function HomePage() {
-  const { user } = useAuth();
+  const { user } = useAuth()
   const [dashboard, setDashboard] = useState({
-    overview: null,
+    amazon: null,
+    bot: null,
+    copybot: null,
     keepaStatus: null,
-    amazonStatus: null,
     queue: null,
     logs: null,
-    workers: null
-  });
-  const [loading, setLoading] = useState(true);
-  const [status, setStatus] = useState('');
+    workers: null,
+    repostSettings: null,
+    history: null,
+    sources: null,
+    copybotLogs: null
+  })
+  const [loading, setLoading] = useState(true)
+  const [status, setStatus] = useState('')
 
   useEffect(() => {
-    let cancelled = false;
+    let cancelled = false
 
     async function apiFetch(path) {
       const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -140,443 +113,401 @@ function HomePage() {
           'Content-Type': 'application/json',
           'X-User-Role': user?.role || ''
         }
-      });
-      const data = await response.json().catch(() => ({}));
+      })
+      const data = await response.json().catch(() => ({}))
 
       if (!response.ok) {
-        throw new Error(data?.error || `Request fehlgeschlagen (${response.status}).`);
+        throw new Error(data?.error || `Request fehlgeschlagen (${response.status}).`)
       }
 
-      return data;
+      return data
     }
 
     async function loadDashboard() {
       try {
-        setLoading(true);
-        setStatus('');
+        setLoading(true)
+        setStatus('')
 
         const results = await Promise.allSettled([
-          apiFetch('/api/learning/overview'),
+          apiFetch('/api/bot'),
+          apiFetch('/api/copybot/overview'),
           apiFetch('/api/keepa/status'),
           apiFetch('/api/amazon/status'),
           apiFetch('/api/publishing/queue'),
           apiFetch('/api/publishing/logs'),
-          apiFetch('/api/publishing/workers/status')
-        ]);
+          apiFetch('/api/publishing/workers/status'),
+          apiFetch('/api/deals/settings'),
+          apiFetch('/api/deals/history'),
+          apiFetch('/api/copybot/sources'),
+          apiFetch('/api/copybot/logs')
+        ])
 
-        const [overviewResult, keepaResult, amazonResult, queueResult, logsResult, workersResult] = results;
-
-        if (overviewResult.status !== 'fulfilled') {
-          throw overviewResult.reason instanceof Error
-            ? overviewResult.reason
-            : new Error('Operations-Dashboard konnte nicht geladen werden.');
-        }
+        const [
+          botResult,
+          copybotResult,
+          keepaResult,
+          amazonResult,
+          queueResult,
+          logsResult,
+          workersResult,
+          repostSettingsResult,
+          historyResult,
+          sourcesResult,
+          copybotLogsResult
+        ] = results
 
         const partialErrors = results
-          .slice(1)
           .filter((item) => item.status === 'rejected')
-          .map((item) => (item.reason instanceof Error ? item.reason.message : 'Ein Teilbereich konnte nicht geladen werden.'));
+          .map((item) => (item.reason instanceof Error ? item.reason.message : 'Ein Teilbereich konnte nicht geladen werden.'))
 
         if (!cancelled) {
           setDashboard({
-            overview: overviewResult.value,
+            bot: botResult.status === 'fulfilled' ? botResult.value : null,
+            copybot: copybotResult.status === 'fulfilled' ? copybotResult.value : null,
             keepaStatus: keepaResult.status === 'fulfilled' ? keepaResult.value : null,
-            amazonStatus: amazonResult.status === 'fulfilled' ? amazonResult.value : null,
+            amazon: amazonResult.status === 'fulfilled' ? amazonResult.value : null,
             queue: queueResult.status === 'fulfilled' ? queueResult.value : null,
             logs: logsResult.status === 'fulfilled' ? logsResult.value : null,
-            workers: workersResult.status === 'fulfilled' ? workersResult.value : null
-          });
+            workers: workersResult.status === 'fulfilled' ? workersResult.value : null,
+            repostSettings: repostSettingsResult.status === 'fulfilled' ? repostSettingsResult.value : null,
+            history: historyResult.status === 'fulfilled' ? historyResult.value : null,
+            sources: sourcesResult.status === 'fulfilled' ? sourcesResult.value : null,
+            copybotLogs: copybotLogsResult.status === 'fulfilled' ? copybotLogsResult.value : null
+          })
 
           if (partialErrors.length) {
-            setStatus(`Monitoring teilweise unvollstaendig: ${partialErrors[0]}`);
+            setStatus(`Monitoring teilweise unvollstaendig: ${partialErrors[0]}`)
           }
         }
       } catch (error) {
         if (!cancelled) {
-          setStatus(error instanceof Error ? error.message : 'Operations-Dashboard konnte nicht geladen werden.');
+          setStatus(error instanceof Error ? error.message : 'Dashboard konnte nicht geladen werden.')
         }
       } finally {
         if (!cancelled) {
-          setLoading(false);
+          setLoading(false)
         }
       }
     }
 
-    void loadDashboard();
+    void loadDashboard()
 
     return () => {
-      cancelled = true;
-    };
-  }, [user?.role]);
+      cancelled = true
+    }
+  }, [user?.role])
 
-  const overview = dashboard.overview;
-  const keepaStatus = dashboard.keepaStatus;
-  const amazonStatus = dashboard.amazonStatus;
-  const queueItems = Array.isArray(dashboard.queue?.items) ? dashboard.queue.items : [];
-  const publishingLogs = Array.isArray(dashboard.logs?.items) ? dashboard.logs.items : [];
-  const workerChannels = Array.isArray(dashboard.workers?.channels) ? dashboard.workers.channels : [];
-  const facebookWorker = dashboard.workers?.facebook || {};
-  const sourceStatuses = Array.isArray(overview?.sourceStatuses) ? overview.sourceStatuses : [];
-  const sellerControls = Array.isArray(overview?.sellerControls) ? overview.sellerControls : [];
-  const pipeline = Array.isArray(overview?.pipeline) ? overview.pipeline : [];
-  const outputStatuses = overview?.outputStatuses || {};
-  const copybot = overview?.copybot || {};
-  const reviewCount = toNumber(outputStatuses?.reviewCount);
-  const keepaSourceStatus = sourceStatuses.find((item) => item.id === 'keepa') || null;
-  const amazonSourceStatus = sourceStatuses.find((item) => item.id === 'amazon_api') || null;
-  const scrapperSourceStatus = sourceStatuses.find((item) => item.id === 'scrapper') || null;
-  const learningSourceStatus = sourceStatuses.find((item) => item.id === 'learning_logic') || null;
-  const telegramSourceStatus = sourceStatuses.find((item) => item.id === 'telegram_output') || null;
-  const generatorPipeline = pipeline.find((item) => item.id === 'generator') || null;
-  const scrapperPipeline = pipeline.find((item) => item.id === 'scrapper') || null;
-  const autoPipeline = pipeline.find((item) => item.id === 'auto_deals') || null;
-  const activePatternSupport = sellerControls.filter((item) => item.patternSupportEnabled).length;
+  const amazonStatus = dashboard.amazon || {}
+  const botOverview = dashboard.bot || {}
+  const botModules = botOverview?.modules || {}
+  const copybotOverview = dashboard.copybot || {}
+  const keepaStatus = dashboard.keepaStatus || {}
+  const queueItems = Array.isArray(dashboard.queue?.items) ? dashboard.queue.items : []
+  const publishingLogs = Array.isArray(dashboard.logs?.items) ? dashboard.logs.items : []
+  const workerChannels = Array.isArray(dashboard.workers?.channels) ? dashboard.workers.channels : []
+  const repostSettings = dashboard.repostSettings || {}
+  const historyItems = Array.isArray(dashboard.history?.items) ? dashboard.history.items : []
+  const sourceItems = Array.isArray(dashboard.sources?.items) ? dashboard.sources.items : []
+  const copybotLogItems = Array.isArray(dashboard.copybotLogs?.items) ? dashboard.copybotLogs.items : []
+  const latestQueueItems = queueItems.slice(0, 6)
+  const latestPublishingItems = publishingLogs.slice(0, 6)
+  const latestHistoryItems = historyItems.slice(0, 6)
+  const latestDeals = Array.isArray(copybotOverview?.lastProcessedDeals) ? copybotOverview.lastProcessedDeals.slice(0, 6) : []
+  const amazonApiStatus =
+    amazonStatus?.overview?.apiStatus || (amazonStatus?.connection?.connected === true ? 'verbunden' : 'unbekannt')
+  const repostCooldownEnabled = Boolean(repostSettings?.repostCooldownEnabled)
+  const repostCooldownHours = toNumber(repostSettings?.repostCooldownHours)
+  const keepaEnabled = Boolean(keepaStatus?.settings?.keepaEnabled)
+  const keepaGapPct = toNumber(keepaStatus?.settings?.strongDealMinComparisonGapPct)
+  const telegramUserApi = botModules?.telegramUserApi || {}
+  const telegramBotApi = botModules?.telegramBotApi || {}
+  const whatsappModule = botModules?.whatsapp || {}
+  const persistenceModule = botModules?.persistence || {}
+  const telegramBotConfigured = Boolean(telegramBotApi?.configured)
+  const telegramLoginReady = Boolean(telegramUserApi?.enabled && telegramUserApi?.apiConfigured)
 
-  const workerChannelMap = useMemo(
-    () => new Map(workerChannels.map((item) => [String(item.channel_type || '').toLowerCase(), item])),
-    [workerChannels]
-  );
+  const activeSources = useMemo(
+    () => sourceItems.filter((item) => Number(item.is_active) === 1),
+    [sourceItems]
+  )
+  const activeTelegramSourceItems = useMemo(
+    () => activeSources.filter((item) => String(item.platform || '').toLowerCase() === 'telegram'),
+    [activeSources]
+  )
+  const activeWhatsappSourceItems = useMemo(
+    () => activeSources.filter((item) => String(item.platform || '').toLowerCase() === 'whatsapp'),
+    [activeSources]
+  )
 
   const queueSummary = useMemo(
     () =>
       workerChannels.reduce(
         (summary, item) => ({
-          waiting: summary.waiting + toNumber(item.waiting),
-          processing: summary.processing + toNumber(item.processing),
-          posted: summary.posted + toNumber(item.posted),
+          pending: summary.pending + toNumber(item.pending ?? item.waiting),
+          sending: summary.sending + toNumber(item.sending ?? item.processing),
+          sent: summary.sent + toNumber(item.sent ?? item.posted),
+          retry: summary.retry + toNumber(item.retry),
           failed: summary.failed + toNumber(item.failed)
         }),
-        { waiting: 0, processing: 0, posted: 0, failed: 0 }
+        { pending: 0, sending: 0, sent: 0, retry: 0, failed: 0 }
       ),
     [workerChannels]
-  );
+  )
 
-  const latestPostedLog = pickLatest(
-    publishingLogs
-      .filter((log) => log?.event_type === 'target.posted')
-      .map((log) => ({
-        label: formatLogTitle(log),
-        detail: shortenText(log?.message || 'Publishing erfolgreich verarbeitet.', 88),
-        at: log?.created_at || log?.createdAt,
-        tone: 'success'
+  const openQueueCount = queueSummary.pending + queueSummary.sending + queueSummary.retry
+  const publishingTone =
+    queueSummary.failed > 0 ? 'danger' : openQueueCount > 0 ? 'warning' : queueSummary.sent > 0 ? 'success' : 'info'
+
+  const lockSummary = useMemo(
+    () =>
+      historyItems.reduce(
+        (summary, item) => {
+          const originType = String(item.originType || '').toLowerCase()
+          const channel = String(item.channel || '').toLowerCase()
+
+          if (originType === 'manual') {
+            summary.manual += 1
+          }
+
+          if (originType === 'automatic') {
+            summary.automatic += 1
+          }
+
+          if (channel.includes('telegram')) {
+            summary.telegram += 1
+          } else if (channel.includes('whatsapp')) {
+            summary.whatsapp += 1
+          } else if (channel.includes('facebook')) {
+            summary.facebook += 1
+          }
+
+          return summary
+        },
+        { manual: 0, automatic: 0, telegram: 0, whatsapp: 0, facebook: 0 }
+      ),
+    [historyItems]
+  )
+
+  const errorEntries = useMemo(() => {
+    const queueErrors = queueItems.flatMap((item) =>
+      (item.targets || [])
+        .filter((target) => ['failed', 'retry'].includes(String(target.status || '').toLowerCase()))
+        .map((target, index) => ({
+          id: `queue-${item.id}-${target.id || index}`,
+          category: 'Queue',
+          title: `${target.channel_type || 'target'} in ${target.status}`,
+          detail:
+            target.error_message ||
+            `${shortenText(item.payload?.title || `Queue ${item.id}`, 72)} wartet weiter auf Versand.`,
+          time: target.updated_at || item.updated_at || item.created_at,
+          tone: target.status === 'failed' ? 'danger' : 'warning'
+        }))
+    )
+
+    const publishingErrors = publishingLogs
+      .filter((item) => ['warning', 'error'].includes(String(item.level || '').toLowerCase()))
+      .map((item) => ({
+        id: `publishing-${item.id}`,
+        category: 'Publishing',
+        title: item.event_type || 'Publishing Event',
+        detail: item.message || 'Publishing-Fehler ohne Detailtext.',
+        time: item.created_at,
+        tone: String(item.level || '').toLowerCase() === 'error' ? 'danger' : 'warning'
       }))
-  );
 
-  const latestIssueLog = pickLatest(
-    publishingLogs
-      .filter((log) => ['warning', 'error'].includes(String(log?.level || '').toLowerCase()))
-      .map((log) => ({
-        label: formatLogTitle(log),
-        detail: shortenText(log?.message || 'Warnung oder Fehler im Publishing.', 88),
-        at: log?.created_at || log?.createdAt,
-        tone: 'danger'
+    const copybotErrors = copybotLogItems
+      .filter((item) => ['warning', 'error'].includes(String(item.level || '').toLowerCase()))
+      .map((item) => ({
+        id: `copybot-${item.id}`,
+        category: 'Quelle',
+        title: item.event_type || 'Copybot Event',
+        detail: item.message || 'Quellen-Fehler ohne Detailtext.',
+        time: item.created_at,
+        tone: String(item.level || '').toLowerCase() === 'error' ? 'danger' : 'warning'
       }))
-  );
 
-  const latestSuccessAction = pickLatest([
-    latestPostedLog,
-    keepaStatus?.overview?.apiUsage?.lastRequestAt
-      ? {
-          label: 'Keepa Abruf',
-          detail: `${toNumber(keepaStatus?.overview?.apiUsage?.requestCount24h)} Requests in 24h`,
-          at: keepaStatus.overview.apiUsage.lastRequestAt,
-          tone: 'info'
-        }
-      : null,
-    amazonStatus?.overview?.lastSuccessfulFetch
-      ? {
-          label: 'Amazon API Abruf',
-          detail: `${toNumber(amazonStatus?.overview?.successCount24h)} erfolgreiche Requests in 24h`,
-          at: amazonStatus.overview.lastSuccessfulFetch,
-          tone: 'info'
-        }
-      : null,
-    copybot?.lastProcessedSource?.last_import_at
-      ? {
-          label: 'Scrapper Import',
-          detail: shortenText(copybot?.lastProcessedSource?.name || 'Letzte Quelle verarbeitet.', 88),
-          at: copybot.lastProcessedSource.last_import_at,
-          tone: 'info'
-        }
-      : null
-  ]);
+    return sortByTimeDesc([...queueErrors, ...publishingErrors, ...copybotErrors]).slice(0, 8)
+  }, [copybotLogItems, publishingLogs, queueItems])
 
-  const latestIssueAction = pickLatest([
-    latestIssueLog,
-    amazonStatus?.overview?.lastErrorAt
-      ? {
-          label: 'Amazon API Fehler',
-          detail: shortenText(amazonStatus?.overview?.lastErrorMessage || 'Letzter Amazon-Fehler.', 88),
-          at: amazonStatus.overview.lastErrorAt,
-          tone: 'danger'
-        }
-      : null
-  ]);
+  const timelineItems = useMemo(() => {
+    const dealEvents = latestDeals.map((item, index) => ({
+      id: `deal-${item.id || index}`,
+      category: 'Deal',
+      title: item.title || item.source_name || `Deal ${index + 1}`,
+      detail: `${item.platform || 'Quelle'} | ${item.seller_type || 'FBM'} | Status ${item.status || 'offen'}`,
+      time: item.created_at,
+      tone: getStatusTone(item.status || 'info')
+    }))
 
-  const latestGeneratorQueue = queueItems.find((item) => item?.source_type === 'generator') || null;
+    const publishingEvents = latestPublishingItems.map((item) => ({
+      id: `publishing-timeline-${item.id}`,
+      category: 'Publishing',
+      title: item.event_type || 'Publishing Event',
+      detail: item.message || 'Publishing-Event',
+      time: item.created_at,
+      tone: getStatusTone(item.level || 'info')
+    }))
 
-  const sourceCards = [
+    const sourceEvents = copybotLogItems.slice(0, 6).map((item) => ({
+      id: `source-timeline-${item.id}`,
+      category: 'Quelle',
+      title: item.event_type || 'Quellen-Event',
+      detail: item.message || 'Quellen-Event',
+      time: item.created_at,
+      tone: getStatusTone(item.level || 'info')
+    }))
+
+    const lockEvents = latestHistoryItems.map((item) => ({
+      id: `lock-${item.id}`,
+      category: 'Sperre',
+      title: item.title || item.asin || 'Sperre gespeichert',
+      detail: `${item.channel || 'Kanal unbekannt'} | ${item.originType || 'unknown'} | ${item.sellerType || 'FBM'}`,
+      time: item.postedAt,
+      tone: 'info'
+    }))
+
+    return sortByTimeDesc([...dealEvents, ...publishingEvents, ...sourceEvents, ...lockEvents]).slice(0, 12)
+  }, [copybotLogItems, latestDeals, latestHistoryItems, latestPublishingItems])
+
+  const overallSystemStatus =
+    errorEntries.length > 0
+      ? 'Aufmerksamkeit noetig'
+      : openQueueCount > 0
+        ? 'Aktiv'
+        : telegramLoginReady || telegramBotConfigured
+          ? 'Bereit'
+          : 'Konfiguration noetig'
+
+  const systemStatusCards = [
     {
-      id: 'keepa',
-      title: 'Keepa',
-      status: keepaSourceStatus?.status || 'vorbereitet',
-      description: 'Preisverlauf und Deal-Quelle',
-      lastAction: keepaStatus?.overview?.apiUsage?.lastRequestAt || null,
-      primaryMetric: `${toNumber(keepaStatus?.overview?.apiUsage?.hitsToday)} Treffer heute`,
-      secondaryMetric: `${toNumber(keepaStatus?.overview?.apiUsage?.requestCount24h)} Requests / 24h`
+      title: 'Systemstatus',
+      value: overallSystemStatus,
+      detail: `${openQueueCount} offene Jobs | ${errorEntries.length} Fehlerhinweise | Letzter Check ${formatDateTime(
+        botOverview?.lastCheck
+      )}`,
+      tone: getStatusTone(overallSystemStatus)
     },
     {
-      id: 'amazon',
-      title: 'Amazon API',
-      status: amazonSourceStatus?.status || amazonStatus?.overview?.apiStatus || 'vorbereitet',
-      description: 'Produkt- und Affiliate-Daten',
-      lastAction: amazonStatus?.overview?.lastSuccessfulFetch || amazonStatus?.connection?.checkedAt || null,
-      primaryMetric: `${toNumber(amazonStatus?.overview?.requestCount24h)} Requests / 24h`,
-      secondaryMetric:
-        amazonStatus?.overview?.lastErrorAt && !amazonStatus?.overview?.lastSuccessfulFetch
-          ? 'Letzter Abruf mit Fehler'
-          : `${toNumber(amazonStatus?.overview?.successCount24h)} erfolgreiche Abrufe`
+      title: 'Decision Engine',
+      value: 'Internet primaer',
+      detail: `Marktvergleich fuehrt. Keepa bleibt Backup ab ${keepaGapPct || 0}% Mindestabstand.`,
+      tone: 'success'
     },
     {
-      id: 'scrapper',
-      title: 'Scrapper',
-      status: scrapperSourceStatus?.status || (copybot?.copybotEnabled ? 'aktiv' : 'deaktiviert'),
-      description: 'Rohdeal-Eingang und Quellenimport',
-      lastAction: copybot?.lastProcessedSource?.last_import_at || null,
-      primaryMetric: `${toNumber(copybot?.reviewCount)} Review | ${toNumber(copybot?.approvedCount)} approved`,
-      secondaryMetric: copybot?.lastProcessedSource?.name ? shortenText(copybot.lastProcessedSource.name, 44) : 'Noch kein letzter Import'
+      title: 'Output Integrationen',
+      value: `${telegramBotConfigured ? 'Telegram bereit' : 'Telegram pruefen'} / ${whatsappModule?.configured ? 'WhatsApp bereit' : 'WhatsApp pruefen'}`,
+      detail: `${queueSummary.sent} erfolgreiche Sendungen | ${queueSummary.failed} fehlgeschlagen | ${queueSummary.retry} im Retry`,
+      tone: publishingTone
     },
     {
-      id: 'generator',
-      title: 'Generator',
-      status: 'aktiv',
-      description: 'Manueller Posting-Bereich',
-      lastAction: latestGeneratorQueue?.created_at || null,
-      primaryMetric: shortenText(generatorPipeline?.detail || 'Manueller Direct-Publish-Flow aktiv.', 56),
-      secondaryMetric: latestGeneratorQueue ? 'Letzter Queue-Eintrag vorhanden' : 'Keine letzte Queue-Aktion'
+      title: 'Persistenz',
+      value: repostCooldownEnabled ? 'Geschuetzt' : 'Sperre deaktiviert',
+      detail: `${toNumber(persistenceModule?.queueEntries || queueItems.length)} Queue-Eintraege | ${historyItems.length} Sperren | ${shortenText(
+        persistenceModule?.dbPath || '-',
+        44
+      )}`,
+      tone: repostCooldownEnabled ? 'success' : 'warning'
     }
-  ];
+  ]
 
-  const channelStats = {
-    telegram: workerChannelMap.get('telegram') || {},
-    whatsapp: workerChannelMap.get('whatsapp') || {},
-    facebook: workerChannelMap.get('facebook') || {}
-  };
-
-  const channelCards = [
+  const telegramStatusCards = [
     {
-      id: 'telegram',
-      title: 'Telegram',
-      status:
-        telegramSourceStatus?.status === 'aktiv'
-          ? latestPostedLog?.label?.toLowerCase().includes('telegram')
-            ? 'aktiv'
-            : 'bereit'
-          : telegramSourceStatus?.status || 'vorbereitet',
-      mode: overview?.keepa?.maskedChatId ? 'Testgruppe' : 'Chat-ID offen',
-      description: 'Echter Testgruppen-Output',
-      lastSuccess: publishingLogs.find((log) => log?.worker_type === 'telegram' && log?.event_type === 'target.posted') || null,
-      lastIssue: publishingLogs.find((log) => log?.worker_type === 'telegram' && ['warning', 'error'].includes(String(log?.level || '').toLowerCase())) || null,
-      metrics: channelStats.telegram
+      title: 'Login Status',
+      value: toNumber(telegramUserApi?.activeSessions) > 0 ? 'Verbunden' : telegramLoginReady ? 'Bereit' : 'Konfiguration fehlt',
+      detail: `API ${telegramUserApi?.apiConfigured ? 'konfiguriert' : 'nicht konfiguriert'} | Reader ${
+        telegramUserApi?.enabled ? 'aktiv' : 'deaktiviert'
+      }`,
+      tone: toNumber(telegramUserApi?.activeSessions) > 0 ? 'success' : telegramLoginReady ? 'info' : 'warning'
     },
     {
-      id: 'whatsapp',
-      title: 'WhatsApp',
-      status: publishingLogs.find((log) => log?.worker_type === 'whatsapp' && ['warning', 'error'].includes(String(log?.level || '').toLowerCase()))
-        ? 'warnung'
-        : 'vorbereitet',
-      mode: 'Simulierter Worker',
-      description: 'Noch nicht live verbunden',
-      lastSuccess: publishingLogs.find((log) => log?.worker_type === 'whatsapp' && log?.event_type === 'target.posted') || null,
-      lastIssue: publishingLogs.find((log) => log?.worker_type === 'whatsapp' && ['warning', 'error'].includes(String(log?.level || '').toLowerCase())) || null,
-      metrics: channelStats.whatsapp
+      title: 'Login Modus',
+      value: telegramUserApi?.loginMode || '-',
+      detail: `Letzte Nachricht ${formatDateTime(telegramUserApi?.lastMessageAt)}`,
+      tone: 'info'
     },
     {
-      id: 'facebook',
-      title: 'Facebook',
-      status: publishingLogs.find((log) => log?.worker_type === 'facebook' && ['warning', 'error'].includes(String(log?.level || '').toLowerCase()))
-        ? 'warnung'
-        : facebookWorker?.enabled
-          ? 'aktiv'
-          : 'vorbereitet',
-      mode: facebookWorker?.enabled ? `Session ${facebookWorker.sessionMode || 'persistent'}` : 'Worker vorbereitet',
-      description: 'Worker-basierter Posting-Kanal',
-      lastSuccess: publishingLogs.find((log) => log?.worker_type === 'facebook' && log?.event_type === 'target.posted') || null,
-      lastIssue: publishingLogs.find((log) => log?.worker_type === 'facebook' && ['warning', 'error'].includes(String(log?.level || '').toLowerCase())) || null,
-      metrics: channelStats.facebook
-    }
-  ];
-
-  const activeSourceCount = sourceCards.filter((item) => getStatusTone(item.status) === 'success').length;
-  const activeChannelCount = channelCards.filter((item) => getStatusTone(item.status) === 'success').length;
-
-  const healthState = useMemo(() => {
-    const sourceHasError = sourceCards.some((item) => getStatusTone(item.status) === 'danger');
-    const channelHasError = channelCards.some((item) => getStatusTone(item.status) === 'danger');
-
-    if (sourceHasError || channelHasError) {
-      return {
-        label: 'kritisch',
-        tone: 'danger',
-        detail: 'Mindestens eine Quelle oder ein Kanal meldet Fehler.'
-      };
-    }
-
-    if (reviewCount > 0 || sourceCards.some((item) => getStatusTone(item.status) === 'warning')) {
-      return {
-        label: 'beobachten',
-        tone: 'warning',
-        detail: 'System laeuft, aber Reviews oder vorbereitete Bereiche brauchen Aufmerksamkeit.'
-      };
-    }
-
-    return {
-      label: 'stabil',
-      tone: 'success',
-      detail: 'Quellen, Logik und Output laufen ohne akuten Stoerfall.'
-    };
-  }, [channelCards, reviewCount, sourceCards]);
-
-  const topStatusCards = [
-    {
-      title: 'System Health',
-      value: healthState.label,
-      detail: healthState.detail,
-      tone: healthState.tone
+      title: 'Sessions',
+      value: `${toNumber(telegramUserApi?.savedSessions)} gespeichert`,
+      detail: `${toNumber(telegramUserApi?.activeSessions)} aktiv und wiederverwendbar`,
+      tone: toNumber(telegramUserApi?.savedSessions) > 0 ? 'success' : 'warning'
     },
+    {
+      title: 'Channels',
+      value: `${toNumber(telegramUserApi?.watchedChannels)} Watches`,
+      detail: `${toNumber(telegramUserApi?.sourceCount)} aktive Telegram Quellen | ${toNumber(
+        telegramBotApi?.publishTargets
+      )} Bot-Ziele`,
+      tone: toNumber(telegramUserApi?.watchedChannels) > 0 ? 'success' : 'info'
+    }
+  ]
+
+  const sourceSummaryCards = [
     {
       title: 'Aktive Quellen',
-      value: `${activeSourceCount}/4`,
-      detail: 'Keepa, Amazon API, Scrapper und Generator',
-      tone: activeSourceCount >= 2 ? 'success' : 'warning'
+      value: activeSources.length,
+      detail: `${activeTelegramSourceItems.length} Telegram | ${activeWhatsappSourceItems.length} WhatsApp`,
+      tone: activeSources.length ? 'success' : 'warning'
     },
     {
-      title: 'Aktive Kanaele',
-      value: `${activeChannelCount}/3`,
-      detail: 'Telegram, WhatsApp und Facebook',
-      tone: activeChannelCount >= 1 ? 'info' : 'warning'
+      title: 'Review Queue',
+      value: toNumber(copybotOverview?.reviewCount),
+      detail: `${toNumber(copybotOverview?.approvedCount)} approved | ${toNumber(copybotOverview?.rejectedCount)} rejected`,
+      tone: toNumber(copybotOverview?.reviewCount) > 0 ? 'warning' : 'info'
     },
     {
-      title: 'Letzte erfolgreiche Aktion',
-      value: latestSuccessAction ? formatDateTime(latestSuccessAction.at) : '-',
-      detail: latestSuccessAction ? `${latestSuccessAction.label} - ${latestSuccessAction.detail}` : 'Noch keine letzte Erfolgsaktion vorhanden.',
-      tone: latestSuccessAction?.tone || 'info'
-    },
-    {
-      title: 'Offene Reviews',
-      value: `${reviewCount}`,
-      detail: reviewCount ? 'Faelle warten auf Freigabe oder Nachpruefung.' : 'Kein offener Review-Stau.',
-      tone: reviewCount ? 'warning' : 'success'
-    },
-    {
-      title: 'Letzte Warnung / Fehler',
-      value: latestIssueAction ? formatDateTime(latestIssueAction.at) : 'Keine',
-      detail: latestIssueAction ? `${latestIssueAction.label} - ${latestIssueAction.detail}` : 'Aktuell liegt keine letzte Warnung oder kein Fehler vor.',
-      tone: latestIssueAction?.tone || 'success'
+      title: 'Quellen-Testlauf',
+      value: copybotOverview?.lastProcessedSource?.name || 'Noch kein Import',
+      detail: `Letzter Eingang ${formatDateTime(copybotOverview?.lastProcessedSource?.last_import_at)}`,
+      tone: copybotOverview?.lastProcessedSource ? 'info' : 'warning'
     }
-  ];
+  ]
 
-  const flowColumns = [
+  const liveFlowSteps = [
     {
-      title: 'Quellen',
-      subtitle: 'Eingaenge',
-      items: sourceCards.map((item) => ({
-        title: item.title,
-        status: item.status,
-        detail: item.description
-      }))
+      id: 'detect',
+      label: 'Deal erkannt',
+      title: `${latestDeals.length} letzte Deals`,
+      detail: latestDeals.length
+        ? `${shortenText(latestDeals[0]?.title || latestDeals[0]?.source_name || 'Deal', 56)}`
+        : 'Noch kein aktueller Deal im Verlauf.',
+      tone: latestDeals.length ? 'success' : 'info'
     },
     {
-      title: 'Verarbeitung',
-      subtitle: 'Pflichtschichten',
-      items: [
-        {
-          title: 'Link Builder',
-          status: 'aktiv',
-          detail: 'Externe Amazon-Links werden standardisiert.'
-        },
-        {
-          title: 'Lern-Logik',
-          status: learningSourceStatus?.status || 'aktiv',
-          detail: shortenText(autoPipeline?.detail || 'Alle Auto-Quellen laufen zuerst durch die Entscheidung.', 78)
-        },
-        {
-          title: 'Muster-Erkennung',
-          status: activePatternSupport ? 'aktiv' : 'deaktiviert',
-          detail: `${activePatternSupport}/${Math.max(sellerControls.length, 3)} Seller-Type-Profile aktiv`
-        }
-      ]
+      id: 'lock',
+      label: 'Sperrcheck',
+      title: repostCooldownEnabled ? `${repostCooldownHours}h aktiv` : 'deaktiviert',
+      detail: `${historyItems.length} gespeicherte Sperren fuer manuelle und automatische Posts`,
+      tone: repostCooldownEnabled ? 'success' : 'warning'
     },
     {
-      title: 'Entscheidung',
-      subtitle: 'Regeln',
-      items: [
-        {
-          title: 'Review Gate',
-          status: reviewCount ? 'review' : 'bereit',
-          detail: reviewCount ? `${reviewCount} offene Reviews` : 'Kein Review-Stau'
-        },
-        ...sellerControls.map((item) => ({
-          title: item.id,
-          status: item.patternSupportEnabled ? 'aktiv' : 'deaktiviert',
-          detail: `Muster ${item.patternSupportEnabled ? 'an' : 'aus'} | Auto ${item.autoPostingEnabled ? 'an' : 'aus'}`
-        }))
-      ]
+      id: 'internet',
+      label: 'Internetvergleich',
+      title: 'Hauptentscheidung',
+      detail: `Amazon ${amazonApiStatus} | Mindestabstand ${keepaGapPct || 0}% fuer starke Marktdeals`,
+      tone: 'success'
     },
     {
-      title: 'Outputs',
-      subtitle: 'Kanaele',
-      items: channelCards.map((item) => ({
-        title: item.title,
-        status: item.status,
-        detail: `${item.mode} | ${item.description}`
-      }))
+      id: 'fallback',
+      label: 'Keepa Fallback',
+      title: keepaEnabled ? 'bereit' : 'deaktiviert',
+      detail: 'avg90, avg180, min90 und Lowest90 bleiben reine Backup-Signale.',
+      tone: keepaEnabled ? 'info' : 'warning'
+    },
+    {
+      id: 'queue',
+      label: 'Queue und Output',
+      title: `${openQueueCount} offen`,
+      detail: `${queueSummary.pending} pending | ${queueSummary.sending} sending | ${queueSummary.retry} retry | ${queueSummary.sent} sent`,
+      tone: publishingTone
     }
-  ];
-
-  const processingCards = [
-    {
-      title: 'Link Builder',
-      status: 'aktiv',
-      detail: 'Scrapper- und Auto-Deals werden vor dem Output sauber auf Amazon-Affiliate-Format gebracht.',
-      meta: 'nur externe Links'
-    },
-    {
-      title: 'Logik-Zentrale',
-      status: learningSourceStatus?.status || 'aktiv',
-      detail: 'Zentrale Pflichtschicht fuer Bewertung, Scores, Review und Freigaben.',
-      meta: shortenText(autoPipeline?.detail || 'Pflichtschicht fuer Auto-Deals', 60)
-    },
-    {
-      title: 'Muster-Erkennung',
-      status: activePatternSupport ? 'aktiv' : 'deaktiviert',
-      detail: 'Unterstuetzt die Entscheidung, ersetzt sie aber nicht als Blackbox.',
-      meta: `${activePatternSupport}/3 Seller-Type-Profile aktiv`
-    },
-    {
-      title: 'Review / Entscheidung',
-      status: reviewCount ? 'review' : 'bereit',
-      detail: 'Approved, review oder blocked bleiben nachvollziehbar als zentrale Entscheidung.',
-      meta: reviewCount ? `${reviewCount} offene Reviews` : 'kein offener Review-Stau'
-    }
-  ];
-
-  const monitoringFeed = publishingLogs.slice(0, 6).map((log) => ({
-    id: `${log.id}-${log.created_at || log.createdAt}`,
-    title: formatLogTitle(log),
-    detail: shortenText(log?.message || 'Kein Log-Text vorhanden.', 92),
-    at: log?.created_at || log?.createdAt,
-    tone: getStatusTone(log?.level || 'info')
-  }));
-
-  const latestQueueItems = queueItems.slice(0, 5).map((item) => ({
-    id: item.id,
-    title: shortenText(item?.payload?.title || `Queue ${item.id}`, 56),
-    status: item.status,
-    detail: `${item.source_type || 'unknown'} | ${formatDateTime(item.created_at)}`
-  }));
+  ]
 
   const workspaceCards = [
+    {
+      title: 'Dashboard',
+      path: '/',
+      description: 'Status, Timeline und Systemsicht'
+    },
     {
       title: 'Generator',
       path: '/generator',
@@ -585,26 +516,50 @@ function HomePage() {
     {
       title: 'Scrapper',
       path: '/scraper',
-      description: 'Rohdeal- und Importbereich'
+      description: 'Deal-Eingang und Pruefung'
     },
-    user?.role === 'admin'
-      ? {
-          title: 'Logik-Zentrale',
-          path: '/learning',
-          description: 'Bewertung, Regeln und Review'
-        }
-      : null,
+    {
+      title: 'Copybot',
+      path: '/copybot',
+      description: 'Telegram- und WhatsApp-Quellen'
+    },
+    {
+      title: 'Templates',
+      path: '/templates',
+      description: 'Vorlagen und Textbausteine'
+    },
+    {
+      title: 'Autobot',
+      path: '/autobot',
+      description: 'Integrationen, Queue und Plattformstatus'
+    },
+    {
+      title: 'Logik-Zentrale',
+      path: '/learning',
+      description: 'Keepa, Marktvergleich und Lernlogik',
+      adminOnly: true
+    },
     {
       title: 'Publishing',
       path: '/publishing',
-      description: 'Queue, Worker und Kanaele'
+      description: 'Queue, Worker und Versand'
     },
     {
-      title: 'Deal Historie',
-      path: '/deal-history',
+      title: 'Sperrzeiten',
+      path: '/sperrzeiten',
       description: 'Repost-Sperre und Verlauf'
+    },
+    {
+      title: 'Logs',
+      path: '/logs',
+      description: 'Aktionen und Historie'
+    },
+    {
+      title: 'Einstellungen',
+      path: '/settings',
+      description: 'System und Ausgabe konfigurieren'
     }
-  ].filter(Boolean);
+  ]
 
   return (
     <Layout>
@@ -612,23 +567,25 @@ function HomePage() {
         <section className="card ops-hero">
           <div className="ops-hero-grid">
             <div className="ops-hero-copy">
-              <p className="section-title">Operations Dashboard / Control Center</p>
-              <h1 className="page-title">Affiliate Manager Pro Operations Center</h1>
+              <p className="section-title">Affiliate Manager Pro</p>
+              <h1 className="page-title">System Dashboard</h1>
               <p className="page-subtitle">
-                Quellen, Pflichtschichten, Entscheidungen und Kanaele werden hier als laufendes System sichtbar,
-                ohne Generator, Scrapper oder Logik-Zentrale durcheinander zu mischen.
+                Uebersichtlich nach Arbeitsfluss geordnet: Systemstatus, Telegram Login, aktive Quellen, Live Flow,
+                Queue, Sperren, letzte Deals, Fehler und Timeline. Internet bleibt Hauptlogik, Keepa bleibt Fallback,
+                Queue und Sperrmodul bleiben durchgaengig aktiv.
               </p>
             </div>
 
             <div className="ops-hero-aside">
               <div className="ops-hero-chip-row">
-                <span className="badge">Quelle -&gt; Verarbeitung -&gt; Entscheidung -&gt; Output</span>
+                <span className="badge">Internet zuerst - Keepa nur Fallback - Queue ohne Verlust</span>
                 <span className={`status-chip ${user?.role === 'admin' ? 'info' : 'success'}`}>
-                  {user?.role === 'admin' ? 'Admin Control View' : 'Workspace View'}
+                  {user?.role === 'admin' ? 'Admin Workspace' : 'Workspace View'}
                 </span>
               </div>
+
               <div className="ops-quick-links">
-                {workspaceCards.map((item) => (
+                {workspaceCards.filter((item) => !item.adminOnly || user?.role === 'admin').map((item) => (
                   <Link key={item.title} to={item.path} className="ops-quick-link">
                     <span>{item.title}</span>
                     <small>{item.description}</small>
@@ -648,292 +605,315 @@ function HomePage() {
 
         {loading ? (
           <section className="card ops-panel">
-            <p style={{ margin: 0 }}>Operations-Dashboard wird geladen...</p>
+            <p style={{ margin: 0 }}>Dashboard wird geladen...</p>
           </section>
         ) : (
           <>
-            <section className="ops-topbar">
-              {topStatusCards.map((card) => (
-                <article key={card.title} className={`card ops-status-card ops-tone-${card.tone}`}>
-                  <div className="ops-card-head">
-                    <p className="section-title">{card.title}</p>
-                    <span className={`status-chip ${card.tone}`}>{card.tone}</span>
-                  </div>
-                  <h2>{card.value}</h2>
-                  <p className="ops-card-copy">{card.detail}</p>
-                </article>
-              ))}
-            </section>
-
-            <section className="ops-core-grid">
-              <article className="card ops-panel ops-flow-panel">
-                <div className="ops-panel-header">
-                  <div>
-                    <p className="section-title">Flow / Control Center</p>
-                    <h2 className="page-title">Systemkette auf einen Blick</h2>
-                  </div>
-                  <span className="ops-header-note">Pflichtlogik vor jedem Auto-Output</span>
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">1. Systemstatus</p>
+                  <h2 className="page-title">Gesamtzustand auf einen Blick</h2>
                 </div>
-
-                <div className="ops-flow-grid">
-                  {flowColumns.map((column) => (
-                    <section key={column.title} className="ops-flow-column">
-                      <div className="ops-column-head">
-                        <span className="ops-column-kicker">{column.subtitle}</span>
-                        <h3>{column.title}</h3>
-                      </div>
-
-                      <div className="ops-node-stack">
-                        {column.items.map((item) => (
-                          <article key={`${column.title}-${item.title}`} className={`ops-node ops-tone-${getStatusTone(item.status)}`}>
-                            <div className="ops-node-head">
-                              <strong>{item.title}</strong>
-                              <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status}</span>
-                            </div>
-                            <p>{item.detail}</p>
-                          </article>
-                        ))}
-                      </div>
-                    </section>
-                  ))}
-                </div>
-              </article>
-
-              <aside className="ops-monitor-stack">
-                <section className="card ops-panel">
-                  <div className="ops-panel-header">
-                    <div>
-                      <p className="section-title">Monitoring</p>
-                      <h2 className="page-title">Queue und Live-Status</h2>
+                <span className="ops-header-note">Letzter Check {formatDateTime(botOverview?.lastCheck)}</span>
+              </div>
+              <div className="ops-source-grid">
+                {systemStatusCards.map((card) => (
+                  <article key={card.title} className={`ops-status-card ops-tone-${card.tone}`}>
+                    <div className="ops-card-head">
+                      <p className="section-title">{card.title}</p>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
                     </div>
-                  </div>
-
-                  <div className="ops-queue-grid">
-                    <article className="ops-mini-stat">
-                      <span>Pending</span>
-                      <strong>{queueSummary.waiting}</strong>
-                    </article>
-                    <article className="ops-mini-stat">
-                      <span>Processing</span>
-                      <strong>{queueSummary.processing}</strong>
-                    </article>
-                    <article className="ops-mini-stat">
-                      <span>Posted</span>
-                      <strong>{queueSummary.posted}</strong>
-                    </article>
-                    <article className="ops-mini-stat">
-                      <span>Failed</span>
-                      <strong>{queueSummary.failed}</strong>
-                    </article>
-                  </div>
-
-                  <div className="ops-monitor-list">
-                    <div className="ops-list-head">
-                      <strong>Letzte Events</strong>
-                      <small>{monitoringFeed.length ? 'live aus Publishing-Logs' : 'noch keine Logs'}</small>
-                    </div>
-                    <div className="ops-feed">
-                      {monitoringFeed.length ? (
-                        monitoringFeed.map((item) => (
-                          <article key={item.id} className="ops-feed-item">
-                            <div className="ops-feed-head">
-                              <strong>{item.title}</strong>
-                              <span className={`status-chip ${item.tone}`}>{formatDateTime(item.at)}</span>
-                            </div>
-                            <p>{item.detail}</p>
-                          </article>
-                        ))
-                      ) : (
-                        <p className="ops-empty-state">Noch keine Publishing-Events vorhanden.</p>
-                      )}
-                    </div>
-                  </div>
-                </section>
-
-                <section className="card ops-panel">
-                  <div className="ops-panel-header">
-                    <div>
-                      <p className="section-title">Live Queue</p>
-                      <h2 className="page-title">Letzte Eintraege</h2>
-                    </div>
-                  </div>
-
-                  <div className="ops-feed">
-                    {latestQueueItems.length ? (
-                      latestQueueItems.map((item) => (
-                        <article key={item.id} className="ops-feed-item">
-                          <div className="ops-feed-head">
-                            <strong>{item.title}</strong>
-                            <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status}</span>
-                          </div>
-                          <p>{item.detail}</p>
-                        </article>
-                      ))
-                    ) : (
-                      <p className="ops-empty-state">Keine Queue-Eintraege vorhanden.</p>
-                    )}
-                  </div>
-                </section>
-              </aside>
+                    <h2>{card.value}</h2>
+                    <p className="ops-card-copy">{card.detail}</p>
+                  </article>
+                ))}
+              </div>
             </section>
 
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">Quellen</p>
-                  <h2 className="page-title">Eingaenge und letzte Aktivitaet</h2>
+                  <p className="section-title">2. Telegram Login Status</p>
+                  <h2 className="page-title">Reader Session, Login und Bot-Output</h2>
                 </div>
-                <span className="ops-header-note">Keepa, Amazon API, Scrapper und Generator getrennt sichtbar</span>
+                <span className="ops-header-note">
+                  User API {telegramLoginReady ? 'konfiguriert' : 'pruefen'} | Bot {telegramBotConfigured ? 'bereit' : 'pruefen'}
+                </span>
+              </div>
+              <div className="ops-source-grid">
+                {telegramStatusCards.map((card) => (
+                  <article key={card.title} className={`ops-status-card ops-tone-${card.tone}`}>
+                    <div className="ops-card-head">
+                      <p className="section-title">{card.title}</p>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
+                    </div>
+                    <h2>{card.value}</h2>
+                    <p className="ops-card-copy">{card.detail}</p>
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">3. Aktive Quellen</p>
+                  <h2 className="page-title">Eingangsquellen ohne Leerlauf</h2>
+                </div>
+                <span className="ops-header-note">{activeSources.length} aktive Quellen geladen</span>
               </div>
 
               <div className="ops-source-grid">
-                {sourceCards.map((item) => (
-                  <article key={item.id} className={`ops-source-card ops-tone-${getStatusTone(item.status)}`}>
+                {sourceSummaryCards.map((card) => (
+                  <article key={card.title} className={`ops-source-card ops-tone-${card.tone}`}>
                     <div className="ops-card-top">
                       <div>
-                        <span className="ops-card-label">{item.title}</span>
-                        <h3>{item.description}</h3>
+                        <span className="ops-card-label">{card.title}</span>
+                        <h3>{card.value}</h3>
                       </div>
-                      <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status}</span>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
                     </div>
-
-                    <div className="ops-meta-list">
-                      <p>Letzte Aktion: {formatDateTime(item.lastAction)}</p>
-                      <p>{item.primaryMetric}</p>
-                      <p>{item.secondaryMetric}</p>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </section>
-
-            <section className="card ops-panel">
-              <div className="ops-panel-header">
-                <div>
-                  <p className="section-title">Verarbeitung</p>
-                  <h2 className="page-title">Logik, Muster-Erkennung und Review</h2>
-                </div>
-                <span className="ops-header-note">Muster-Unterstuetzung bleibt von Auto-Posting getrennt</span>
-              </div>
-
-              <div className="ops-processing-grid">
-                {processingCards.map((item) => (
-                  <article key={item.title} className={`ops-processing-card ops-tone-${getStatusTone(item.status)}`}>
-                    <div className="ops-card-top">
-                      <div>
-                        <span className="ops-card-label">{item.title}</span>
-                        <h3>{item.meta}</h3>
-                      </div>
-                      <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status}</span>
-                    </div>
-                    <p className="ops-card-copy">{item.detail}</p>
+                    <p className="ops-card-copy">{card.detail}</p>
                   </article>
                 ))}
               </div>
 
-              <div className="ops-rule-grid">
-                {sellerControls.map((item) => (
-                  <article key={item.id} className="ops-rule-card">
-                    <div className="ops-feed-head">
-                      <strong>{item.id}</strong>
-                      <span className={`status-chip ${item.active ? 'success' : 'warning'}`}>
-                        {item.active ? 'aktiv' : 'inaktiv'}
-                      </span>
-                    </div>
-                    <div className="ops-rule-chips">
-                      <span className={`status-chip ${item.patternSupportEnabled ? 'info' : 'warning'}`}>
-                        Muster {item.patternSupportEnabled ? 'an' : 'aus'}
-                      </span>
-                      <span className={`status-chip ${item.autoPostingEnabled ? 'success' : 'warning'}`}>
-                        Auto {item.autoPostingEnabled ? 'an' : 'aus'}
-                      </span>
-                    </div>
-                    <p className="ops-card-copy">
-                      Letzte Entscheidung: {item.lastDecision || '-'} | Letzter Lauf: {formatDateTime(item.lastRunAt)}
-                    </p>
-                  </article>
-                ))}
-              </div>
-            </section>
-
-            <section className="card ops-panel">
-              <div className="ops-panel-header">
-                <div>
-                  <p className="section-title">Kanaele</p>
-                  <h2 className="page-title">Telegram, WhatsApp und Facebook</h2>
-                </div>
-                <span className="ops-header-note">Keine Fake-Connected-States, nur echte Aktiv-, Warn- oder Prepared-Zustaende</span>
-              </div>
-
-              <div className="ops-channel-grid">
-                {channelCards.map((item) => (
-                  <article key={item.id} className={`ops-channel-card ops-tone-${getStatusTone(item.status)}`}>
-                    <div className="ops-card-top">
-                      <div>
-                        <span className="ops-card-label">{item.title}</span>
-                        <h3>{item.mode}</h3>
+              <div className="ops-feed">
+                {activeSources.length ? (
+                  activeSources.slice(0, 8).map((item) => (
+                    <article key={item.id} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{item.name || `Quelle ${item.id}`}</strong>
+                        <span className={`status-chip ${getStatusTone(item.platform)}`}>{item.platform || 'unknown'}</span>
                       </div>
-                      <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status}</span>
-                    </div>
-
-                    <p className="ops-card-copy">{item.description}</p>
-
-                    <div className="ops-channel-stats">
-                      <span>Pending {toNumber(item.metrics.waiting)}</span>
-                      <span>Processing {toNumber(item.metrics.processing)}</span>
-                      <span>Posted {toNumber(item.metrics.posted)}</span>
-                      <span>Failed {toNumber(item.metrics.failed)}</span>
-                    </div>
-
-                    <div className="ops-meta-list">
                       <p>
-                        Letzter Versand:{' '}
-                        {item.lastSuccess ? formatDateTime(item.lastSuccess.created_at || item.lastSuccess.createdAt) : '-'}
+                        Prioritaet {toNumber(item.priority)} | Typ {item.source_type || 'manual'} | Preisregel{' '}
+                        {item.pricing_rule_name || '-'}
+                      </p>
+                      <p>Letzter Import {formatDateTime(item.last_import_at)}</p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Keine aktiven Quellen vorhanden.</p>
+                )}
+              </div>
+            </section>
+
+            <section className="card ops-panel ops-flow-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">4. Live Flow</p>
+                  <h2 className="page-title">Vom Eingang bis zum Versand</h2>
+                </div>
+                <span className="ops-header-note">Deal -&gt; Sperre -&gt; Internet -&gt; Keepa -&gt; Queue</span>
+              </div>
+
+              <div className="ops-flow-grid">
+                {liveFlowSteps.map((step) => (
+                  <article key={step.id} className={`ops-flow-column ops-tone-${step.tone}`}>
+                    <div className="ops-column-head">
+                      <div>
+                        <p className="ops-column-kicker">{step.label}</p>
+                        <h3>{step.title}</h3>
+                      </div>
+                      <span className={`status-chip ${step.tone}`}>{step.tone}</span>
+                    </div>
+                    <div className="ops-node">
+                      <strong>{step.label}</strong>
+                      <p>{step.detail}</p>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">5. Queue</p>
+                  <h2 className="page-title">Offene Jobs und letzte Queue-Eintraege</h2>
+                </div>
+                <span className="ops-header-note">{openQueueCount} Jobs aktuell offen</span>
+              </div>
+
+              <div className="ops-queue-grid">
+                <article className="ops-mini-stat">
+                  <span>Pending</span>
+                  <strong>{queueSummary.pending}</strong>
+                </article>
+                <article className="ops-mini-stat">
+                  <span>Sending</span>
+                  <strong>{queueSummary.sending}</strong>
+                </article>
+                <article className="ops-mini-stat">
+                  <span>Retry</span>
+                  <strong>{queueSummary.retry}</strong>
+                </article>
+                <article className="ops-mini-stat">
+                  <span>Sent</span>
+                  <strong>{queueSummary.sent}</strong>
+                </article>
+                <article className="ops-mini-stat">
+                  <span>Failed</span>
+                  <strong>{queueSummary.failed}</strong>
+                </article>
+              </div>
+
+              <div className="ops-feed">
+                {latestQueueItems.length ? (
+                  latestQueueItems.map((item) => (
+                    <article key={item.id} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{shortenText(item?.payload?.title || `Queue ${item.id}`, 72)}</strong>
+                        <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status}</span>
+                      </div>
+                      <p>
+                        {item.source_type || 'unknown'} | Retry {toNumber(item.retry_count)} | erstellt{' '}
+                        {formatDateTime(item.created_at)}
                       </p>
                       <p>
-                        Letzte Warnung:{' '}
-                        {item.lastIssue ? formatDateTime(item.lastIssue.created_at || item.lastIssue.createdAt) : '-'}
+                        {(item.targets || [])
+                          .map((target) => `${target.channel_type}:${target.status}`)
+                          .join(' | ') || 'Keine Targets'}
                       </p>
-                    </div>
-                  </article>
-                ))}
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Keine offenen Queue-Eintraege vorhanden.</p>
+                )}
               </div>
             </section>
 
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">Orientierung</p>
-                  <h2 className="page-title">Arbeitsbereiche und kurze Einordnung</h2>
+                  <p className="section-title">6. Sperren</p>
+                  <h2 className="page-title">Sperrzeiten und letzte gespeicherte Locks</h2>
                 </div>
+                <span className="ops-header-note">
+                  {repostCooldownEnabled ? `${repostCooldownHours} Stunden aktiv` : 'Sperrzeit deaktiviert'}
+                </span>
               </div>
 
-              <div className="ops-workspace-grid">
-                {workspaceCards.map((item) => (
-                  <Link key={item.title} to={item.path} className="ops-workspace-card">
-                    <div className="ops-card-top">
-                      <div>
-                        <span className="ops-card-label">{item.title}</span>
-                        <h3>{item.description}</h3>
+              <div className="ops-channel-stats">
+                <span>Gesamt: {historyItems.length}</span>
+                <span>Manuell: {lockSummary.manual}</span>
+                <span>Automatisch: {lockSummary.automatic}</span>
+                <span>Telegram: {lockSummary.telegram}</span>
+                <span>WhatsApp: {lockSummary.whatsapp}</span>
+                <span>Facebook: {lockSummary.facebook}</span>
+              </div>
+
+              <div className="ops-feed">
+                {latestHistoryItems.length ? (
+                  latestHistoryItems.map((item) => (
+                    <article key={item.id} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{shortenText(item.title || item.asin || item.normalizedUrl, 72)}</strong>
+                        <span className="status-chip info">{formatDateTime(item.postedAt)}</span>
                       </div>
-                      <span className="status-chip info">oeffnen</span>
-                    </div>
-                    <p className="ops-card-copy">
-                      {item.title === 'Generator' && 'Manueller Posting-Bereich fuer direkte Deals.'}
-                      {item.title === 'Scrapper' && 'Rohdeal-Eingang fuer Quellen und Imports.'}
-                      {item.title === 'Logik-Zentrale' && 'Bewertung, Muster-Erkennung, Regeln und Entscheidungen.'}
-                      {item.title === 'Publishing' && 'Kanaele, Queue, Worker und Versandstatus.'}
-                      {item.title === 'Deal Historie' && 'Verlauf, Repost-Sperre und Nachvollziehbarkeit.'}
-                    </p>
-                  </Link>
-                ))}
+                      <p>
+                        {item.channel || 'Kanal unbekannt'} | {item.originType || 'unknown'} | {item.sellerType || 'FBM'}
+                      </p>
+                      <p>{shortenText(item.normalizedUrl || item.url || item.originalUrl, 92)}</p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Noch keine Sperr-Eintraege vorhanden.</p>
+                )}
+              </div>
+            </section>
+
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">7. Letzte Deals</p>
+                  <h2 className="page-title">Zuletzt verarbeitete Deals</h2>
+                </div>
+                <span className="ops-header-note">{latestDeals.length} Eintraege sichtbar</span>
+              </div>
+
+              <div className="ops-feed">
+                {latestDeals.length ? (
+                  latestDeals.map((item, index) => (
+                    <article key={item.id || index} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{shortenText(item.title || item.source_name || `Deal ${index + 1}`, 72)}</strong>
+                        <span className={`status-chip ${getStatusTone(item.status)}`}>{item.status || 'unknown'}</span>
+                      </div>
+                      <p>
+                        {item.platform || 'Quelle'} | {item.seller_type || 'FBM'} | Score {toNumber(item.score)} | Rabatt{' '}
+                        {toNumber(item.detected_discount)}%
+                      </p>
+                      <p>
+                        Quelle {item.source_name || '-'} | {formatDateTime(item.created_at)}
+                      </p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Noch keine letzten Deals verfuegbar.</p>
+                )}
+              </div>
+            </section>
+
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">8. Fehler</p>
+                  <h2 className="page-title">Aktuelle Blocker und Warnungen</h2>
+                </div>
+                <span className="ops-header-note">{errorEntries.length} relevante Hinweise</span>
+              </div>
+
+              <div className="ops-feed">
+                {errorEntries.length ? (
+                  errorEntries.map((item) => (
+                    <article key={item.id} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{item.category}: {item.title}</strong>
+                        <span className={`status-chip ${item.tone}`}>{item.tone}</span>
+                      </div>
+                      <p>{shortenText(item.detail, 110)}</p>
+                      <p>{formatDateTime(item.time)}</p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Aktuell keine relevanten Fehler oder Warnungen.</p>
+                )}
+              </div>
+            </section>
+
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">9. Timeline</p>
+                  <h2 className="page-title">Chronologische Systemereignisse</h2>
+                </div>
+                <span className="ops-header-note">Deals, Quellen, Publishing und Sperren zusammengefuehrt</span>
+              </div>
+
+              <div className="ops-feed">
+                {timelineItems.length ? (
+                  timelineItems.map((item) => (
+                    <article key={item.id} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{item.category}: {shortenText(item.title, 72)}</strong>
+                        <span className={`status-chip ${item.tone}`}>{formatDateTime(item.time)}</span>
+                      </div>
+                      <p>{shortenText(item.detail, 110)}</p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Noch keine Timeline-Eintraege vorhanden.</p>
+                )}
               </div>
             </section>
           </>
         )}
       </div>
     </Layout>
-  );
+  )
 }
 
-export default HomePage;
+export default HomePage

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import { useAuth } from '../context/AuthContext';
+import TelegramUserClientPanel from '../components/telegram/TelegramUserClientPanel';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
 
@@ -472,11 +473,15 @@ function CopybotPage() {
     return (
       <div style={{ display: 'grid', gap: '1rem' }}>
         <section className="card" style={{ padding: '1.25rem' }}>
-          <p className="section-title">{currentTab === '/copybot/whatsapp-sources' ? 'WhatsApp Quellen' : 'Telegram Quellen'}</p>
+          <p className="section-title">
+            {currentTab === '/copybot/whatsapp-sources' ? 'WhatsApp Quellen' : 'Telegram Login & Quellen'}
+          </p>
           <h1 className="page-title">
             {currentTab === '/copybot/whatsapp-sources' ? 'WhatsApp Quellen' : 'Telegram Quellen'}
           </h1>
         </section>
+
+        {currentTab === '/copybot/telegram-sources' && <TelegramUserClientPanel onStatusChange={setStatus} />}
 
         {isAdmin && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>

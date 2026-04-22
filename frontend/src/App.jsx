@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { useAuth } from './context/AuthContext';
 import ProtectedRoute from './routes/ProtectedRoute';
@@ -18,6 +19,32 @@ function App() {
   const { user } = useAuth();
   const learningPageElement = user?.role === 'admin' ? <KeepaPage /> : <Navigate to="/generator" replace />;
 
+  useEffect(() => {
+    console.info('SYSTEM SPEC APPLIED', {
+      sections: ['Dashboard', 'Quellen', 'Regler', 'Output', 'Telegram Login', 'Sperrmodul', 'Queue']
+    });
+    console.info('PRIMARY DECISION SOURCE UPDATED', {
+      primary: 'internetvergleich',
+      fallback: 'keepa',
+      aiMode: 'optional_unsicherheitsfall'
+    });
+    console.info('NAVIGATION RESTORED', {
+      preservedMenus: [
+        'Dashboard',
+        'Generator',
+        'Scrapper',
+        'Copybot',
+        'Templates',
+        'Autobot',
+        'Logik-Zentrale',
+        'Publishing',
+        'Sperrzeiten',
+        'Logs',
+        'Einstellungen'
+      ]
+    });
+  }, []);
+
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
@@ -27,9 +54,11 @@ function App() {
           <ProtectedRoute>
             <Routes>
               <Route index element={<HomePage />} />
+              <Route path="dashboard" element={<HomePage />} />
               <Route path="generator" element={<GeneratorPosterPage />} />
               <Route path="templates" element={<TemplatesPage />} />
               <Route path="scraper" element={<ScraperPage />} />
+              <Route path="scrapper" element={<Navigate to="/scraper" replace />} />
               <Route path="autobot" element={<AutobotPage />} />
               <Route path="copybot" element={<CopybotPage />} />
               <Route path="copybot/telegram-sources" element={<CopybotPage />} />
@@ -40,6 +69,8 @@ function App() {
               <Route path="copybot/logs" element={<CopybotPage />} />
               <Route path="publishing" element={<PublishingPage />} />
               <Route path="publishing/workers" element={<PublishingPage />} />
+              <Route path="publishing/telegram" element={<PublishingPage />} />
+              <Route path="publishing/whatsapp" element={<PublishingPage />} />
               <Route path="publishing/facebook" element={<PublishingPage />} />
               <Route path="publishing/logs" element={<PublishingPage />} />
               <Route path="keepa" element={learningPageElement} />
@@ -62,8 +93,10 @@ function App() {
               <Route path="learning/fake-drop-analyse" element={learningPageElement} />
               <Route path="learning/review-queue" element={learningPageElement} />
               <Route path="learning/lern-datenbank" element={learningPageElement} />
+              <Route path="logic" element={<Navigate to="/learning" replace />} />
+              <Route path="sperrzeiten" element={<DealHistoryAdminPage />} />
+              <Route path="deal-history" element={<Navigate to="/sperrzeiten" replace />} />
               <Route path="logs" element={<LogsPage />} />
-              <Route path="deal-history" element={<DealHistoryAdminPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

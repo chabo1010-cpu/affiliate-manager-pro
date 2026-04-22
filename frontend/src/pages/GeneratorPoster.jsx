@@ -35,7 +35,6 @@ const newIconOptions = ['Jetzt', 'Deal', 'Neu'];
 const amazonScrapeApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/amazon/scrape`;
 const dealsCheckApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/deals/check`;
 const directPublishApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/posts/direct`;
-const publishingQueueApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'}/api/publishing/generator`;
 const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
 const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
 const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
@@ -529,51 +528,7 @@ function GeneratorPosterPage() {
     }
   };
 
-  async function fileToDataUrl(file) {
-    return await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          resolve(reader.result);
-          return;
-        }
-
-        reject(new Error('Upload-Datei konnte nicht gelesen werden.'));
-      };
-      reader.onerror = () => reject(new Error('Upload-Datei konnte nicht gelesen werden.'));
-      reader.readAsDataURL(file);
-    });
-  }
-
-  const buildGeneratorPayload = async () => {
-    const uploadForQueue = hasUploadedImage && uploadedImageFile ? await fileToDataUrl(uploadedImageFile) : '';
-
-    return {
-      title: scrapedTitle || generatedPost.productTitle,
-      link: amazonLink,
-      normalizedUrl: dealSnapshot?.normalizedUrl || '',
-      asin: dealSnapshot?.asin || '',
-      sellerType: dealSnapshot?.sellerType || 'FBM',
-      currentPrice: formattedCurrentPrice,
-      oldPrice: showOldPrice ? formattedOldPrice : '',
-      couponCode: rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '',
-      textByChannel: {
-        telegram: finalPostText,
-        whatsapp: generatedPost.whatsappText,
-        facebook: previewMainPost
-      },
-      generatedImagePath: scrapedImageUrl || '',
-      uploadedImagePath: uploadForQueue,
-      telegramImageSource: effectiveTelegramImageSource,
-      whatsappImageSource: effectiveWhatsappImageSource,
-      facebookImageSource: effectiveFacebookImageSource,
-      enableTelegram: telegramEnabled,
-      enableWhatsapp: whatsappEnabled,
-      enableFacebook: facebookEnabled
-    };
-  };
-
-  const handlePublish = async (mode) => {
+  const handlePublish = async () => {
     if (publishing) return;
 
     if (!hasScraped) {
@@ -593,7 +548,7 @@ function GeneratorPosterPage() {
       return;
     }
 
-    if (mode === 'direct' && !telegramEnabled) {
+    if (!telegramEnabled) {
       const message = 'Direct Publish ist aktuell nur mit aktiviertem Telegram-Kanal verfuegbar.';
       setFormError(message);
       showToast(message);
@@ -604,53 +559,39 @@ function GeneratorPosterPage() {
     setPublishing(true);
 
     try {
-      const endpoint = mode === 'direct' ? directPublishApiUrl : publishingQueueApiUrl;
-      let response;
+      const formData = new FormData();
+      formData.append('title', scrapedTitle || generatedPost.productTitle);
+      formData.append('link', amazonLink);
+      formData.append('normalizedUrl', dealSnapshot?.normalizedUrl || '');
+      formData.append('asin', dealSnapshot?.asin || '');
+      formData.append('sellerType', dealSnapshot?.sellerType || 'FBM');
+      formData.append('currentPrice', formattedCurrentPrice);
+      formData.append('oldPrice', showOldPrice ? formattedOldPrice : '');
+      formData.append('couponCode', rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '');
+      formData.append(
+        'textByChannel',
+        JSON.stringify({
+          telegram: finalPostText,
+          whatsapp: generatedPost.whatsappText,
+          facebook: previewMainPost
+        })
+      );
+      formData.append('generatedImagePath', scrapedImageUrl || '');
+      formData.append('telegramImageSource', effectiveTelegramImageSource);
+      formData.append('whatsappImageSource', effectiveWhatsappImageSource);
+      formData.append('facebookImageSource', effectiveFacebookImageSource);
+      formData.append('enableTelegram', String(telegramEnabled));
+      formData.append('enableWhatsapp', String(whatsappEnabled));
+      formData.append('enableFacebook', String(facebookEnabled));
 
-      if (mode === 'direct') {
-        const formData = new FormData();
-        formData.append('title', scrapedTitle || generatedPost.productTitle);
-        formData.append('link', amazonLink);
-        formData.append('normalizedUrl', dealSnapshot?.normalizedUrl || '');
-        formData.append('asin', dealSnapshot?.asin || '');
-        formData.append('sellerType', dealSnapshot?.sellerType || 'FBM');
-        formData.append('currentPrice', formattedCurrentPrice);
-        formData.append('oldPrice', showOldPrice ? formattedOldPrice : '');
-        formData.append('couponCode', rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '');
-        formData.append(
-          'textByChannel',
-          JSON.stringify({
-            telegram: finalPostText,
-            whatsapp: generatedPost.whatsappText,
-            facebook: previewMainPost
-          })
-        );
-        formData.append('generatedImagePath', scrapedImageUrl || '');
-        formData.append('telegramImageSource', effectiveTelegramImageSource);
-        formData.append('whatsappImageSource', effectiveWhatsappImageSource);
-        formData.append('facebookImageSource', effectiveFacebookImageSource);
-        formData.append('enableTelegram', String(telegramEnabled));
-        formData.append('enableWhatsapp', String(whatsappEnabled));
-        formData.append('enableFacebook', String(facebookEnabled));
-
-        if (hasUploadedImage && uploadedImageFile) {
-          formData.append('uploadedImageFile', uploadedImageFile);
-        }
-
-        response = await fetch(endpoint, {
-          method: 'POST',
-          body: formData
-        });
-      } else {
-        const queuePayload = await buildGeneratorPayload();
-        response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(queuePayload)
-        });
+      if (hasUploadedImage && uploadedImageFile) {
+        formData.append('uploadedImageFile', uploadedImageFile);
       }
+
+      const response = await fetch(directPublishApiUrl, {
+        method: 'POST',
+        body: formData
+      });
 
       const rawResponse = await response.text();
       let data = {};
@@ -668,14 +609,15 @@ function GeneratorPosterPage() {
         return;
       }
 
-      showToast(
-        mode === 'direct'
-          ? whatsappEnabled || facebookEnabled
-            ? 'Generator-Post veroeffentlicht. Weitere Kanaele sind fuer spaetere Direkt-Implementierung vorbereitet.'
-            : 'Erfolgreich veroeffentlicht'
-          : 'Generator-Post wurde in die Publishing Queue gelegt.',
-        SUCCESS_RESET_DELAY_MS
-      );
+      const queueStatus = String(data?.queue?.status || '').trim().toLowerCase();
+      const successMessage =
+        queueStatus === 'retry'
+          ? 'Generator-Post gespeichert. Versand laeuft ueber Retry weiter.'
+          : queueStatus === 'pending' || queueStatus === 'sending'
+            ? 'Generator-Post gespeichert und an die Queue uebergeben.'
+            : 'Erfolgreich veroeffentlicht';
+
+      showToast(successMessage, SUCCESS_RESET_DELAY_MS);
       resetTimeoutRef.current = window.setTimeout(() => {
         resetGeneratorState();
         resetTimeoutRef.current = null;
@@ -683,12 +625,8 @@ function GeneratorPosterPage() {
     } catch (error) {
       const message =
         error instanceof Error
-          ? mode === 'direct'
-            ? `Telegram-Verbindungsfehler: ${error.message}`
-            : `Queue-Verbindungsfehler: ${error.message}`
-          : mode === 'direct'
-            ? 'Telegram-Verbindungsfehler'
-            : 'Queue-Verbindungsfehler';
+          ? `Telegram-Verbindungsfehler: ${error.message}`
+          : 'Telegram-Verbindungsfehler';
 
       setFormError(message);
       showToast(message);
@@ -1010,7 +948,7 @@ function GeneratorPosterPage() {
                     <input ref={uploadInputRef} type="file" accept="image/*" onChange={handleUploadImage} />
                   </label>
                   <p className="generator-field-hint">
-                    Keine automatische Screenshot-Erstellung. Du entscheidest pro Generator-Deal zwischen Direct Publish und Publishing Queue.
+                    Keine automatische Screenshot-Erstellung. Der Generator veroeffentlicht Deals direkt aus dieser Ansicht.
                   </p>
                   {generatorPreviewImageUrl && (
                     <div className="generator-image-preview-card">
@@ -1101,16 +1039,8 @@ function GeneratorPosterPage() {
                 <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
                   <button
                     type="button"
-                    className="generator-action-button secondary"
-                    onClick={() => void handlePublish('queue')}
-                    disabled={publishing}
-                  >
-                    {publishing ? 'Wird verarbeitet...' : 'In Queue legen'}
-                  </button>
-                  <button
-                    type="button"
                     className="generator-action-button primary"
-                    onClick={() => void handlePublish('direct')}
+                    onClick={() => void handlePublish()}
                     disabled={publishing}
                   >
                     {publishing ? 'Wird veroeffentlicht...' : 'Veroeffentlichen'}

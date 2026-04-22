@@ -90,6 +90,14 @@ function DealHistoryAdminPage() {
         : settings.repostCooldownHours === 24
           ? '24h'
           : 'custom';
+
+  useEffect(() => {
+    document.title = 'Sperrzeiten - Affiliate Manager Pro';
+    console.info('DEAL HISTORY RENAMED TO SPERRZEITEN', {
+      route: '/sperrzeiten'
+    });
+  }, []);
+
   const loadSettings = async () => {
     try {
       const data = await requestJson(adminSettingsApiUrl);
@@ -125,7 +133,7 @@ function DealHistoryAdminPage() {
       const data = await requestJson(`${adminHistoryApiUrl}?${params.toString()}`);
       setItems(Array.isArray(data?.items) ? data.items : []);
     } catch (error) {
-      showToast(error instanceof Error ? error.message : 'Deal-Historie konnte nicht geladen werden');
+      showToast(error instanceof Error ? error.message : 'Sperrzeiten konnten nicht geladen werden');
     } finally {
       setLoading(false);
     }
@@ -188,7 +196,7 @@ function DealHistoryAdminPage() {
       <div className="deal-admin-page">
         <section className="card deal-admin-hero">
           <p className="section-title">AFFILIATE MANAGER</p>
-          <h1 className="page-title">Deal Historie</h1>
+          <h1 className="page-title">Sperrzeiten</h1>
           <p className="page-subtitle">
             Interne Repost-Sperre, Verlauf und Preisentwicklung an einer Stelle.
           </p>
@@ -200,7 +208,7 @@ function DealHistoryAdminPage() {
             <strong>{settings.repostCooldownEnabled ? `${settings.repostCooldownHours} Stunden` : 'Deaktiviert'}</strong>
           </article>
           <article className="card deal-admin-stat">
-            <span>Historien-Eintraege</span>
+            <span>Eintraege</span>
             <strong>{stats.deals}</strong>
           </article>
         </section>
@@ -366,7 +374,7 @@ function DealHistoryAdminPage() {
           <div className="deal-admin-table-header">
             <div>
               <p className="section-title">Gespeicherte Beitraege</p>
-              <h2 className="page-title">Historie</h2>
+              <h2 className="page-title">Sperrzeiten-Verlauf</h2>
             </div>
             {loading && <span className="badge">Laedt...</span>}
           </div>
