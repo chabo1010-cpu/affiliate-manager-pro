@@ -177,7 +177,7 @@ const USAGE_LOG_MODULE_MAP = {
 
 const DEFAULT_SETTINGS = {
   keepaEnabled: true,
-  schedulerEnabled: false,
+  schedulerEnabled: true,
   domainId: 3,
   defaultCategories: [],
   defaultDiscount: 40,
@@ -6023,9 +6023,21 @@ export function startKeepaScheduler() {
   }
 
   schedulerStarted = true;
+  console.info('Scheduler gestartet', {
+    intervalMs: SCHEDULER_INTERVAL_MS,
+    scope: 'deal-processing'
+  });
   setInterval(() => {
     void runDueRules();
   }, SCHEDULER_INTERVAL_MS);
 
   void runDueRules();
+}
+
+export function getKeepaSchedulerRuntimeStatus() {
+  return {
+    started: schedulerStarted,
+    running: schedulerRunning,
+    intervalMs: SCHEDULER_INTERVAL_MS
+  };
 }

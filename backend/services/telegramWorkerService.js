@@ -1,4 +1,5 @@
 import { cleanText, savePostedDeal } from './dealHistoryService.js';
+import { buildPublishingChannelLabel } from './databaseService.js';
 import { sendTelegramDealToTargets } from './telegramBotClientService.js';
 
 export async function processTelegramPublishingTarget(target, queuePayload) {
@@ -22,29 +23,31 @@ export async function processTelegramPublishingTarget(target, queuePayload) {
     rabattgutscheinCode: queuePayload.couponCode
   });
 
-  result.targets.forEach((delivery) => {
-    savePostedDeal({
-      asin: queuePayload.asin || '',
-      originalUrl: queuePayload.link,
-      normalizedUrl: queuePayload.normalizedUrl || queuePayload.link,
-      title: queuePayload.title,
-      currentPrice: queuePayload.currentPrice || '',
-      oldPrice: queuePayload.oldPrice || '',
-      sellerType: queuePayload.sellerType || 'FBM',
-      postedAt,
-      channel: delivery.targetName ? `TELEGRAM:${delivery.targetName}` : 'TELEGRAM',
-      couponCode: queuePayload.couponCode || '',
-      sourceType: cleanText(queuePayload.databaseSourceType) || 'publisher_queue',
-      sourceId: queuePayload.generatorPostId || queuePayload.sourceId || null,
-      queueId: target.queue_id,
-      origin: cleanText(queuePayload.databaseOrigin) || 'automatic',
-      decisionReason: 'Telegram Queue-Target erfolgreich veroeffentlicht.',
-      meta: {
-        targetId: target.id,
-        delivery
-      }
+  if (queuePayload.skipPostedDealHistory !== true) {
+    result.targets.forEach((delivery) => {
+      savePostedDeal({
+        asin: queuePayload.asin || '',
+        originalUrl: queuePayload.link,
+        normalizedUrl: queuePayload.normalizedUrl || queuePayload.link,
+        title: queuePayload.title,
+        currentPrice: queuePayload.currentPrice || '',
+        oldPrice: queuePayload.oldPrice || '',
+        sellerType: queuePayload.sellerType || 'FBM',
+        postedAt,
+        channel: buildPublishingChannelLabel('telegram', target.target_label || delivery.targetName || target.target_ref || ''),
+        couponCode: queuePayload.couponCode || '',
+        sourceType: cleanText(queuePayload.databaseSourceType) || 'publisher_queue',
+        sourceId: queuePayload.generatorPostId || queuePayload.sourceId || null,
+        queueId: target.queue_id,
+        origin: cleanText(queuePayload.databaseOrigin) || 'automatic',
+        decisionReason: 'Telegram Queue-Target erfolgreich veroeffentlicht.',
+        meta: {
+          targetId: target.id,
+          delivery
+        }
+      });
     });
-  });
+  }
 
   return result;
 }

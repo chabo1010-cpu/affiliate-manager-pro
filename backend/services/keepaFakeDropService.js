@@ -1436,6 +1436,89 @@ export function persistFakeDropAnalysis(resultInput, options = {}) {
   };
 }
 
+export function evaluateKeepaFakeDropHeuristics(resultInput = {}, options = {}) {
+  const result = normalizeResultInput(resultInput);
+  const settings = getFakeDropSettingsView();
+
+  if (!settings.engineEnabled && options.force !== true) {
+    return {
+      available: false,
+      engineEnabled: false,
+      engineVersion: settings.engineVersion || ENGINE_VERSION,
+      classification: 'manuelle_pruefung',
+      classificationLabel: CLASSIFICATION_LABELS.manuelle_pruefung,
+      reviewRecommended: false,
+      fakeDropRisk: null,
+      reviewPriority: null,
+      analysisReason: 'Fake-Drop-Heuristik ist deaktiviert.',
+      features: {},
+      flags: [],
+      positives: [],
+      reasons: [],
+      chartPoints: [],
+      priceSeries: [],
+      similarCaseSummary: buildSimilarCaseSummary([]),
+      similarCases: []
+    };
+  }
+
+  const feedbackAdjustments = getFeedbackAdjustments();
+  const analysis = analyzeTimeSeries(result, settings, feedbackAdjustments);
+  const similarCaseSignals =
+    options.includeSimilarCases === false
+      ? {
+          sellerType: normalizeSellerType(result.sellerType),
+          consideredCount: 0,
+          matchedCount: 0,
+          cases: [],
+          summary: buildSimilarCaseSummary([])
+        }
+      : getSimilarCaseSignals(
+          {
+            asin: result.asin,
+            sellerType: result.sellerType,
+            categoryName: result.categoryName,
+            sourceType: result.origin,
+            currentPrice: result.currentPrice,
+            keepaDiscount: result.keepaDiscount,
+            fakeDropRisk: analysis.fakeDropRisk,
+            classification: analysis.classification,
+            features: analysis.features
+          },
+          {
+            skipLog: options.skipLog === true
+          }
+        );
+
+  return {
+    available:
+      Array.isArray(analysis.priceSeries) && analysis.priceSeries.length > 0
+        ? true
+        : Boolean(
+            analysis.features?.historySpanDays ||
+              analysis.features?.currentPrice !== null ||
+              analysis.features?.avg90 !== null ||
+              analysis.features?.avg180 !== null
+          ),
+    engineEnabled: true,
+    engineVersion: analysis.engineVersion || settings.engineVersion || ENGINE_VERSION,
+    classification: analysis.classification,
+    classificationLabel: analysis.classificationLabel,
+    reviewRecommended: analysis.reviewRecommended,
+    fakeDropRisk: analysis.fakeDropRisk,
+    reviewPriority: analysis.reviewPriority,
+    analysisReason: analysis.analysisReason,
+    features: analysis.features,
+    flags: analysis.flags,
+    positives: analysis.positives,
+    reasons: Array.isArray(analysis.reasoning?.reasons) ? analysis.reasoning.reasons : [],
+    chartPoints: Array.isArray(analysis.chartPoints) ? analysis.chartPoints : [],
+    priceSeries: Array.isArray(analysis.priceSeries) ? analysis.priceSeries : [],
+    similarCaseSummary: similarCaseSignals.summary,
+    similarCases: similarCaseSignals.cases
+  };
+}
+
 export function getFakeDropSettingsView() {
   const settings = normalizeSettingsRow(getSettingsRow());
   const feedbackAdjustments = Object.values(getFeedbackAdjustments())

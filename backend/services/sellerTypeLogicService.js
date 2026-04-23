@@ -1,5 +1,6 @@
 import { getDb } from '../db.js';
 import { normalizeSellerType } from './dealHistoryService.js';
+import { logGeneratorDebug } from './generatorFlowService.js';
 
 const db = getDb();
 
@@ -90,6 +91,46 @@ function fromJson(value, fallback) {
 function normalizeClassification(value) {
   const normalized = cleanText(String(value || '')).toLowerCase();
   return KNOWN_CLASSIFICATIONS.has(normalized) ? normalized : 'manuelle_pruefung';
+}
+
+function normalizeCount(value, max = 999) {
+  const numeric = parseNumber(value, 0);
+  return clamp(Math.round(numeric ?? 0), 0, max);
+}
+
+function normalizeAdjustment(value, min, max) {
+  const numeric = parseNumber(value, 0) ?? 0;
+  return Math.round(clamp(numeric, min, max) * 10) / 10;
+}
+
+function normalizeFeedbackSummary(summary, sellerType) {
+  const source = summary && typeof summary === 'object' ? summary : {};
+
+  return {
+    sellerType,
+    total: normalizeCount(source.total),
+    positiveCount: normalizeCount(source.positiveCount),
+    negativeCount: normalizeCount(source.negativeCount),
+    uncertainCount: normalizeCount(source.uncertainCount),
+    riskAdjustment: normalizeAdjustment(source.riskAdjustment, -8, 8),
+    scoreAdjustment: normalizeAdjustment(source.scoreAdjustment, -10, 10),
+    labelCounts: source.labelCounts && typeof source.labelCounts === 'object' ? source.labelCounts : {},
+    tagCounts: source.tagCounts && typeof source.tagCounts === 'object' ? source.tagCounts : {}
+  };
+}
+
+function normalizeSimilarCaseSummary(summary) {
+  const source = summary && typeof summary === 'object' ? summary : {};
+
+  return {
+    total: normalizeCount(source.total),
+    positiveCount: normalizeCount(source.positiveCount),
+    negativeCount: normalizeCount(source.negativeCount),
+    uncertainCount: normalizeCount(source.uncertainCount),
+    dominantLabel: cleanText(source.dominantLabel),
+    riskAdjustment: normalizeAdjustment(source.riskAdjustment, -10, 10),
+    scoreAdjustment: normalizeAdjustment(source.scoreAdjustment, -12, 12)
+  };
 }
 
 function countTags(rows = []) {
@@ -191,39 +232,38 @@ export function getSellerTypeFeedbackSummary(inputSellerType = 'FBM') {
 export function evaluateSellerTypeDeal(input = {}) {
   const sellerType = normalizeSellerType(input.sellerType);
   const config = getSellerTypeLogicConfig(sellerType);
-  const feedbackSummary =
-    input.feedbackSummary?.sellerType === sellerType ? input.feedbackSummary : getSellerTypeFeedbackSummary(sellerType);
-  const similarCaseSummary =
-    input.similarCaseSummary && typeof input.similarCaseSummary === 'object'
-      ? {
-          total: parseNumber(input.similarCaseSummary.total, 0) ?? 0,
-          positiveCount: parseNumber(input.similarCaseSummary.positiveCount, 0) ?? 0,
-          negativeCount: parseNumber(input.similarCaseSummary.negativeCount, 0) ?? 0,
-          uncertainCount: parseNumber(input.similarCaseSummary.uncertainCount, 0) ?? 0,
-          dominantLabel: cleanText(input.similarCaseSummary.dominantLabel),
-          riskAdjustment: parseNumber(input.similarCaseSummary.riskAdjustment, 0) ?? 0,
-          scoreAdjustment: parseNumber(input.similarCaseSummary.scoreAdjustment, 0) ?? 0
-        }
-      : {
-          total: 0,
-          positiveCount: 0,
-          negativeCount: 0,
-          uncertainCount: 0,
-          dominantLabel: '',
-          riskAdjustment: 0,
-          scoreAdjustment: 0
-        };
+  const feedbackSummary = normalizeFeedbackSummary(
+    input.feedbackSummary?.sellerType === sellerType ? input.feedbackSummary : getSellerTypeFeedbackSummary(sellerType),
+    sellerType
+  );
+  const similarCaseSummary = normalizeSimilarCaseSummary(input.similarCaseSummary);
   const keepaAvailable = input.keepaAvailable === true;
   const keepaDiscount = parseNumber(input.keepaDiscount, 0) ?? 0;
   const keepaDealScore = parseNumber(input.keepaDealScore ?? input.dealScore, 0) ?? 0;
   const fakeDropRiskRaw = parseNumber(input.fakeDropRisk, null);
-  const combinedRiskAdjustment = feedbackSummary.riskAdjustment + similarCaseSummary.riskAdjustment;
-  const combinedScoreAdjustment = feedbackSummary.scoreAdjustment + similarCaseSummary.scoreAdjustment;
+  const combinedRiskAdjustment = normalizeAdjustment(
+    feedbackSummary.riskAdjustment + similarCaseSummary.riskAdjustment,
+    -18,
+    18
+  );
+  const combinedScoreAdjustment = normalizeAdjustment(
+    feedbackSummary.scoreAdjustment + similarCaseSummary.scoreAdjustment,
+    -18,
+    18
+  );
   const fakeDropRisk =
     fakeDropRiskRaw === null ? null : Math.round(clamp(fakeDropRiskRaw + combinedRiskAdjustment, 0, 100) * 10) / 10;
-  const fakeDropClassification = normalizeClassification(input.fakeDropClassification);
+  const rawFakeDropClassification = cleanText(String(input.fakeDropClassification || '')).toLowerCase();
+  const fakeDropClassification = normalizeClassification(rawFakeDropClassification);
+  if (rawFakeDropClassification && !KNOWN_CLASSIFICATIONS.has(rawFakeDropClassification)) {
+    logGeneratorDebug('UNKNOWN FAKE DROP CLASSIFICATION', {
+      sellerType,
+      receivedClassification: rawFakeDropClassification,
+      fallbackClassification: fakeDropClassification
+    });
+  }
   const riskPenalty = fakeDropRisk === null ? 0 : Math.max(0, fakeDropRisk - config.maxFakeDropRisk) * 0.7;
-  const finalScore = clamp(Math.round(keepaDealScore + combinedScoreAdjustment - riskPenalty), 0, 100);
+  const finalScore = clamp(Math.round(clamp(keepaDealScore + combinedScoreAdjustment - riskPenalty, 0, 100)), 0, 100);
   const checks = {
     keepaAvailable,
     minDiscountPassed: keepaDiscount >= config.minDiscount,

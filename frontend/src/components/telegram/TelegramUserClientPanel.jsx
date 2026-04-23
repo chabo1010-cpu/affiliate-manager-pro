@@ -19,10 +19,10 @@ function formatDateTime(value) {
   }).format(parsed);
 }
 
-function TelegramUserClientPanel({ onStatusChange }) {
+function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default-user' }) {
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin';
-  const [sessionName, setSessionName] = useState('default-user');
+  const [sessionName, setSessionName] = useState(initialSessionName || 'default-user');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [phoneCode, setPhoneCode] = useState('');
   const [password, setPassword] = useState('');
@@ -280,6 +280,14 @@ function TelegramUserClientPanel({ onStatusChange }) {
   useEffect(() => {
     void loadStatus();
   }, [isAdmin, user?.role]);
+
+  useEffect(() => {
+    if (!initialSessionName) {
+      return;
+    }
+
+    setSessionName(initialSessionName);
+  }, [initialSessionName]);
 
   useEffect(() => {
     if (!currentPendingLogin) {

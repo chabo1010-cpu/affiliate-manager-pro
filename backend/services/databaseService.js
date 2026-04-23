@@ -7,6 +7,7 @@ export const CENTRAL_DATABASE_COLLECTIONS = {
   sessions: ['app_sessions', 'telegram_reader_sessions', 'telegram_reader_channels'],
   sperrmodul: ['deals_history'],
   queue: ['publishing_queue', 'publishing_targets'],
+  advertising: ['advertising_modules', 'advertising_jobs'],
   logs: ['publishing_logs', 'copybot_logs', 'keepa_usage_logs', 'amazon_api_logs'],
   dealStatus: ['deal_status_registry']
 };
@@ -84,7 +85,7 @@ function buildSessionKey(input = {}) {
   return `${moduleName}:${sessionType}:${externalRef}`;
 }
 
-function buildDealKey(input = {}) {
+export function buildDealStatusKey(input = {}) {
   const explicitKey = cleanText(input.dealKey || input.fallbackKey);
   if (explicitKey) {
     return explicitKey;
@@ -112,6 +113,17 @@ function buildDealKey(input = {}) {
   }
 
   return '';
+}
+
+export function buildPublishingChannelLabel(channelType = '', targetLabel = '') {
+  const normalizedChannel = cleanText(channelType).toUpperCase();
+  const normalizedTargetLabel = cleanText(targetLabel);
+
+  if (!normalizedChannel) {
+    return normalizedTargetLabel;
+  }
+
+  return normalizedTargetLabel ? `${normalizedChannel}:${normalizedTargetLabel}` : normalizedChannel;
 }
 
 function readAppSessionByKey(sessionKey) {
@@ -245,7 +257,7 @@ export function upsertAppSession(input = {}) {
 }
 
 export function upsertDealStatusState(input = {}) {
-  const dealKey = buildDealKey(input);
+  const dealKey = buildDealStatusKey(input);
   if (!dealKey) {
     return null;
   }
@@ -387,7 +399,7 @@ export function syncDealStatusWithQueue(input = {}) {
   const target = input.target && typeof input.target === 'object' ? input.target : null;
   const channelType = cleanText(target?.channel_type || target?.channelType).toUpperCase();
   const targetLabel = cleanText(target?.target_label || target?.targetLabel);
-  const channel = channelType ? `${channelType}${targetLabel ? `:${targetLabel}` : ''}` : '';
+  const channel = buildPublishingChannelLabel(channelType, targetLabel);
 
   return upsertDealStatusState({
     asin: cleanText(payload.asin),
@@ -415,7 +427,7 @@ export function syncDealStatusWithQueue(input = {}) {
 
 export function syncImportedDealState(input = {}) {
   return upsertDealStatusState({
-    dealKey: buildDealKey({
+    dealKey: buildDealStatusKey({
       asin: input.asin,
       normalizedUrl: input.normalizedUrl,
       originalUrl: input.originalUrl

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import { useAuth } from '../context/AuthContext';
+import TelegramGroupManager from '../components/telegram/TelegramGroupManager';
 import TelegramUserClientPanel from '../components/telegram/TelegramUserClientPanel';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
@@ -49,6 +50,7 @@ function CopybotPage() {
   const [reviewItems, setReviewItems] = useState([]);
   const [logs, setLogs] = useState([]);
   const [status, setStatus] = useState('');
+  const [telegramReaderSessionName, setTelegramReaderSessionName] = useState('default-user');
   const [loading, setLoading] = useState(true);
   const [sourceForm, setSourceForm] = useState({
     id: 0,
@@ -470,6 +472,29 @@ function CopybotPage() {
   }
 
   function renderSources() {
+    if (currentTab === '/copybot/telegram-sources') {
+      return (
+        <div style={{ display: 'grid', gap: '1rem' }}>
+          <section className="card" style={{ padding: '1.25rem' }}>
+            <p className="section-title">Telegram Quellen</p>
+            <h1 className="page-title">Telegram Gruppen</h1>
+            <p className="page-subtitle" style={{ marginBottom: 0 }}>
+              Gruppen einfach eintragen, aktivieren und nur bei Bedarf erweitern.
+            </p>
+          </section>
+
+          <TelegramGroupManager
+            onStatusChange={setStatus}
+            onSessionNameChange={setTelegramReaderSessionName}
+          />
+          <TelegramUserClientPanel
+            onStatusChange={setStatus}
+            initialSessionName={telegramReaderSessionName}
+          />
+        </div>
+      );
+    }
+
     return (
       <div style={{ display: 'grid', gap: '1rem' }}>
         <section className="card" style={{ padding: '1.25rem' }}>
@@ -480,8 +505,6 @@ function CopybotPage() {
             {currentTab === '/copybot/whatsapp-sources' ? 'WhatsApp Quellen' : 'Telegram Quellen'}
           </h1>
         </section>
-
-        {currentTab === '/copybot/telegram-sources' && <TelegramUserClientPanel onStatusChange={setStatus} />}
 
         {isAdmin && (
           <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '0.75rem' }}>

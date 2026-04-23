@@ -1,6 +1,6 @@
 import { getDb } from '../db.js';
 import { assertDealNotLocked, cleanText } from './dealHistoryService.js';
-import { syncDealStatusWithQueue } from './databaseService.js';
+import { buildDealStatusKey, syncDealStatusWithQueue } from './databaseService.js';
 import {
   PUBLISHING_QUEUE_STATUS,
   isFailedPublishingQueueStatus,
@@ -18,6 +18,8 @@ import { processFacebookPublishingTarget } from './facebookWorkerService.js';
 
 const db = getDb();
 const PUBLISHER_LOOP_INTERVAL_MS = 15 * 1000;
+const SQLITE_RETRY_ATTEMPTS = 6;
+const SQLITE_RETRY_BASE_DELAY_MS = 40;
 let publishingWorkerLoopStarted = false;
 let publishingWorkerLoopRunning = false;
 
@@ -41,6 +43,41 @@ function parseJson(value, fallback = null) {
   }
 }
 
+function sleepSync(delayMs) {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return;
+  }
+
+  const sharedArray = new SharedArrayBuffer(4);
+  const view = new Int32Array(sharedArray);
+  Atomics.wait(view, 0, 0, delayMs);
+}
+
+function isSqliteBusyError(error) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /SQLITE_BUSY|database is locked|database schema is locked/i.test(message);
+}
+
+function runWithSqliteWriteRetry(operation, { attempts = SQLITE_RETRY_ATTEMPTS, baseDelayMs = SQLITE_RETRY_BASE_DELAY_MS } = {}) {
+  let lastError;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      lastError = error;
+      if (!isSqliteBusyError(error) || attempt === attempts - 1) {
+        throw error;
+      }
+
+      const delayMs = Math.min(300, baseDelayMs * 2 ** attempt);
+      sleepSync(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
 function getAppSettings() {
   return db.prepare(`SELECT * FROM app_settings WHERE id = 1`).get();
 }
@@ -54,6 +91,21 @@ function getPublishingOrigin(sourceType = '', originOverride = '') {
   return ['generator', 'generator_direct', 'manual_post'].includes(cleanText(sourceType).toLowerCase())
     ? 'manual'
     : 'automatic';
+}
+
+function buildDealLockError(message = 'Deal-Lock aktiv: Der Deal ist bereits in Queue oder Verarbeitung.', meta = null) {
+  const error = new Error(message);
+  error.code = 'DEAL_LOCK_ACTIVE_QUEUE';
+  error.retryable = false;
+  if (meta && typeof meta === 'object') {
+    error.meta = meta;
+  }
+  return error;
+}
+
+function isActiveDealKeyConstraintError(error) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /idx_publishing_queue_active_deal_key|UNIQUE constraint failed: publishing_queue\.deal_key/i.test(message);
 }
 
 function logPublishing({ queueId = null, targetId = null, workerType = null, level = 'info', eventType, message, payload = null }) {
@@ -71,6 +123,23 @@ function logPublishing({ queueId = null, targetId = null, workerType = null, lev
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `
   ).run(queueId, targetId, workerType, level, eventType, message, payload ? stringifyJson(payload) : null, nowIso());
+}
+
+function safeLogPublishing(input = {}) {
+  try {
+    runWithSqliteWriteRetry(() => logPublishing(input));
+  } catch (error) {
+    console.error('PUBLISHING LOG WRITE FAILED', error instanceof Error ? error.message : error);
+  }
+}
+
+function safeSyncDealStatusWithQueue(input = {}) {
+  try {
+    return runWithSqliteWriteRetry(() => syncDealStatusWithQueue(input));
+  } catch (error) {
+    console.error('DEAL STATUS SYNC FAILED', error instanceof Error ? error.message : error);
+    return null;
+  }
 }
 
 function normalizeTarget(target = {}) {
@@ -99,6 +168,9 @@ function mapPublishingQueueRow(queue, targets = []) {
   return {
     ...queue,
     status: normalizePublishingQueueStatus(queue.status, queue.status),
+    dealKey: queue.deal_key || '',
+    attemptCount: Number(queue.attempt_count || 0),
+    retryCount: Number(queue.retry_count || 0),
     payload: parseJson(queue.payload_json, {}),
     targets: targets.map(mapPublishingTargetRow)
   };
@@ -129,167 +201,203 @@ function getSelectedImage(payload, imageSource) {
     return variants.standard || '';
   }
 
-  if (imageSource === 'link_preview' || imageSource === 'none') {
-    return '';
-  }
-
   return '';
 }
 
 function buildChannelPayload(payload, channelType) {
   const texts = payload.textByChannel || {};
-  const couponCode = cleanText(payload.couponCode);
 
   return {
     text: texts[channelType] || texts.telegram || payload.title || '',
     imageUrl: getSelectedImage(payload, payload.targetImageSources?.[channelType] || 'none'),
     link: cleanText(payload.link),
-    couponCode
+    couponCode: cleanText(payload.couponCode)
   };
 }
 
-export function createPublishingEntry({ sourceType, sourceId = null, payload, targets = [], originOverride = '' }) {
-  const timestamp = nowIso();
-  const origin = getPublishingOrigin(sourceType, originOverride);
-  const enrichedPayload = {
-    ...(payload && typeof payload === 'object' ? payload : {}),
-    sourceId: sourceId ?? payload?.sourceId ?? null,
-    databaseSourceType: sourceType,
-    databaseOrigin: origin
-  };
-  const normalizedTargets = expandPublishingTargets(
-    enrichedPayload,
-    targets.map(normalizeTarget).filter((item) => item.channelType)
-  );
+const insertPublishingEntryTransaction = db.transaction(
+  ({ sourceType, sourceId, payload, targets, originOverride = '', skipDealLock = false }) => {
+    const timestamp = nowIso();
+    const origin = getPublishingOrigin(sourceType, originOverride);
+    const enrichedPayload = {
+      ...(payload && typeof payload === 'object' ? payload : {}),
+      sourceId: sourceId ?? payload?.sourceId ?? null,
+      databaseSourceType: sourceType,
+      databaseOrigin: origin
+    };
+    const normalizedTargets = expandPublishingTargets(
+      enrichedPayload,
+      (Array.isArray(targets) ? targets : []).map(normalizeTarget).filter((item) => item.channelType)
+    );
+    const dealKey = buildDealStatusKey({
+      asin: enrichedPayload.asin,
+      normalizedUrl: enrichedPayload.normalizedUrl || enrichedPayload.link,
+      originalUrl: enrichedPayload.link,
+      queueId: null
+    });
 
-  assertDealNotLocked({
-    asin: enrichedPayload.asin,
-    url: enrichedPayload.link,
-    normalizedUrl: enrichedPayload.normalizedUrl || enrichedPayload.link,
-    sourceType,
-    origin
-  });
+    if (!skipDealLock && enrichedPayload.skipDealLock !== true) {
+      assertDealNotLocked({
+        asin: enrichedPayload.asin,
+        url: enrichedPayload.link,
+        normalizedUrl: enrichedPayload.normalizedUrl || enrichedPayload.link,
+        sourceType,
+        origin
+      });
+    }
 
-  const queueResult = db
-    .prepare(
+    const queueResult = db
+      .prepare(
+        `
+          INSERT INTO publishing_queue (
+            source_type,
+            source_id,
+            status,
+            payload_json,
+            deal_key,
+            attempt_count,
+            retry_count,
+            next_retry_at,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?, ?)
+        `
+      )
+      .run(
+        sourceType,
+        sourceId,
+        PUBLISHING_QUEUE_STATUS.pending,
+        stringifyJson(enrichedPayload),
+        dealKey || null,
+        timestamp,
+        timestamp
+      );
+
+    const queueId = Number(queueResult.lastInsertRowid);
+    const targetStatement = db.prepare(
       `
-        INSERT INTO publishing_queue (
-          source_type,
-          source_id,
+        INSERT INTO publishing_targets (
+          queue_id,
+          channel_type,
+          is_enabled,
+          image_source,
+          target_ref,
+          target_label,
+          target_meta_json,
           status,
-          payload_json,
-          retry_count,
-          next_retry_at,
+          posted_at,
+          error_message,
           created_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, 0, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
       `
-    )
-    .run(sourceType, sourceId, PUBLISHING_QUEUE_STATUS.pending, stringifyJson(enrichedPayload), timestamp, timestamp);
-
-  const queueId = queueResult.lastInsertRowid;
-  const targetStatement = db.prepare(
-    `
-      INSERT INTO publishing_targets (
-        queue_id,
-        channel_type,
-        is_enabled,
-        image_source,
-        target_ref,
-        target_label,
-        target_meta_json,
-        status,
-        posted_at,
-        error_message,
-        created_at,
-        updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-    `
-  );
-
-  normalizedTargets.forEach((target) => {
-    targetStatement.run(
-      queueId,
-      target.channelType,
-      target.isEnabled ? 1 : 0,
-      target.imageSource,
-      target.targetRef || null,
-      target.targetLabel || null,
-      target.targetMeta ? stringifyJson(target.targetMeta) : null,
-      PUBLISHING_QUEUE_STATUS.pending,
-      timestamp,
-      timestamp
     );
-  });
 
-  logPublishing({
-    queueId,
-    workerType: 'publisher',
-    eventType: 'queue.created',
-    message: `Publishing-Eintrag aus ${sourceType} erstellt.`,
-    payload: {
+    normalizedTargets.forEach((target) => {
+      targetStatement.run(
+        queueId,
+        target.channelType,
+        target.isEnabled ? 1 : 0,
+        target.imageSource,
+        target.targetRef || null,
+        target.targetLabel || null,
+        target.targetMeta ? stringifyJson(target.targetMeta) : null,
+        PUBLISHING_QUEUE_STATUS.pending,
+        timestamp,
+        timestamp
+      );
+    });
+
+    logPublishing({
+      queueId,
+      workerType: 'publisher',
+      eventType: 'queue.created',
+      message: `Publishing-Eintrag aus ${sourceType} erstellt.`,
+      payload: {
+        sourceId,
+        dealKey,
+        targets: normalizedTargets
+      }
+    });
+
+    syncDealStatusWithQueue({
+      queueId,
+      queueStatus: PUBLISHING_QUEUE_STATUS.pending,
+      payload: enrichedPayload,
+      sourceType,
       sourceId,
-      targets: normalizedTargets
-    }
-  });
+      message: `Queue fuer ${sourceType} erstellt.`,
+      origin,
+      meta: {
+        dealKey,
+        targetCount: normalizedTargets.length
+      }
+    });
 
-  syncDealStatusWithQueue({
-    queueId,
-    queueStatus: PUBLISHING_QUEUE_STATUS.pending,
-    payload: enrichedPayload,
-    sourceType,
-    sourceId,
-    message: `Queue fuer ${sourceType} erstellt.`,
-    origin,
-    meta: {
-      targetCount: normalizedTargets.length
-    }
-  });
+    return queueId;
+  }
+);
 
-  return getPublishingQueueEntry(queueId);
+export function createPublishingEntry(input = {}) {
+  try {
+    const queueId = runWithSqliteWriteRetry(() => insertPublishingEntryTransaction(input));
+    return getPublishingQueueEntry(queueId);
+  } catch (error) {
+    if (isActiveDealKeyConstraintError(error)) {
+      throw buildDealLockError(undefined, {
+        sourceType: cleanText(input.sourceType),
+        asin: cleanText(input.payload?.asin),
+        normalizedUrl: cleanText(input.payload?.normalizedUrl || input.payload?.link)
+      });
+    }
+
+    throw error;
+  }
 }
 
 export function createGeneratorPublishingEntry(input = {}) {
   const timestamp = nowIso();
-  const generatorResult = db
-    .prepare(
-      `
-        INSERT INTO generator_posts (
-          title,
-          product_link,
-          asin,
-          normalized_url,
-          seller_type,
-          telegram_text,
-          whatsapp_text,
-          facebook_text,
-          generated_image_path,
-          uploaded_image_path,
-          telegram_image_source,
-          whatsapp_image_source,
-          facebook_image_source,
-          created_at,
-          updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `
-    )
-    .run(
-      cleanText(input.title),
-      cleanText(input.link),
-      cleanText(input.asin).toUpperCase(),
-      cleanText(input.normalizedUrl),
-      cleanText(input.sellerType) || 'FBM',
-      cleanText(input.textByChannel?.telegram),
-      cleanText(input.textByChannel?.whatsapp),
-      cleanText(input.textByChannel?.facebook),
-      cleanText(input.generatedImagePath),
-      cleanText(input.uploadedImagePath),
-      cleanText(input.telegramImageSource) || 'standard',
-      cleanText(input.whatsappImageSource) || 'standard',
-      cleanText(input.facebookImageSource) || 'link_preview',
-      timestamp,
-      timestamp
-    );
+  const generatorResult = runWithSqliteWriteRetry(() =>
+    db
+      .prepare(
+        `
+          INSERT INTO generator_posts (
+            title,
+            product_link,
+            asin,
+            normalized_url,
+            seller_type,
+            telegram_text,
+            whatsapp_text,
+            facebook_text,
+            generated_image_path,
+            uploaded_image_path,
+            telegram_image_source,
+            whatsapp_image_source,
+            facebook_image_source,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      )
+      .run(
+        cleanText(input.title),
+        cleanText(input.link),
+        cleanText(input.asin).toUpperCase(),
+        cleanText(input.normalizedUrl),
+        cleanText(input.sellerType) || 'FBM',
+        cleanText(input.textByChannel?.telegram),
+        cleanText(input.textByChannel?.whatsapp),
+        cleanText(input.textByChannel?.facebook),
+        cleanText(input.generatedImagePath),
+        cleanText(input.uploadedImagePath),
+        cleanText(input.telegramImageSource) || 'standard',
+        cleanText(input.whatsappImageSource) || 'standard',
+        cleanText(input.facebookImageSource) || 'link_preview',
+        timestamp,
+        timestamp
+      )
+  );
 
   return createPublishingEntry({
     sourceType: 'generator',
@@ -401,26 +509,35 @@ export function getWorkerStatus() {
 }
 
 export function saveFacebookWorkerSettings(input = {}) {
-  db.prepare(
-    `
-      UPDATE app_settings
-      SET facebookEnabled = ?,
-          facebookSessionMode = ?,
-          facebookDefaultRetryLimit = ?,
-          facebookDefaultTarget = ?
-      WHERE id = 1
-    `
-  ).run(
-    input.facebookEnabled ? 1 : 0,
-    cleanText(input.facebookSessionMode) || 'persistent',
-    Number(input.facebookDefaultRetryLimit ?? 3),
-    cleanText(input.facebookDefaultTarget) || null
+  runWithSqliteWriteRetry(() =>
+    db
+      .prepare(
+        `
+          UPDATE app_settings
+          SET facebookEnabled = ?,
+              facebookSessionMode = ?,
+              facebookDefaultRetryLimit = ?,
+              facebookDefaultTarget = ?
+          WHERE id = 1
+        `
+      )
+      .run(
+        input.facebookEnabled ? 1 : 0,
+        cleanText(input.facebookSessionMode) || 'persistent',
+        Number(input.facebookDefaultRetryLimit ?? 3),
+        cleanText(input.facebookDefaultTarget) || null
+      )
   );
 
   return getWorkerStatus().facebook;
 }
 
 function updateQueueStatus(queueId) {
+  const queue = db.prepare(`SELECT status, next_retry_at FROM publishing_queue WHERE id = ?`).get(queueId);
+  if (!queue) {
+    return null;
+  }
+
   const targets = db.prepare(`SELECT status FROM publishing_targets WHERE queue_id = ? AND is_enabled = 1`).all(queueId);
   const normalizedStatuses = targets.map((item) => normalizePublishingQueueStatus(item.status, item.status));
   const nextStatus = normalizedStatuses.every((status) => isSentPublishingQueueStatus(status))
@@ -434,8 +551,18 @@ function updateQueueStatus(queueId) {
           : normalizedStatuses.some((status) => isFailedPublishingQueueStatus(status))
             ? PUBLISHING_QUEUE_STATUS.failed
             : PUBLISHING_QUEUE_STATUS.pending;
+  const nextRetryAt = nextStatus === PUBLISHING_QUEUE_STATUS.retry ? queue.next_retry_at || null : null;
 
-  db.prepare(`UPDATE publishing_queue SET status = ?, updated_at = ? WHERE id = ?`).run(nextStatus, nowIso(), queueId);
+  runWithSqliteWriteRetry(() =>
+    db.prepare(`UPDATE publishing_queue SET status = ?, next_retry_at = ?, updated_at = ? WHERE id = ?`).run(
+      nextStatus,
+      nextRetryAt,
+      nowIso(),
+      queueId
+    )
+  );
+
+  return nextStatus;
 }
 
 function resolveRetryLimitForTarget(target, settings = getAppSettings()) {
@@ -454,39 +581,65 @@ function resolveRetryLimitForTarget(target, settings = getAppSettings()) {
   return Number(settings?.facebookDefaultRetryLimit ?? 3);
 }
 
+function markTargetProcessing(target) {
+  const timestamp = nowIso();
+
+  runWithSqliteWriteRetry(() => {
+    db.prepare(`UPDATE publishing_targets SET status = ?, updated_at = ? WHERE id = ?`).run(
+      PUBLISHING_QUEUE_STATUS.sending,
+      timestamp,
+      target.id
+    );
+    db.prepare(
+      `
+        UPDATE publishing_queue
+        SET status = ?,
+            attempt_count = COALESCE(attempt_count, 0) + 1,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.sending, timestamp, target.queue_id);
+  });
+}
+
 function markTargetFailed(target, errorMessage, retry = true, retryLimitOverride = null) {
   const settings = getAppSettings();
   const retryLimit = Number.isFinite(Number(retryLimitOverride))
     ? Number(retryLimitOverride)
     : resolveRetryLimitForTarget(target, settings);
   const queue = db.prepare(`SELECT retry_count FROM publishing_queue WHERE id = ?`).get(target.queue_id);
-  const nextRetryCount = Number(queue?.retry_count ?? 0) + 1;
-  const canRetry = retry && nextRetryCount <= retryLimit;
+  const nextRetryCountCandidate = Number(queue?.retry_count ?? 0) + 1;
+  const canRetry = retry && nextRetryCountCandidate <= retryLimit;
   const nextRetryAt = canRetry ? new Date(Date.now() + 15 * 60 * 1000).toISOString() : null;
 
-  db.prepare(
-    `
-      UPDATE publishing_targets
-      SET status = ?, error_message = ?, updated_at = ?
-      WHERE id = ?
-    `
-  ).run(canRetry ? PUBLISHING_QUEUE_STATUS.retry : PUBLISHING_QUEUE_STATUS.failed, errorMessage, nowIso(), target.id);
+  runWithSqliteWriteRetry(() => {
+    db.prepare(
+      `
+        UPDATE publishing_targets
+        SET status = ?, error_message = ?, updated_at = ?
+        WHERE id = ?
+      `
+    ).run(canRetry ? PUBLISHING_QUEUE_STATUS.retry : PUBLISHING_QUEUE_STATUS.failed, errorMessage, nowIso(), target.id);
 
-  db.prepare(
-    `
-      UPDATE publishing_queue
-      SET status = ?, retry_count = ?, next_retry_at = ?, updated_at = ?
-      WHERE id = ?
-    `
-  ).run(
-    canRetry ? PUBLISHING_QUEUE_STATUS.retry : PUBLISHING_QUEUE_STATUS.failed,
-    nextRetryCount,
-    nextRetryAt,
-    nowIso(),
-    target.queue_id
-  );
+    db.prepare(
+      `
+        UPDATE publishing_queue
+        SET status = ?,
+            retry_count = ?,
+            next_retry_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(
+      canRetry ? PUBLISHING_QUEUE_STATUS.retry : PUBLISHING_QUEUE_STATUS.failed,
+      canRetry ? nextRetryCountCandidate : Number(queue?.retry_count ?? 0),
+      nextRetryAt,
+      nowIso(),
+      target.queue_id
+    );
+  });
 
-  logPublishing({
+  safeLogPublishing({
     queueId: target.queue_id,
     targetId: target.id,
     workerType: target.channel_type,
@@ -503,18 +656,21 @@ function markTargetFailed(target, errorMessage, retry = true, retryLimitOverride
 
 function markTargetSent(target, workerType, workerResult = {}) {
   const timestamp = nowIso();
-  db.prepare(
-    `
-      UPDATE publishing_targets
-      SET status = ?,
-          posted_at = ?,
-          error_message = NULL,
-          updated_at = ?
-      WHERE id = ?
-    `
-  ).run(PUBLISHING_QUEUE_STATUS.sent, timestamp, timestamp, target.id);
 
-  logPublishing({
+  runWithSqliteWriteRetry(() =>
+    db.prepare(
+      `
+        UPDATE publishing_targets
+        SET status = ?,
+            posted_at = ?,
+            error_message = NULL,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.sent, timestamp, timestamp, target.id)
+  );
+
+  safeLogPublishing({
     queueId: target.queue_id,
     targetId: target.id,
     workerType,
@@ -524,57 +680,68 @@ function markTargetSent(target, workerType, workerResult = {}) {
   });
 }
 
-async function processTarget(target) {
+function getTargetProcessor(target, processorOverrides = {}) {
+  const processors = {
+    telegram: processTelegramPublishingTarget,
+    whatsapp: processWhatsappPublishingTarget,
+    facebook: processFacebookPublishingTarget,
+    ...(processorOverrides && typeof processorOverrides === 'object' ? processorOverrides : {})
+  };
+
+  return processors[target.channel_type] || null;
+}
+
+async function processTarget(target, processorOverrides = {}) {
   const queue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
   const payload = parseJson(queue?.payload_json, {});
-  db.prepare(`UPDATE publishing_targets SET status = ?, updated_at = ? WHERE id = ?`).run(
-    PUBLISHING_QUEUE_STATUS.sending,
-    nowIso(),
-    target.id
-  );
-  db.prepare(`UPDATE publishing_queue SET status = ?, updated_at = ? WHERE id = ?`).run(
-    PUBLISHING_QUEUE_STATUS.sending,
-    nowIso(),
-    target.queue_id
-  );
+  const origin = getPublishingOrigin(queue?.source_type || '', payload.databaseOrigin || '');
+  const channelPayload = buildChannelPayload(payload, target.channel_type);
+  const workerPayload = {
+    ...payload,
+    textByChannel: {
+      ...(payload.textByChannel || {}),
+      [target.channel_type]: channelPayload.text
+    }
+  };
+
+  markTargetProcessing(target);
 
   try {
-    assertDealNotLocked({
-      asin: payload.asin,
-      url: payload.link,
-      normalizedUrl: payload.normalizedUrl || payload.link,
-      queueId: target.queue_id,
-      sourceType: queue?.source_type || '',
-      origin: getPublishingOrigin(queue?.source_type || '')
-    });
+    if (payload.skipDealLock !== true) {
+      assertDealNotLocked({
+        asin: payload.asin,
+        url: payload.link,
+        normalizedUrl: payload.normalizedUrl || payload.link,
+        queueId: target.queue_id,
+        sourceType: queue?.source_type || '',
+        origin
+      });
+    }
 
-    let workerResult;
-    if (target.channel_type === 'telegram') {
-      workerResult = await processTelegramPublishingTarget(target, payload);
-    } else if (target.channel_type === 'whatsapp') {
-      workerResult = await processWhatsappPublishingTarget(target, payload);
-    } else if (target.channel_type === 'facebook') {
-      workerResult = await processFacebookPublishingTarget(target, payload);
-    } else {
+    const processor = getTargetProcessor(target, processorOverrides);
+    if (!processor) {
       throw new Error(`Unbekannter Channel ${target.channel_type}`);
     }
 
+    const workerResult = await processor(target, workerPayload, queue);
     markTargetSent(target, target.channel_type, workerResult);
-    updateQueueStatus(target.queue_id);
+    const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.sent;
     const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
-    syncDealStatusWithQueue({
+    safeSyncDealStatusWithQueue({
       queueId: target.queue_id,
-      queueStatus: normalizePublishingQueueStatus(updatedQueue?.status, PUBLISHING_QUEUE_STATUS.sent),
+      queueStatus: normalizePublishingQueueStatus(queueStatus, PUBLISHING_QUEUE_STATUS.sent),
       payload,
       sourceType: queue?.source_type || '',
       sourceId: queue?.source_id ?? null,
       target,
       message: `${target.channel_type} Target erfolgreich verarbeitet.`,
-      origin: getPublishingOrigin(queue?.source_type || ''),
+      origin,
       meta: {
-        workerResult
+        workerResult,
+        dealKey: updatedQueue?.deal_key || ''
       }
     });
+
     return {
       targetId: target.id,
       channelType: target.channel_type,
@@ -582,25 +749,43 @@ async function processTarget(target) {
       workerResult
     };
   } catch (error) {
-    markTargetFailed(
-      target,
-      error instanceof Error ? error.message : 'Worker-Fehler',
-      !(error instanceof Error && error.retryable === false),
-      error instanceof Error ? error.retryLimit : null
-    );
-    updateQueueStatus(target.queue_id);
-    const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
-    syncDealStatusWithQueue({
-      queueId: target.queue_id,
-      queueStatus: normalizePublishingQueueStatus(updatedQueue?.status, PUBLISHING_QUEUE_STATUS.failed),
-      payload,
-      sourceType: queue?.source_type || '',
-      sourceId: queue?.source_id ?? null,
-      target,
-      message: `${target.channel_type} Target fehlgeschlagen.`,
-      errorMessage: error instanceof Error ? error.message : 'Worker-Fehler',
-      origin: getPublishingOrigin(queue?.source_type || '')
-    });
+    try {
+      markTargetFailed(
+        target,
+        error instanceof Error ? error.message : 'Worker-Fehler',
+        !(error instanceof Error && error.retryable === false),
+        error instanceof Error ? error.retryLimit : null
+      );
+      const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.failed;
+      const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
+      safeSyncDealStatusWithQueue({
+        queueId: target.queue_id,
+        queueStatus: normalizePublishingQueueStatus(queueStatus, PUBLISHING_QUEUE_STATUS.failed),
+        payload,
+        sourceType: queue?.source_type || '',
+        sourceId: queue?.source_id ?? null,
+        target,
+        message: `${target.channel_type} Target fehlgeschlagen.`,
+        errorMessage: error instanceof Error ? error.message : 'Worker-Fehler',
+        origin,
+        meta: {
+          dealKey: updatedQueue?.deal_key || ''
+        }
+      });
+    } catch (stateError) {
+      safeLogPublishing({
+        queueId: target.queue_id,
+        targetId: target.id,
+        workerType: target.channel_type,
+        level: 'error',
+        eventType: 'target.state.error',
+        message: stateError instanceof Error ? stateError.message : 'Queue-Status konnte nach Fehler nicht aktualisiert werden.',
+        payload: {
+          originalError: error instanceof Error ? error.message : 'Worker-Fehler'
+        }
+      });
+    }
+
     return {
       targetId: target.id,
       channelType: target.channel_type,
@@ -644,43 +829,37 @@ function listRunnableTargets({ channelType = null, queueId = null, limit = 20 } 
 
 function recoverInterruptedPublishingTargets() {
   const timestamp = nowIso();
-  const recoveredTargets = db
-    .prepare(
-      `
-        UPDATE publishing_targets
-        SET status = ?, updated_at = ?
-        WHERE status IN (?, ?)
-      `
-    )
-    .run(
-      PUBLISHING_QUEUE_STATUS.retry,
-      timestamp,
-      PUBLISHING_QUEUE_STATUS.sending,
-      'processing'
-    ).changes;
-  const recoveredQueues = db
-    .prepare(
-      `
-        UPDATE publishing_queue
-        SET status = ?,
-            next_retry_at = NULL,
-            updated_at = ?
-        WHERE status IN (?, ?)
-      `
-    )
-    .run(
-      PUBLISHING_QUEUE_STATUS.retry,
-      timestamp,
-      PUBLISHING_QUEUE_STATUS.sending,
-      'processing'
-    ).changes;
+  const recoveredTargets = runWithSqliteWriteRetry(() =>
+    db
+      .prepare(
+        `
+          UPDATE publishing_targets
+          SET status = ?, updated_at = ?
+          WHERE status IN (?, ?)
+        `
+      )
+      .run(PUBLISHING_QUEUE_STATUS.retry, timestamp, PUBLISHING_QUEUE_STATUS.sending, 'processing').changes
+  );
+  const recoveredQueues = runWithSqliteWriteRetry(() =>
+    db
+      .prepare(
+        `
+          UPDATE publishing_queue
+          SET status = ?,
+              next_retry_at = NULL,
+              updated_at = ?
+          WHERE status IN (?, ?)
+        `
+      )
+      .run(PUBLISHING_QUEUE_STATUS.retry, timestamp, PUBLISHING_QUEUE_STATUS.sending, 'processing').changes
+  );
 
   if (recoveredTargets || recoveredQueues) {
     console.info('QUEUE RECOVERY APPLIED', {
       recoveredQueues,
       recoveredTargets
     });
-    logPublishing({
+    safeLogPublishing({
       workerType: 'publisher',
       eventType: 'queue.recovered',
       message: `${recoveredTargets} Target(s) und ${recoveredQueues} Queue(s) nach Neustart auf Retry gesetzt.`,
@@ -690,6 +869,15 @@ function recoverInterruptedPublishingTargets() {
       }
     });
   }
+
+  return {
+    recoveredQueues,
+    recoveredTargets
+  };
+}
+
+export function recoverPublishingQueueState() {
+  return recoverInterruptedPublishingTargets();
 }
 
 export async function runPublishingWorkers(channelType = null, options = {}) {
@@ -701,12 +889,12 @@ export async function runPublishingWorkers(channelType = null, options = {}) {
 
   const results = [];
   for (const target of targets) {
-    results.push(await processTarget(target));
+    results.push(await processTarget(target, options?.processors || {}));
   }
   return results;
 }
 
-export async function processPublishingQueueEntry(queueId) {
+export async function processPublishingQueueEntry(queueId, options = {}) {
   const results = [];
 
   while (true) {
@@ -720,7 +908,7 @@ export async function processPublishingQueueEntry(queueId) {
     }
 
     for (const target of batch) {
-      results.push(await processTarget(target));
+      results.push(await processTarget(target, options?.processors || {}));
     }
   }
 
@@ -746,7 +934,7 @@ async function drainPublishingQueue() {
       });
     }
   } catch (error) {
-    logPublishing({
+    safeLogPublishing({
       workerType: 'publisher',
       level: 'error',
       eventType: 'queue.resume.error',
@@ -764,8 +952,9 @@ export function startPublishingWorkerLoop() {
 
   publishingWorkerLoopStarted = true;
   recoverInterruptedPublishingTargets();
-  console.info('QUEUE RESUME ACTIVE', {
-    intervalMs: PUBLISHER_LOOP_INTERVAL_MS
+  console.info('Queue Worker aktiv', {
+    intervalMs: PUBLISHER_LOOP_INTERVAL_MS,
+    handles: ['pending', 'retry', 'recovery']
   });
 
   setInterval(() => {
@@ -775,29 +964,40 @@ export function startPublishingWorkerLoop() {
   void drainPublishingQueue();
 }
 
+export function getPublishingWorkerRuntimeStatus() {
+  return {
+    started: publishingWorkerLoopStarted,
+    running: publishingWorkerLoopRunning,
+    intervalMs: PUBLISHER_LOOP_INTERVAL_MS
+  };
+}
+
 export function retryPublishingQueue(queueId) {
-  db.prepare(
-    `
-      UPDATE publishing_queue
-      SET status = ?,
-          next_retry_at = NULL,
-          updated_at = ?
-      WHERE id = ?
-    `
-  ).run(PUBLISHING_QUEUE_STATUS.retry, nowIso(), queueId);
-  db.prepare(
-    `
-      UPDATE publishing_targets
-      SET status = CASE WHEN status = ? THEN ? ELSE status END,
-          updated_at = ?
-      WHERE queue_id = ?
-    `
-  ).run(PUBLISHING_QUEUE_STATUS.failed, PUBLISHING_QUEUE_STATUS.retry, nowIso(), queueId);
-  updateQueueStatus(queueId);
+  runWithSqliteWriteRetry(() => {
+    db.prepare(
+      `
+        UPDATE publishing_queue
+        SET status = ?,
+            next_retry_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.retry, nowIso(), queueId);
+    db.prepare(
+      `
+        UPDATE publishing_targets
+        SET status = CASE WHEN status = ? THEN ? ELSE status END,
+            updated_at = ?
+        WHERE queue_id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.failed, PUBLISHING_QUEUE_STATUS.retry, nowIso(), queueId);
+  });
+
+  const queueStatus = updateQueueStatus(queueId) || PUBLISHING_QUEUE_STATUS.retry;
   const queue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(queueId);
-  syncDealStatusWithQueue({
+  safeSyncDealStatusWithQueue({
     queueId,
-    queueStatus: PUBLISHING_QUEUE_STATUS.retry,
+    queueStatus,
     payload: parseJson(queue?.payload_json, {}),
     sourceType: queue?.source_type || '',
     sourceId: queue?.source_id ?? null,

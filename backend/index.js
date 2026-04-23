@@ -16,8 +16,11 @@ import settingsRoutes from './routes/settings.js';
 import historyRoutes from './routes/history.js';
 import keepaRoutes from './routes/keepa.js';
 import learningRoutes from './routes/learning.js';
+import dealEngineRoutes from './routes/dealEngine.js';
+import advertisingRoutes from './routes/advertising.js';
 import { startKeepaScheduler } from './services/keepaService.js';
 import { startPublishingWorkerLoop } from './services/publisherService.js';
+import { startAdvertisingScheduler } from './services/advertisingService.js';
 
 const app = express();
 const port = getApiPort();
@@ -61,9 +64,12 @@ app.use('/api/telegram', telegramRoutes);
 app.use('/api/publishing', publishingRoutes);
 app.use('/api/keepa', keepaRoutes);
 app.use('/api/learning', learningRoutes);
+app.use('/api/deal-engine', dealEngineRoutes);
+app.use('/api/advertising', advertisingRoutes);
 
 startKeepaScheduler();
 startPublishingWorkerLoop();
+startAdvertisingScheduler();
 
 app.get('/', (req, res) => {
   res.json({ status: 'Affiliate Manager Pro API laeuft', version: '0.1.0' });

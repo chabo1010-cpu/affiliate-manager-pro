@@ -15,6 +15,31 @@ import { buildGeneratorDealContext } from '../services/generatorDealScoringServi
 const router = express.Router();
 const db = getDb();
 
+function parseBooleanFlag(value, fallback = true) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    return value === 1;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+
+  return fallback;
+}
+
 function extractFirstMatch(html, patterns) {
   for (const pattern of patterns) {
     const match = html.match(pattern);
@@ -81,7 +106,16 @@ router.get('/', async (req, res) => {
 });
 
 router.post('/check', async (req, res) => {
-  const { url = '', asin = '', normalizedUrl = '', sellerType = '', currentPrice = '', title = '', imageUrl = '' } = req.body ?? {};
+  const {
+    url = '',
+    asin = '',
+    normalizedUrl = '',
+    sellerType = '',
+    currentPrice = '',
+    title = '',
+    imageUrl = '',
+    includeGeneratorContext
+  } = req.body ?? {};
   const requestPayload = {
     url: typeof url === 'string' ? url.trim() : '',
     asin: typeof asin === 'string' ? asin.trim() : '',
@@ -89,7 +123,8 @@ router.post('/check', async (req, res) => {
     sellerType: typeof sellerType === 'string' ? sellerType.trim() : '',
     currentPrice,
     title: typeof title === 'string' ? title.trim() : '',
-    imageUrl: typeof imageUrl === 'string' ? imageUrl.trim() : ''
+    imageUrl: typeof imageUrl === 'string' ? imageUrl.trim() : '',
+    includeGeneratorContext: parseBooleanFlag(includeGeneratorContext, true)
   };
 
   logGeneratorDebug('api.deals.check.request', requestPayload);
@@ -146,31 +181,37 @@ router.post('/check', async (req, res) => {
     normalizedUrl: result.normalizedUrl || null,
     resolvedFinalUrl: identity.resolvedFinalUrl || null,
     lastDeal: result.lastDeal || null,
-    activeRegistryLock: result.activeRegistryLock || null
+    activeRegistryLock: result.activeRegistryLock || null,
+    generatorContext: null,
+    generatorContextPending: requestPayload.includeGeneratorContext !== true
   };
 
-  try {
-    responsePayload.generatorContext = await buildGeneratorDealContext({
-      asin: responsePayload.asin || identity.asin || '',
-      sellerType: requestPayload.sellerType || responsePayload.sellerType || 'FBM',
-      currentPrice: requestPayload.currentPrice || result.lastDeal?.currentPrice || '',
-      title: requestPayload.title || result.lastDeal?.title || '',
-      productUrl: responsePayload.resolvedFinalUrl || responsePayload.normalizedUrl || requestPayload.url,
-      imageUrl: requestPayload.imageUrl || '',
-      source: 'generator_check'
-    });
-  } catch (error) {
-    responsePayload.generatorContext = {
-      asin: responsePayload.asin || identity.asin || '',
-      sellerType: responsePayload.sellerType || 'FBM',
-      keepa: {
-        available: false,
-        status: 'error',
-        reason: error instanceof Error ? error.message : 'Generator-Kontext konnte nicht aufgebaut werden.'
-      },
-      evaluation: null,
-      review: null
-    };
+  if (requestPayload.includeGeneratorContext === true) {
+    try {
+      responsePayload.generatorContext = await buildGeneratorDealContext({
+        asin: responsePayload.asin || identity.asin || '',
+        sellerType: requestPayload.sellerType || responsePayload.sellerType || 'FBM',
+        currentPrice: requestPayload.currentPrice || result.lastDeal?.currentPrice || '',
+        title: requestPayload.title || result.lastDeal?.title || '',
+        productUrl: responsePayload.resolvedFinalUrl || responsePayload.normalizedUrl || requestPayload.url,
+        imageUrl: requestPayload.imageUrl || '',
+        source: 'generator_check'
+      });
+      responsePayload.generatorContextPending = false;
+    } catch (error) {
+      responsePayload.generatorContext = {
+        asin: responsePayload.asin || identity.asin || '',
+        sellerType: responsePayload.sellerType || 'FBM',
+        keepa: {
+          available: false,
+          status: 'error',
+          reason: error instanceof Error ? error.message : 'Generator-Kontext konnte nicht aufgebaut werden.'
+        },
+        evaluation: null,
+        review: null
+      };
+      responsePayload.generatorContextPending = false;
+    }
   }
 
   logGeneratorDebug('api.deals.check.response', {
@@ -179,6 +220,7 @@ router.post('/check', async (req, res) => {
     normalizedUrl: responsePayload.normalizedUrl,
     postingCount: responsePayload.postingCount,
     remainingSeconds: responsePayload.remainingSeconds,
+    generatorContextPending: responsePayload.generatorContextPending,
     keepaStatus: responsePayload.generatorContext?.keepa?.status || 'missing',
     sellerTypeDecision: responsePayload.generatorContext?.evaluation?.decision || 'unavailable'
   });

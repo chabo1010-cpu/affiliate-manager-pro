@@ -83,6 +83,7 @@ const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 5000');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS deals_history (
@@ -234,6 +235,8 @@ db.exec(`
     source_id INTEGER,
     status TEXT NOT NULL DEFAULT 'queued',
     payload_json TEXT NOT NULL,
+    deal_key TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
     created_at TEXT NOT NULL,
@@ -268,6 +271,67 @@ db.exec(`
     FOREIGN KEY (target_id) REFERENCES publishing_targets(id)
   );
 
+  CREATE TABLE IF NOT EXISTS advertising_modules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot_number INTEGER NOT NULL UNIQUE,
+    module_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'paused',
+    priority TEXT NOT NULL DEFAULT 'medium',
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    frequency_mode TEXT NOT NULL DEFAULT 'daily',
+    times_json TEXT NOT NULL DEFAULT '["09:00"]',
+    weekdays_json TEXT NOT NULL DEFAULT '[]',
+    interval_hours INTEGER NOT NULL DEFAULT 6,
+    interval_days INTEGER NOT NULL DEFAULT 1,
+    max_per_day INTEGER NOT NULL DEFAULT 1,
+    main_text TEXT NOT NULL DEFAULT '',
+    extra_text TEXT NOT NULL DEFAULT '',
+    image_data_url TEXT,
+    image_filename TEXT,
+    telegram_enabled INTEGER NOT NULL DEFAULT 1,
+    telegram_target_ids_json TEXT NOT NULL DEFAULT '[]',
+    whatsapp_enabled INTEGER NOT NULL DEFAULT 0,
+    whatsapp_targets_json TEXT NOT NULL DEFAULT '[]',
+    last_scheduled_at TEXT,
+    last_success_at TEXT,
+    last_failure_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS advertising_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id INTEGER NOT NULL,
+    module_name TEXT NOT NULL,
+    job_type TEXT NOT NULL DEFAULT 'scheduled',
+    dedupe_key TEXT NOT NULL UNIQUE,
+    scheduled_for TEXT NOT NULL,
+    scheduled_date_key TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'queued',
+    queue_id INTEGER,
+    queue_status TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
+    last_error TEXT,
+    delivered_channels_json TEXT NOT NULL DEFAULT '[]',
+    target_snapshot_json TEXT NOT NULL DEFAULT '[]',
+    payload_snapshot_json TEXT,
+    sent_at TEXT,
+    failed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (module_id) REFERENCES advertising_modules(id),
+    FOREIGN KEY (queue_id) REFERENCES publishing_queue(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_advertising_modules_status ON advertising_modules (status, slot_number);
+  CREATE INDEX IF NOT EXISTS idx_advertising_jobs_scheduled_for ON advertising_jobs (scheduled_for DESC);
+  CREATE INDEX IF NOT EXISTS idx_advertising_jobs_status ON advertising_jobs (status, scheduled_for DESC);
+  CREATE INDEX IF NOT EXISTS idx_advertising_jobs_queue_id ON advertising_jobs (queue_id);
+
   CREATE TABLE IF NOT EXISTS telegram_reader_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -287,6 +351,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS telegram_reader_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER,
+    slot_index INTEGER,
     channel_ref TEXT NOT NULL,
     channel_title TEXT,
     channel_type TEXT NOT NULL DEFAULT 'group',
@@ -377,13 +442,15 @@ db.exec(`
     facebookEnabled INTEGER NOT NULL DEFAULT 0,
     facebookSessionMode TEXT NOT NULL DEFAULT 'persistent',
     facebookDefaultRetryLimit INTEGER NOT NULL DEFAULT 3,
-    facebookDefaultTarget TEXT
+    facebookDefaultTarget TEXT,
+    telegramReaderGroupSlotCount INTEGER NOT NULL DEFAULT 10,
+    schedulerBootstrapVersion INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS keepa_settings (
     id INTEGER PRIMARY KEY,
     keepa_enabled INTEGER NOT NULL DEFAULT 1,
-    scheduler_enabled INTEGER NOT NULL DEFAULT 0,
+    scheduler_enabled INTEGER NOT NULL DEFAULT 1,
     domain_id INTEGER NOT NULL DEFAULT 3,
     default_categories_json TEXT NOT NULL DEFAULT '[]',
     default_discount REAL NOT NULL DEFAULT 40,
@@ -721,6 +788,73 @@ ensureColumn(
   `telegramCopyButtonText TEXT NOT NULL DEFAULT '${DEFAULT_TELEGRAM_COPY_BUTTON_TEXT}'`
 );
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS deal_engine_settings (
+    id INTEGER PRIMARY KEY,
+    amazon_day_min_market_pct REAL NOT NULL DEFAULT 15,
+    amazon_night_min_market_pct REAL NOT NULL DEFAULT 25,
+    fbm_day_min_market_pct REAL NOT NULL DEFAULT 20,
+    fbm_night_min_market_pct REAL NOT NULL DEFAULT 30,
+    keepa_approve_score REAL NOT NULL DEFAULT 70,
+    keepa_queue_score REAL NOT NULL DEFAULT 50,
+    queue_margin_pct REAL NOT NULL DEFAULT 3,
+    queue_enabled INTEGER NOT NULL DEFAULT 1,
+    night_mode_enabled INTEGER NOT NULL DEFAULT 1,
+    night_start_hour INTEGER NOT NULL DEFAULT 22,
+    night_end_hour INTEGER NOT NULL DEFAULT 6,
+    cheap_product_limit REAL NOT NULL DEFAULT 20,
+    require_market_for_cheap INTEGER NOT NULL DEFAULT 1,
+    require_market_for_no_name INTEGER NOT NULL DEFAULT 1,
+    telegram_output_enabled INTEGER NOT NULL DEFAULT 1,
+    whatsapp_output_enabled INTEGER NOT NULL DEFAULT 1,
+    ai_resolver_enabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS deal_engine_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT,
+    source_platform TEXT,
+    source_type TEXT,
+    amazon_url TEXT NOT NULL,
+    asin TEXT,
+    title TEXT,
+    seller_area TEXT NOT NULL DEFAULT 'FBM',
+    amazon_price REAL,
+    market_price REAL,
+    lowest_price REAL,
+    market_advantage_pct REAL,
+    market_offer_count INTEGER NOT NULL DEFAULT 0,
+    keepa_score REAL,
+    keepa_discount_avg90 REAL,
+    keepa_discount_avg180 REAL,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    keepa_fallback_used INTEGER NOT NULL DEFAULT 0,
+    ai_status TEXT NOT NULL DEFAULT 'not_needed',
+    ai_needed INTEGER NOT NULL DEFAULT 0,
+    ai_used INTEGER NOT NULL DEFAULT 0,
+    ai_escalation TEXT NOT NULL DEFAULT 'not_needed',
+    fake_pattern_status TEXT NOT NULL DEFAULT 'clear',
+    day_part TEXT NOT NULL DEFAULT 'day',
+    decision TEXT NOT NULL DEFAULT 'REJECT',
+    decision_reason TEXT,
+    market_comparison_json TEXT,
+    reason_details_json TEXT,
+    output_status TEXT NOT NULL DEFAULT 'none',
+    output_queue_id INTEGER,
+    output_target_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT,
+    analysis_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_deal_engine_runs_created_at ON deal_engine_runs (created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_deal_engine_runs_decision ON deal_engine_runs (decision, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_deal_engine_runs_output_queue ON deal_engine_runs (output_queue_id);
+`);
+
 ensureColumn(
   'app_settings',
   'telegramCopyButtonText',
@@ -728,6 +862,8 @@ ensureColumn(
 );
 ensureColumn('app_settings', 'copybotEnabled', `copybotEnabled INTEGER NOT NULL DEFAULT 0`);
 ensureColumn('app_settings', 'telegramBotEnabled', `telegramBotEnabled INTEGER NOT NULL DEFAULT 1`);
+ensureColumn('app_settings', 'telegramReaderGroupSlotCount', `telegramReaderGroupSlotCount INTEGER NOT NULL DEFAULT 10`);
+ensureColumn('app_settings', 'schedulerBootstrapVersion', `schedulerBootstrapVersion INTEGER NOT NULL DEFAULT 0`);
 ensureColumn(
   'app_settings',
   'telegramBotDefaultRetryLimit',
@@ -741,8 +877,15 @@ ensureColumn(
   `facebookDefaultRetryLimit INTEGER NOT NULL DEFAULT 3`
 );
 ensureColumn('app_settings', 'facebookDefaultTarget', `facebookDefaultTarget TEXT`);
+ensureColumn('telegram_reader_channels', 'slot_index', `slot_index INTEGER`);
 
-ensureColumn('keepa_settings', 'scheduler_enabled', `scheduler_enabled INTEGER NOT NULL DEFAULT 0`);
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_reader_channels_session_slot
+    ON telegram_reader_channels (session_id, slot_index)
+    WHERE slot_index IS NOT NULL
+`);
+
+ensureColumn('keepa_settings', 'scheduler_enabled', `scheduler_enabled INTEGER NOT NULL DEFAULT 1`);
 ensureColumn('keepa_settings', 'domain_id', `domain_id INTEGER NOT NULL DEFAULT 3`);
 ensureColumn('keepa_settings', 'default_categories_json', `default_categories_json TEXT NOT NULL DEFAULT '[]'`);
 ensureColumn('keepa_settings', 'default_discount', `default_discount REAL NOT NULL DEFAULT 40`);
@@ -859,6 +1002,24 @@ ensureColumn('generator_posts', 'posted_channels_json', `posted_channels_json TE
 ensureColumn('publishing_targets', 'target_ref', `target_ref TEXT`);
 ensureColumn('publishing_targets', 'target_label', `target_label TEXT`);
 ensureColumn('publishing_targets', 'target_meta_json', `target_meta_json TEXT`);
+ensureColumn('publishing_queue', 'deal_key', `deal_key TEXT`);
+ensureColumn('publishing_queue', 'attempt_count', `attempt_count INTEGER NOT NULL DEFAULT 0`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_publishing_queue_deal_key ON publishing_queue (deal_key)`);
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_publishing_queue_active_deal_key
+  ON publishing_queue (deal_key)
+  WHERE deal_key IS NOT NULL
+    AND TRIM(deal_key) != ''
+    AND status IN ('pending', 'sending', 'retry')
+`);
+
+ensureColumn('deal_engine_runs', 'lowest_price', `lowest_price REAL`);
+ensureColumn('deal_engine_runs', 'keepa_fallback_used', `keepa_fallback_used INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_runs', 'ai_needed', `ai_needed INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_runs', 'ai_used', `ai_used INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_runs', 'ai_escalation', `ai_escalation TEXT NOT NULL DEFAULT 'not_needed'`);
+ensureColumn('deal_engine_runs', 'market_comparison_json', `market_comparison_json TEXT`);
+ensureColumn('deal_engine_runs', 'reason_details_json', `reason_details_json TEXT`);
 
 ensureColumn('keepa_review_labels', 'asin', `asin TEXT`);
 ensureColumn('keepa_review_labels', 'seller_type', `seller_type TEXT NOT NULL DEFAULT 'UNKNOWN'`);
@@ -973,8 +1134,10 @@ if (!appSettingsRow?.count) {
         facebookEnabled,
         facebookSessionMode,
         facebookDefaultRetryLimit,
-        facebookDefaultTarget
-      ) VALUES (1, ?, ?, ?, 0, 1, 3, 0, 'persistent', 3, NULL)
+        facebookDefaultTarget,
+        telegramReaderGroupSlotCount,
+        schedulerBootstrapVersion
+      ) VALUES (1, ?, ?, ?, 0, 1, 3, 0, 'persistent', 3, NULL, 10, 0)
     `
   ).run(
     legacySettings?.repostCooldownEnabled ?? 1,
@@ -991,6 +1154,12 @@ if (!appSettingsRow?.count) {
           telegramCopyButtonText = COALESCE(NULLIF(TRIM(telegramCopyButtonText), ''), ?),
           copybotEnabled = COALESCE(copybotEnabled, 0),
           telegramBotEnabled = COALESCE(telegramBotEnabled, 1),
+          telegramReaderGroupSlotCount = CASE
+            WHEN telegramReaderGroupSlotCount IS NULL OR telegramReaderGroupSlotCount < 10 THEN 10
+            WHEN telegramReaderGroupSlotCount > 100 THEN 100
+            ELSE telegramReaderGroupSlotCount
+          END,
+          schedulerBootstrapVersion = COALESCE(schedulerBootstrapVersion, 0),
           telegramBotDefaultRetryLimit = COALESCE(telegramBotDefaultRetryLimit, 3),
           facebookEnabled = COALESCE(facebookEnabled, 0),
           facebookSessionMode = COALESCE(NULLIF(TRIM(facebookSessionMode), ''), 'persistent'),
@@ -1024,6 +1193,13 @@ db.exec(`
 `);
 
 db.exec(`
+  UPDATE publishing_queue
+  SET attempt_count = COALESCE(attempt_count, 0),
+      retry_count = COALESCE(retry_count, 0),
+      deal_key = NULLIF(TRIM(COALESCE(deal_key, '')), '')
+`);
+
+db.exec(`
   UPDATE publishing_targets
   SET status = CASE
     WHEN status = 'queued' THEN 'pending'
@@ -1047,6 +1223,15 @@ db.exec(`
         WHEN last_queue_status = 'posted' THEN 'sent'
         ELSE last_queue_status
       END
+`);
+
+db.exec(`
+  UPDATE deal_engine_runs
+  SET keepa_fallback_used = COALESCE(keepa_fallback_used, fallback_used),
+      ai_needed = COALESCE(ai_needed, 0),
+      ai_used = COALESCE(ai_used, 0),
+      ai_escalation = COALESCE(NULLIF(TRIM(ai_escalation), ''), ai_status, 'not_needed'),
+      lowest_price = COALESCE(lowest_price, market_price)
 `);
 
 const now = new Date().toISOString();
@@ -1116,7 +1301,7 @@ db.prepare(
     ) VALUES (
       1,
       1,
-      0,
+      1,
       3,
       '[]',
       40,
@@ -1148,7 +1333,7 @@ db.prepare(
   `
     UPDATE keepa_settings
     SET keepa_enabled = COALESCE(keepa_enabled, 1),
-        scheduler_enabled = COALESCE(scheduler_enabled, 0),
+        scheduler_enabled = COALESCE(scheduler_enabled, 1),
         domain_id = COALESCE(domain_id, 3),
         default_categories_json = COALESCE(default_categories_json, '[]'),
         default_discount = COALESCE(default_discount, 40),
@@ -1172,6 +1357,231 @@ db.prepare(
     WHERE id = 1
   `
 ).run({ now });
+
+db.prepare(
+  `
+    UPDATE keepa_settings
+    SET scheduler_enabled = 1,
+        updated_at = @now
+    WHERE id = 1
+      AND scheduler_enabled = 0
+      AND EXISTS (
+        SELECT 1
+        FROM app_settings
+        WHERE id = 1
+          AND COALESCE(schedulerBootstrapVersion, 0) < 1
+      )
+  `
+).run({ now });
+
+db.prepare(
+  `
+    UPDATE app_settings
+    SET schedulerBootstrapVersion = 1
+    WHERE id = 1
+      AND COALESCE(schedulerBootstrapVersion, 0) < 1
+  `
+).run();
+
+const dealEngineSettingsRow = db.prepare(`SELECT COUNT(*) AS count FROM deal_engine_settings`).get();
+if (!dealEngineSettingsRow?.count) {
+  db.prepare(
+    `
+      INSERT INTO deal_engine_settings (
+        id,
+        amazon_day_min_market_pct,
+        amazon_night_min_market_pct,
+        fbm_day_min_market_pct,
+        fbm_night_min_market_pct,
+        keepa_approve_score,
+        keepa_queue_score,
+        queue_margin_pct,
+        queue_enabled,
+        night_mode_enabled,
+        night_start_hour,
+        night_end_hour,
+        cheap_product_limit,
+        require_market_for_cheap,
+        require_market_for_no_name,
+        telegram_output_enabled,
+        whatsapp_output_enabled,
+        ai_resolver_enabled,
+        created_at,
+        updated_at
+      ) VALUES (
+        1,
+        15,
+        25,
+        20,
+        30,
+        70,
+        50,
+        3,
+        1,
+        1,
+        22,
+        6,
+        20,
+        1,
+        1,
+        1,
+        1,
+        0,
+        @now,
+        @now
+      )
+    `
+  ).run({ now });
+} else {
+  db.prepare(`DELETE FROM deal_engine_settings WHERE id != 1`).run();
+  db.prepare(
+    `
+      INSERT OR IGNORE INTO deal_engine_settings (
+        id,
+        amazon_day_min_market_pct,
+        amazon_night_min_market_pct,
+        fbm_day_min_market_pct,
+        fbm_night_min_market_pct,
+        keepa_approve_score,
+        keepa_queue_score,
+        queue_margin_pct,
+        queue_enabled,
+        night_mode_enabled,
+        night_start_hour,
+        night_end_hour,
+        cheap_product_limit,
+        require_market_for_cheap,
+        require_market_for_no_name,
+        telegram_output_enabled,
+        whatsapp_output_enabled,
+        ai_resolver_enabled,
+        created_at,
+        updated_at
+      ) VALUES (
+        1,
+        15,
+        25,
+        20,
+        30,
+        70,
+        50,
+        3,
+        1,
+        1,
+        22,
+        6,
+        20,
+        1,
+        1,
+        1,
+        1,
+        0,
+        @now,
+        @now
+      )
+    `
+  ).run({ now });
+  db.prepare(
+    `
+      UPDATE deal_engine_settings
+      SET amazon_day_min_market_pct = COALESCE(amazon_day_min_market_pct, 15),
+          amazon_night_min_market_pct = COALESCE(amazon_night_min_market_pct, 25),
+          fbm_day_min_market_pct = COALESCE(fbm_day_min_market_pct, 20),
+          fbm_night_min_market_pct = COALESCE(fbm_night_min_market_pct, 30),
+          keepa_approve_score = COALESCE(keepa_approve_score, 70),
+          keepa_queue_score = COALESCE(keepa_queue_score, 50),
+          queue_margin_pct = COALESCE(queue_margin_pct, 3),
+          queue_enabled = COALESCE(queue_enabled, 1),
+          night_mode_enabled = COALESCE(night_mode_enabled, 1),
+          night_start_hour = COALESCE(night_start_hour, 22),
+          night_end_hour = COALESCE(night_end_hour, 6),
+          cheap_product_limit = COALESCE(cheap_product_limit, 20),
+          require_market_for_cheap = COALESCE(require_market_for_cheap, 1),
+          require_market_for_no_name = COALESCE(require_market_for_no_name, 1),
+          telegram_output_enabled = COALESCE(telegram_output_enabled, 1),
+          whatsapp_output_enabled = COALESCE(whatsapp_output_enabled, 1),
+          ai_resolver_enabled = COALESCE(ai_resolver_enabled, 0),
+          updated_at = @now
+      WHERE id = 1
+    `
+  ).run({ now });
+}
+
+const advertisingModuleDefaults = [
+  { slotNumber: 1, moduleName: 'Werbemodul 1' },
+  { slotNumber: 2, moduleName: 'Werbemodul 2' },
+  { slotNumber: 3, moduleName: 'Werbemodul 3' },
+  { slotNumber: 4, moduleName: 'Werbemodul 4' },
+  { slotNumber: 5, moduleName: 'Werbemodul 5' }
+];
+
+advertisingModuleDefaults.forEach((item) => {
+  db.prepare(
+    `
+      INSERT OR IGNORE INTO advertising_modules (
+        slot_number,
+        module_name,
+        status,
+        priority,
+        start_date,
+        end_date,
+        frequency_mode,
+        times_json,
+        weekdays_json,
+        interval_hours,
+        interval_days,
+        max_per_day,
+        main_text,
+        extra_text,
+        image_data_url,
+        image_filename,
+        telegram_enabled,
+        telegram_target_ids_json,
+        whatsapp_enabled,
+        whatsapp_targets_json,
+        last_scheduled_at,
+        last_success_at,
+        last_failure_at,
+        last_error,
+        created_at,
+        updated_at
+      ) VALUES (
+        @slotNumber,
+        @moduleName,
+        'paused',
+        'medium',
+        @startDate,
+        NULL,
+        'daily',
+        '["09:00"]',
+        '[]',
+        6,
+        1,
+        1,
+        '',
+        '',
+        NULL,
+        NULL,
+        1,
+        '[]',
+        0,
+        '[]',
+        NULL,
+        NULL,
+        NULL,
+        '',
+        @createdAt,
+        @updatedAt
+      )
+    `
+  ).run({
+    slotNumber: item.slotNumber,
+    moduleName: item.moduleName,
+    startDate: now.slice(0, 10),
+    createdAt: now,
+    updatedAt: now
+  });
+});
 
 db.prepare(
   `

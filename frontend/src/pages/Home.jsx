@@ -86,12 +86,32 @@ function getStatusTone(status) {
   return 'info'
 }
 
+function getOperationalTone(status) {
+  const normalized = String(status || '').trim().toLowerCase()
+
+  if (['active', 'aktiv', 'live', 'produktiv'].includes(normalized)) {
+    return 'success'
+  }
+
+  if (['session_missing', 'session fehlt', 'not_configured', 'nicht konfiguriert', 'disabled', 'deaktiviert'].includes(normalized)) {
+    return 'warning'
+  }
+
+  if (['prepared', 'vorbereitet', 'optional aktiv'].includes(normalized)) {
+    return 'info'
+  }
+
+  return getStatusTone(status)
+}
+
 function HomePage() {
   const { user } = useAuth()
   const [dashboard, setDashboard] = useState({
     amazon: null,
     bot: null,
+    dealEngine: null,
     copybot: null,
+    advertising: null,
     keepaStatus: null,
     queue: null,
     logs: null,
@@ -139,7 +159,9 @@ function HomePage() {
           apiFetch('/api/deals/settings'),
           apiFetch('/api/deals/history'),
           apiFetch('/api/copybot/sources'),
-          apiFetch('/api/copybot/logs')
+          apiFetch('/api/copybot/logs'),
+          apiFetch('/api/advertising/dashboard'),
+          apiFetch('/api/deal-engine/dashboard')
         ])
 
         const [
@@ -153,7 +175,9 @@ function HomePage() {
           repostSettingsResult,
           historyResult,
           sourcesResult,
-          copybotLogsResult
+          copybotLogsResult,
+          advertisingResult,
+          dealEngineResult
         ] = results
 
         const partialErrors = results
@@ -163,6 +187,7 @@ function HomePage() {
         if (!cancelled) {
           setDashboard({
             bot: botResult.status === 'fulfilled' ? botResult.value : null,
+            dealEngine: dealEngineResult.status === 'fulfilled' ? dealEngineResult.value : null,
             copybot: copybotResult.status === 'fulfilled' ? copybotResult.value : null,
             keepaStatus: keepaResult.status === 'fulfilled' ? keepaResult.value : null,
             amazon: amazonResult.status === 'fulfilled' ? amazonResult.value : null,
@@ -172,7 +197,8 @@ function HomePage() {
             repostSettings: repostSettingsResult.status === 'fulfilled' ? repostSettingsResult.value : null,
             history: historyResult.status === 'fulfilled' ? historyResult.value : null,
             sources: sourcesResult.status === 'fulfilled' ? sourcesResult.value : null,
-            copybotLogs: copybotLogsResult.status === 'fulfilled' ? copybotLogsResult.value : null
+            copybotLogs: copybotLogsResult.status === 'fulfilled' ? copybotLogsResult.value : null,
+            advertising: advertisingResult.status === 'fulfilled' ? advertisingResult.value : null
           })
 
           if (partialErrors.length) {
@@ -199,6 +225,7 @@ function HomePage() {
 
   const amazonStatus = dashboard.amazon || {}
   const botOverview = dashboard.bot || {}
+  const dealEngineOverview = dashboard.dealEngine || {}
   const botModules = botOverview?.modules || {}
   const copybotOverview = dashboard.copybot || {}
   const keepaStatus = dashboard.keepaStatus || {}
@@ -209,6 +236,9 @@ function HomePage() {
   const historyItems = Array.isArray(dashboard.history?.items) ? dashboard.history.items : []
   const sourceItems = Array.isArray(dashboard.sources?.items) ? dashboard.sources.items : []
   const copybotLogItems = Array.isArray(dashboard.copybotLogs?.items) ? dashboard.copybotLogs.items : []
+  const advertisingOverview = dashboard.advertising || {}
+  const operationalStatus = botOverview.operationalStatus || {}
+  const productionReality = botOverview.productionReality || { live: [], prepared: [], blocked: [] }
   const latestQueueItems = queueItems.slice(0, 6)
   const latestPublishingItems = publishingLogs.slice(0, 6)
   const latestHistoryItems = historyItems.slice(0, 6)
@@ -225,6 +255,11 @@ function HomePage() {
   const persistenceModule = botModules?.persistence || {}
   const telegramBotConfigured = Boolean(telegramBotApi?.configured)
   const telegramLoginReady = Boolean(telegramUserApi?.enabled && telegramUserApi?.apiConfigured)
+  const telegramReaderRuntime = operationalStatus.telegramReader || {}
+  const telegramBotRuntime = operationalStatus.telegramBot || {}
+  const whatsappRuntime = operationalStatus.whatsapp || {}
+  const aiResolverRuntime = operationalStatus.aiResolver || {}
+  const schedulerRuntime = operationalStatus.scheduler || {}
 
   const activeSources = useMemo(
     () => sourceItems.filter((item) => Number(item.is_active) === 1),
@@ -389,13 +424,15 @@ function HomePage() {
     },
     {
       title: 'Decision Engine',
-      value: 'Internet primaer',
-      detail: `Marktvergleich fuehrt. Keepa bleibt Backup ab ${keepaGapPct || 0}% Mindestabstand.`,
+      value: dealEngineOverview?.runtimeStatus?.internetDecision?.label || 'Internet primaer',
+      detail:
+        dealEngineOverview?.runtimeStatus?.aiResolver?.detail ||
+        `Marktvergleich fuehrt. Keepa bleibt Backup ab ${keepaGapPct || 0}% Mindestabstand.`,
       tone: 'success'
     },
     {
       title: 'Output Integrationen',
-      value: `${telegramBotConfigured ? 'Telegram bereit' : 'Telegram pruefen'} / ${whatsappModule?.configured ? 'WhatsApp bereit' : 'WhatsApp pruefen'}`,
+      value: `${telegramBotRuntime?.label || 'vorbereitet'} / ${whatsappRuntime?.label || 'nicht konfiguriert'}`,
       detail: `${queueSummary.sent} erfolgreiche Sendungen | ${queueSummary.failed} fehlgeschlagen | ${queueSummary.retry} im Retry`,
       tone: publishingTone
     },
@@ -410,14 +447,71 @@ function HomePage() {
     }
   ]
 
+  const operationalCards = [
+    {
+      title: 'Telegram Reader',
+      value: telegramReaderRuntime?.label || 'vorbereitet',
+      detail:
+        telegramReaderRuntime?.detail ||
+        'Telegram Reader ist vorbereitet und benoetigt fuer Live-Betrieb eine echte User Session.',
+      tone: getOperationalTone(telegramReaderRuntime?.status)
+    },
+    {
+      title: 'Telegram Bot',
+      value: telegramBotRuntime?.label || 'vorbereitet',
+      detail: telegramBotRuntime?.detail || 'Telegram Bot bleibt der primaere Live-Output fuer genehmigte Deals.',
+      tone: getOperationalTone(telegramBotRuntime?.status)
+    },
+    {
+      title: 'WhatsApp',
+      value: whatsappRuntime?.label || 'nicht konfiguriert',
+      detail: whatsappRuntime?.detail || 'WhatsApp bleibt optional und nur mit echter Produktiv-Anbindung live.',
+      tone: getOperationalTone(whatsappRuntime?.status)
+    },
+    {
+      title: 'KI Resolver',
+      value: aiResolverRuntime?.label || 'deaktiviert',
+      detail:
+        aiResolverRuntime?.detail ||
+        'KI ist optional und greift nur bei Unsicherheit nach Marktvergleich, Keepa und Fake-Pattern ein.',
+      tone: getOperationalTone(aiResolverRuntime?.status)
+    },
+    {
+      title: 'Scheduler',
+      value: schedulerRuntime?.label || 'deaktiviert',
+      detail: schedulerRuntime?.detail || 'Scheduler startet Deals, Queue und Werbemodule gemeinsam.',
+      tone: getOperationalTone(schedulerRuntime?.status)
+    }
+  ]
+
+  const realitySummaryCards = [
+    {
+      title: 'Produktionsreif',
+      items: productionReality.live || [],
+      tone: 'success'
+    },
+    {
+      title: 'Vorbereitet',
+      items: productionReality.prepared || [],
+      tone: 'info'
+    },
+    {
+      title: 'Noch blockiert',
+      items: productionReality.blocked || [],
+      tone: 'warning'
+    }
+  ]
+
   const telegramStatusCards = [
     {
       title: 'Login Status',
-      value: toNumber(telegramUserApi?.activeSessions) > 0 ? 'Verbunden' : telegramLoginReady ? 'Bereit' : 'Konfiguration fehlt',
-      detail: `API ${telegramUserApi?.apiConfigured ? 'konfiguriert' : 'nicht konfiguriert'} | Reader ${
-        telegramUserApi?.enabled ? 'aktiv' : 'deaktiviert'
-      }`,
-      tone: toNumber(telegramUserApi?.activeSessions) > 0 ? 'success' : telegramLoginReady ? 'info' : 'warning'
+      value: telegramReaderRuntime?.label || (toNumber(telegramUserApi?.activeSessions) > 0 ? 'Verbunden' : telegramLoginReady ? 'Bereit' : 'Konfiguration fehlt'),
+      detail:
+        telegramReaderRuntime?.detail ||
+        `API ${telegramUserApi?.apiConfigured ? 'konfiguriert' : 'nicht konfiguriert'} | Reader ${
+          telegramUserApi?.enabled ? 'aktiv' : 'deaktiviert'
+        }`,
+      tone: getOperationalTone(telegramReaderRuntime?.status || (toNumber(telegramUserApi?.activeSessions) > 0 ? 'active' : 'prepared'))
     },
     {
       title: 'Login Modus',
@@ -462,45 +556,63 @@ function HomePage() {
     }
   ]
 
-  const liveFlowSteps = [
+  const advertisingSummaryCards = [
     {
-      id: 'detect',
-      label: 'Deal erkannt',
-      title: `${latestDeals.length} letzte Deals`,
-      detail: latestDeals.length
-        ? `${shortenText(latestDeals[0]?.title || latestDeals[0]?.source_name || 'Deal', 56)}`
-        : 'Noch kein aktueller Deal im Verlauf.',
-      tone: latestDeals.length ? 'success' : 'info'
+      title: 'Aktive Module',
+      value: toNumber(advertisingOverview?.overview?.activeModuleCount),
+      detail: `${toNumber(advertisingOverview?.overview?.plannedTodayCount)} geplante Posts heute`,
+      tone: toNumber(advertisingOverview?.overview?.activeModuleCount) > 0 ? 'success' : 'warning'
     },
     {
-      id: 'lock',
-      label: 'Sperrcheck',
-      title: repostCooldownEnabled ? `${repostCooldownHours}h aktiv` : 'deaktiviert',
-      detail: `${historyItems.length} gespeicherte Sperren fuer manuelle und automatische Posts`,
-      tone: repostCooldownEnabled ? 'success' : 'warning'
+      title: 'Naechster Werbe-Post',
+      value: advertisingOverview?.overview?.nextPlannedPost?.moduleName || 'Noch nicht geplant',
+      detail: `Naechster Lauf ${formatDateTime(advertisingOverview?.overview?.nextPlannedPost?.scheduledFor)}`,
+      tone: advertisingOverview?.overview?.nextPlannedPost ? 'info' : 'warning'
     },
     {
-      id: 'internet',
-      label: 'Internetvergleich',
-      title: 'Hauptentscheidung',
-      detail: `Amazon ${amazonApiStatus} | Mindestabstand ${keepaGapPct || 0}% fuer starke Marktdeals`,
-      tone: 'success'
-    },
-    {
-      id: 'fallback',
-      label: 'Keepa Fallback',
-      title: keepaEnabled ? 'bereit' : 'deaktiviert',
-      detail: 'avg90, avg180, min90 und Lowest90 bleiben reine Backup-Signale.',
-      tone: keepaEnabled ? 'info' : 'warning'
-    },
-    {
-      id: 'queue',
-      label: 'Queue und Output',
-      title: `${openQueueCount} offen`,
-      detail: `${queueSummary.pending} pending | ${queueSummary.sending} sending | ${queueSummary.retry} retry | ${queueSummary.sent} sent`,
-      tone: publishingTone
+      title: 'Letzter Versand',
+      value: advertisingOverview?.overview?.lastSuccess?.moduleName || 'Noch keine Ausfuehrung',
+      detail: `Letzter Erfolg ${formatDateTime(
+        advertisingOverview?.overview?.lastSuccess?.sentAt || advertisingOverview?.overview?.lastSuccess?.updatedAt
+      )}`,
+      tone: advertisingOverview?.overview?.lastSuccess ? 'success' : 'info'
     }
   ]
+
+  const liveFlowSteps =
+    Array.isArray(botOverview?.finalFlow) && botOverview.finalFlow.length
+      ? botOverview.finalFlow.map((step) => ({
+          id: step.id,
+          label: step.label,
+          title: step.status || 'vorbereitet',
+          detail: step.detail,
+          tone: getOperationalTone(step.status)
+        }))
+      : [
+          {
+            id: 'detect',
+            label: 'Deal erkannt',
+            title: `${latestDeals.length} letzte Deals`,
+            detail: latestDeals.length
+              ? `${shortenText(latestDeals[0]?.title || latestDeals[0]?.source_name || 'Deal', 56)}`
+              : 'Noch kein aktueller Deal im Verlauf.',
+            tone: latestDeals.length ? 'success' : 'info'
+          },
+          {
+            id: 'internet',
+            label: 'Internetvergleich',
+            title: 'Hauptentscheidung',
+            detail: `Amazon ${amazonApiStatus} | Mindestabstand ${keepaGapPct || 0}% fuer starke Marktdeals`,
+            tone: 'success'
+          },
+          {
+            id: 'queue',
+            label: 'Queue und Output',
+            title: `${openQueueCount} offen`,
+            detail: `${queueSummary.pending} pending | ${queueSummary.sending} sending | ${queueSummary.retry} retry | ${queueSummary.sent} sent`,
+            tone: publishingTone
+          }
+        ]
 
   const workspaceCards = [
     {
@@ -532,6 +644,11 @@ function HomePage() {
       title: 'Autobot',
       path: '/autobot',
       description: 'Integrationen, Queue und Plattformstatus'
+    },
+    {
+      title: 'Werbung',
+      path: '/advertising',
+      description: 'Freie Werbemodule und geplante Posts'
     },
     {
       title: 'Logik-Zentrale',
@@ -572,13 +689,17 @@ function HomePage() {
               <p className="page-subtitle">
                 Uebersichtlich nach Arbeitsfluss geordnet: Systemstatus, Telegram Login, aktive Quellen, Live Flow,
                 Queue, Sperren, letzte Deals, Fehler und Timeline. Internet bleibt Hauptlogik, Keepa bleibt Fallback,
-                Queue und Sperrmodul bleiben durchgaengig aktiv.
+                KI bleibt optional und Telegram Reader sowie WhatsApp werden nur dann als live gezeigt, wenn echte
+                Sessions oder produktive Anbindungen vorhanden sind.
               </p>
             </div>
 
             <div className="ops-hero-aside">
               <div className="ops-hero-chip-row">
-                <span className="badge">Internet zuerst - Keepa nur Fallback - Queue ohne Verlust</span>
+                <span className="badge">Internet zuerst - Keepa nur Fallback - KI nur bei Unsicherheit</span>
+                <span className="badge">
+                  Reader {telegramReaderRuntime?.label || 'vorbereitet'} - WhatsApp {whatsappRuntime?.label || 'optional'}
+                </span>
                 <span className={`status-chip ${user?.role === 'admin' ? 'info' : 'success'}`}>
                   {user?.role === 'admin' ? 'Admin Workspace' : 'Workspace View'}
                 </span>
@@ -634,7 +755,56 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">2. Telegram Login Status</p>
+                  <p className="section-title">2. Betriebsrealitaet</p>
+                  <h2 className="page-title">Live, vorbereitet und noch blockiert</h2>
+                </div>
+                <span className="ops-header-note">
+                  Reader {telegramReaderRuntime?.label || 'vorbereitet'} | KI {aiResolverRuntime?.label || 'deaktiviert'} | Scheduler{' '}
+                  {schedulerRuntime?.label || 'deaktiviert'}
+                </span>
+              </div>
+
+              <div className="ops-source-grid">
+                {operationalCards.map((card) => (
+                  <article key={card.title} className={`ops-status-card ops-tone-${card.tone}`}>
+                    <div className="ops-card-head">
+                      <p className="section-title">{card.title}</p>
+                      <span className={`status-chip ${card.tone}`}>{card.value}</span>
+                    </div>
+                    <h2>{card.value}</h2>
+                    <p className="ops-card-copy">{card.detail}</p>
+                  </article>
+                ))}
+              </div>
+
+              <div className="ops-reality-grid">
+                {realitySummaryCards.map((card) => (
+                  <article key={card.title} className={`ops-source-card ops-tone-${card.tone}`}>
+                    <div className="ops-card-top">
+                      <div>
+                        <span className="ops-card-label">{card.title}</span>
+                        <h3>{card.items.length}</h3>
+                      </div>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
+                    </div>
+                    {card.items.length ? (
+                      <div className="ops-reality-list">
+                        {card.items.map((item) => (
+                          <p key={`${card.title}-${item}`}>{item}</p>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="ops-card-copy">Keine Eintraege.</p>
+                    )}
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">3. Telegram Login Status</p>
                   <h2 className="page-title">Reader Session, Login und Bot-Output</h2>
                 </div>
                 <span className="ops-header-note">
@@ -658,7 +828,7 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">3. Aktive Quellen</p>
+                  <p className="section-title">4. Aktive Quellen</p>
                   <h2 className="page-title">Eingangsquellen ohne Leerlauf</h2>
                 </div>
                 <span className="ops-header-note">{activeSources.length} aktive Quellen geladen</span>
@@ -700,13 +870,54 @@ function HomePage() {
               </div>
             </section>
 
+            <section className="card ops-panel">
+              <div className="ops-panel-header">
+                <div>
+                  <p className="section-title">4b. Werbung</p>
+                  <h2 className="page-title">Freie Werbemodule und kommende Sendungen</h2>
+                </div>
+                <span className="ops-header-note">{toNumber(advertisingOverview?.publishing?.queueCount)} Werbejobs in Queue</span>
+              </div>
+
+              <div className="ops-source-grid">
+                {advertisingSummaryCards.map((card) => (
+                  <article key={card.title} className={`ops-source-card ops-tone-${card.tone}`}>
+                    <div className="ops-card-top">
+                      <div>
+                        <span className="ops-card-label">{card.title}</span>
+                        <h3>{card.value}</h3>
+                      </div>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
+                    </div>
+                    <p className="ops-card-copy">{card.detail}</p>
+                  </article>
+                ))}
+              </div>
+
+              <div className="ops-feed">
+                {(advertisingOverview?.upcoming || []).length ? (
+                  advertisingOverview.upcoming.slice(0, 6).map((item, index) => (
+                    <article key={`${item.moduleId}-${item.scheduledFor}-${index}`} className="ops-feed-item">
+                      <div className="ops-feed-head">
+                        <strong>{item.moduleName}</strong>
+                        <span className={`status-chip ${getStatusTone(item.priority)}`}>{item.priority}</span>
+                      </div>
+                      <p>{formatDateTime(item.scheduledFor)}</p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="ops-empty-state">Keine kommenden Werbesendungen vorhanden.</p>
+                )}
+              </div>
+            </section>
+
             <section className="card ops-panel ops-flow-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">4. Live Flow</p>
+                  <p className="section-title">5. Finaler Flow</p>
                   <h2 className="page-title">Vom Eingang bis zum Versand</h2>
                 </div>
-                <span className="ops-header-note">Deal -&gt; Sperre -&gt; Internet -&gt; Keepa -&gt; Queue</span>
+                <span className="ops-header-note">Reader -&gt; Internet -&gt; Keepa -&gt; Fake-Pattern -&gt; KI optional -&gt; Queue</span>
               </div>
 
               <div className="ops-flow-grid">
@@ -731,7 +942,7 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">5. Queue</p>
+                  <p className="section-title">6. Queue</p>
                   <h2 className="page-title">Offene Jobs und letzte Queue-Eintraege</h2>
                 </div>
                 <span className="ops-header-note">{openQueueCount} Jobs aktuell offen</span>
@@ -788,7 +999,7 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">6. Sperren</p>
+                  <p className="section-title">7. Sperren</p>
                   <h2 className="page-title">Sperrzeiten und letzte gespeicherte Locks</h2>
                 </div>
                 <span className="ops-header-note">
@@ -828,7 +1039,7 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">7. Letzte Deals</p>
+                  <p className="section-title">8. Letzte Deals</p>
                   <h2 className="page-title">Zuletzt verarbeitete Deals</h2>
                 </div>
                 <span className="ops-header-note">{latestDeals.length} Eintraege sichtbar</span>
@@ -860,7 +1071,7 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">8. Fehler</p>
+                  <p className="section-title">9. Fehler</p>
                   <h2 className="page-title">Aktuelle Blocker und Warnungen</h2>
                 </div>
                 <span className="ops-header-note">{errorEntries.length} relevante Hinweise</span>
@@ -887,7 +1098,7 @@ function HomePage() {
             <section className="card ops-panel">
               <div className="ops-panel-header">
                 <div>
-                  <p className="section-title">9. Timeline</p>
+                  <p className="section-title">10. Timeline</p>
                   <h2 className="page-title">Chronologische Systemereignisse</h2>
                 </div>
                 <span className="ops-header-note">Deals, Quellen, Publishing und Sperren zusammengefuehrt</span>

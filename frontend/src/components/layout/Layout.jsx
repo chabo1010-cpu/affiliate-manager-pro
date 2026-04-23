@@ -7,11 +7,15 @@ function Layout({ children, showSidebar = true }) {
       <MobileHeader />
       <div className="page-container">
         <div className="desktop-shell">
-          {showSidebar && <Sidebar />}
+          {showSidebar ? (
+            <div className="layout-sidebar-shell">
+              <Sidebar />
+            </div>
+          ) : null}
           <main className="layout-main">{children}</main>
         </div>
         <div className="mobile-shell">
-          <main>{children}</main>
+          <main className="layout-main-mobile">{children}</main>
         </div>
       </div>
     </div>

@@ -14,6 +14,8 @@ import DealHistoryAdminPage from './pages/DealHistoryAdmin';
 import CopybotPage from './pages/Copybot';
 import PublishingPage from './pages/Publishing';
 import KeepaPage from './pages/Keepa';
+import DealEnginePage from './pages/DealEngine';
+import AdvertisingPage from './pages/Advertising';
 
 function App() {
   const { user } = useAuth();
@@ -36,6 +38,7 @@ function App() {
         'Copybot',
         'Templates',
         'Autobot',
+        'Werbung',
         'Logik-Zentrale',
         'Publishing',
         'Sperrzeiten',
@@ -68,6 +71,8 @@ function App() {
               <Route path="copybot/review" element={<CopybotPage />} />
               <Route path="copybot/logs" element={<CopybotPage />} />
               <Route path="publishing" element={<PublishingPage />} />
+              <Route path="deal-engine" element={<DealEnginePage />} />
+              <Route path="advertising" element={<AdvertisingPage />} />
               <Route path="publishing/workers" element={<PublishingPage />} />
               <Route path="publishing/telegram" element={<PublishingPage />} />
               <Route path="publishing/whatsapp" element={<PublishingPage />} />

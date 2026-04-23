@@ -112,6 +112,7 @@
 
 .ops-topbar,
 .ops-source-grid,
+.ops-reality-grid,
 .ops-processing-grid,
 .ops-channel-grid,
 .ops-workspace-grid,
@@ -119,6 +120,17 @@
   display: grid;
   gap: 0.9rem;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.ops-reality-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.ops-reality-list p {
+  margin: 0;
+  color: #93a2b9;
+  line-height: 1.45;
 }
 
 .ops-status-card,

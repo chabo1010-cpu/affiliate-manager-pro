@@ -1,0 +1,376 @@
+.ad-page {
+  display: grid;
+  gap: 1rem;
+  min-height: 100%;
+  align-content: start;
+}
+
+.ad-sticky-top {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: grid;
+  gap: 1rem;
+  padding-bottom: 0.2rem;
+  background: linear-gradient(180deg, rgba(3, 5, 10, 0.98) 0%, rgba(3, 5, 10, 0.86) 72%, rgba(3, 5, 10, 0) 100%);
+  backdrop-filter: blur(12px);
+}
+
+.ad-hero,
+.ad-panel,
+.ad-card,
+.ad-module-card,
+.ad-list-item {
+  position: relative;
+  overflow: hidden;
+}
+
+.ad-hero {
+  padding: 1.2rem;
+  background:
+    radial-gradient(circle at top right, rgba(14, 165, 233, 0.12), transparent 28%),
+    radial-gradient(circle at bottom left, rgba(249, 115, 22, 0.12), transparent 26%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(8, 13, 24, 0.98));
+}
+
+.ad-hero::before,
+.ad-panel::before,
+.ad-card::before,
+.ad-module-card::before,
+.ad-list-item::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 1rem;
+  right: 1rem;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(14, 165, 233, 0.34), transparent);
+}
+
+.ad-hero-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.ad-hero-copy {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.ad-hero-copy .page-title {
+  font-size: clamp(1.7rem, 3vw, 2.35rem);
+  line-height: 1.08;
+}
+
+.ad-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  align-content: start;
+}
+
+.ad-inline-alert {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding: 0.9rem 1rem;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.ad-inline-alert p {
+  margin: 0;
+}
+
+.ad-panel {
+  padding: 1rem;
+  display: grid;
+  gap: 0.9rem;
+  background:
+    radial-gradient(circle at top right, rgba(14, 165, 233, 0.08), transparent 28%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(9, 15, 28, 0.97));
+}
+
+.ad-overview-panel {
+  box-shadow: 0 22px 44px rgba(0, 0, 0, 0.18);
+}
+
+.ad-panel-header,
+.ad-card-head,
+.ad-subsection-header,
+.ad-module-head,
+.ad-module-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.ad-header-note {
+  color: #8fa0b9;
+  font-size: 0.85rem;
+}
+
+.ad-overview-grid,
+.ad-history-grid {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.ad-card,
+.ad-list-item,
+.ad-module-card {
+  display: grid;
+  gap: 0.7rem;
+  padding: 0.95rem 1rem;
+  border-radius: 20px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: linear-gradient(180deg, rgba(17, 24, 39, 0.92), rgba(9, 15, 28, 0.96));
+}
+
+.ad-module-card {
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.ad-module-card.is-open {
+  border-color: rgba(16, 185, 129, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(16, 185, 129, 0.08);
+}
+
+.ad-card h3,
+.ad-card p,
+.ad-list-item p {
+  margin: 0;
+}
+
+.ad-tone-success {
+  box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.09);
+}
+
+.ad-tone-warning {
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.09);
+}
+
+.ad-tone-danger {
+  box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.09);
+}
+
+.ad-tone-info {
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.09);
+}
+
+.ad-module-panel {
+  min-height: 0;
+}
+
+.ad-module-stack {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.ad-module-title {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.ad-module-title-top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+}
+
+.ad-module-toolbar {
+  align-items: end;
+}
+
+.ad-inline-field {
+  display: grid;
+  gap: 0.35rem;
+  min-width: min(100%, 280px);
+  flex: 1 1 260px;
+}
+
+.ad-inline-field-status {
+  max-width: 180px;
+}
+
+.ad-inline-field span,
+.ad-module-grid label span,
+.ad-subsection label span {
+  color: #9db0c7;
+  font-size: 0.83rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.ad-module-body {
+  display: grid;
+  gap: 1rem;
+  padding-top: 0.2rem;
+}
+
+.ad-module-grid,
+.ad-channel-grid {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.ad-module-grid label,
+.ad-subsection label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.ad-span-2 {
+  grid-column: span 2;
+}
+
+.ad-weekdays,
+.ad-target-list,
+.ad-module-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.ad-weekday-chip,
+.ad-target-chip,
+.ad-toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ad-weekday-chip input,
+.ad-target-chip input,
+.ad-toggle input {
+  width: auto;
+}
+
+.ad-subsection {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.9rem;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ad-targets-box {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.ad-image-row {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.ad-image-row input[type='file'] {
+  padding: 0.65rem 0.85rem;
+}
+
+.ad-image-preview {
+  width: 100%;
+  max-width: 240px;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  object-fit: cover;
+}
+
+.ad-module-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.ad-module-footer button,
+.ad-module-actions button {
+  min-width: 150px;
+}
+
+.ad-scroll-panel {
+  min-height: 0;
+}
+
+.ad-list {
+  display: grid;
+  gap: 0.7rem;
+  min-height: 0;
+  max-height: min(36vh, 360px);
+  overflow-y: auto;
+  padding-right: 0.2rem;
+  overscroll-behavior: contain;
+}
+
+@media (min-width: 920px) {
+  .ad-hero-grid {
+    grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.9fr);
+    align-items: start;
+  }
+
+  .ad-overview-grid {
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  }
+
+  .ad-module-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ad-channel-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1180px) {
+  .ad-history-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}
+
+@media (max-width: 1023px) {
+  .ad-sticky-top {
+    position: static;
+    padding-bottom: 0;
+    background: transparent;
+    backdrop-filter: none;
+  }
+}
+
+@media (max-width: 767px) {
+  .ad-hero,
+  .ad-panel,
+  .ad-card,
+  .ad-module-card,
+  .ad-list-item {
+    padding: 0.9rem;
+  }
+
+  .ad-span-2 {
+    grid-column: span 1;
+  }
+
+  .ad-module-footer button,
+  .ad-module-actions button,
+  .ad-inline-field,
+  .ad-inline-field-status {
+    width: 100%;
+    max-width: none;
+  }
+
+  .ad-list {
+    max-height: 300px;
+  }
+}

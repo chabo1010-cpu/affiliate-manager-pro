@@ -3,8 +3,10 @@ import { sendTelegramPost } from '../services/telegramSenderService.js';
 import {
   completeTelegramPhoneLogin,
   disconnectTelegramUserSession,
+  getTelegramReaderGroupConfig,
   getTelegramUserClientStatus,
   listTelegramUserDialogs,
+  saveTelegramReaderGroupConfig,
   startTelegramPhoneLogin,
   startTelegramQrLogin,
   submitTelegramQrPassword,
@@ -78,6 +80,32 @@ router.get('/user-client/status', requireAdmin, async (req, res) => {
     res.json(await getTelegramUserClientStatus());
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Status konnte nicht geladen werden.' });
+  }
+});
+
+router.get('/user-client/groups', requireAdmin, (req, res) => {
+  try {
+    res.json(
+      getTelegramReaderGroupConfig({
+        sessionName: req.query.sessionName
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Gruppen konnten nicht geladen werden.' });
+  }
+});
+
+router.put('/user-client/groups', requireAdmin, (req, res) => {
+  try {
+    res.json(
+      saveTelegramReaderGroupConfig({
+        sessionName: req.body?.sessionName,
+        slotCount: req.body?.slotCount,
+        items: req.body?.items
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Gruppen konnten nicht gespeichert werden.' });
   }
 });
 

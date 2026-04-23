@@ -8,6 +8,8 @@ const baseNav = [
   { label: 'Copybot', path: '/copybot', icon: '\u{1F4E8}' },
   { label: 'Templates', path: '/templates', icon: '\u{1F9F1}' },
   { label: 'Autobot', path: '/autobot', icon: '\u2699\uFE0F' },
+  { label: 'Deal Engine', path: '/deal-engine', icon: '\u2696\uFE0F' },
+  { label: 'Werbung', path: '/advertising', icon: '\u{1F4E3}' },
   { label: 'Publishing', path: '/publishing', icon: '\u{1F4E4}' },
   { label: 'Sperrzeiten', path: '/sperrzeiten', icon: '\u23F2\uFE0F' },
   { label: 'Logs', path: '/logs', icon: '\u{1F4CA}' },

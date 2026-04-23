@@ -39,7 +39,11 @@ const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
 const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
 const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
 
-function parseEnabledFlag(value) {
+function parseEnabledFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
   return value === true || value === 1 || value === '1';
 }
 
@@ -111,6 +115,68 @@ function formatRemainingTime(value) {
   return `${safeMinutes} ${minuteLabel}`;
 }
 
+function buildInitialDealSnapshot(scrapeData = {}, fallbackUrl = '') {
+  return {
+    asin: scrapeData.asin || '',
+    finalUrl: scrapeData.finalUrl || scrapeData.normalizedUrl || fallbackUrl,
+    normalizedUrl: scrapeData.normalizedUrl || '',
+    sellerType: scrapeData.sellerType || '',
+    lastPostedAt: '',
+    minPrice: null,
+    maxPrice: null,
+    postingCount: 0,
+    blocked: false,
+    remainingMs: 0,
+    cooldownEnabled: null,
+    cooldownHours: 12,
+    generatorContext: null,
+    generatorContextPending: true
+  };
+}
+
+function buildCheckedDealSnapshot(checkData = {}, scrapeData = {}, fallbackUrl = '') {
+  const baseSnapshot = buildInitialDealSnapshot(scrapeData, fallbackUrl);
+
+  return {
+    ...baseSnapshot,
+    asin: checkData.asin || scrapeData.asin || '',
+    finalUrl: scrapeData.finalUrl || checkData.resolvedFinalUrl || scrapeData.normalizedUrl || fallbackUrl,
+    normalizedUrl: scrapeData.normalizedUrl || checkData.normalizedUrl || '',
+    sellerType: scrapeData.sellerType || checkData.sellerType || checkData.lastDeal?.sellerType || '',
+    lastPostedAt: checkData.lastPostedAt || checkData.lastDeal?.postedAt || '',
+    minPrice: parseDealPriceValue(checkData.minPrice),
+    maxPrice: parseDealPriceValue(checkData.maxPrice),
+    postingCount: Number(checkData.postingCount || 0),
+    blocked: checkData.blocked === true,
+    remainingMs: Number(checkData.remainingSeconds || 0) * 1000,
+    cooldownEnabled: parseEnabledFlag(checkData.repostCooldownEnabled, null),
+    cooldownHours: Number(checkData.repostCooldownHours ?? 12),
+    generatorContext: checkData.generatorContext || null,
+    generatorContextPending: checkData.generatorContextPending === true
+  };
+}
+
+function normalizeDirectPublishResponse(data = {}) {
+  const safeData = data && typeof data === 'object' ? data : {};
+  const safeResults = safeData.results && typeof safeData.results === 'object' ? safeData.results : {};
+  const safeDeliveries = safeData.deliveries && typeof safeData.deliveries === 'object' ? safeData.deliveries : {};
+
+  return {
+    ...safeData,
+    queue: safeData.queue && typeof safeData.queue === 'object' ? safeData.queue : null,
+    results: {
+      telegram: safeResults.telegram && typeof safeResults.telegram === 'object' ? safeResults.telegram : null,
+      whatsapp: safeResults.whatsapp && typeof safeResults.whatsapp === 'object' ? safeResults.whatsapp : null,
+      facebook: safeResults.facebook && typeof safeResults.facebook === 'object' ? safeResults.facebook : null
+    },
+    deliveries: {
+      telegram: Array.isArray(safeDeliveries.telegram) ? safeDeliveries.telegram : [],
+      whatsapp: Array.isArray(safeDeliveries.whatsapp) ? safeDeliveries.whatsapp : [],
+      facebook: Array.isArray(safeDeliveries.facebook) ? safeDeliveries.facebook : []
+    }
+  };
+}
+
 function decodeHtmlEntities(text) {
   if (typeof window === 'undefined' || !window.document) {
     return text;
@@ -161,8 +227,11 @@ function GeneratorPosterPage() {
   const [rabattgutscheinCode, setRabattgutscheinCode] = useState('');
   const [formError, setFormError] = useState('');
   const [dealSnapshot, setDealSnapshot] = useState(null);
+  const [backgroundCheckPending, setBackgroundCheckPending] = useState(false);
+  const [backgroundCheckMessage, setBackgroundCheckMessage] = useState('');
   const resetTimeoutRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const scrapeRunRef = useRef(0);
   const { toast, showToast } = useToast();
   const rabattgutscheinAktiv = selectedExtras.includes(COUPON_OPTION_LABEL);
 
@@ -309,6 +378,9 @@ function GeneratorPosterPage() {
     setRabattgutscheinCode('');
     setFormError('');
     setDealSnapshot(null);
+    setBackgroundCheckPending(false);
+    setBackgroundCheckMessage('');
+    scrapeRunRef.current += 1;
     if (uploadInputRef.current) {
       uploadInputRef.current.value = '';
     }
@@ -389,6 +461,8 @@ function GeneratorPosterPage() {
       setScrapedTitle('');
       setFormError('Link vergessen.');
       setDealSnapshot(null);
+      setBackgroundCheckPending(false);
+      setBackgroundCheckMessage('');
       showToast('Link vergessen.');
       return;
     }
@@ -396,6 +470,10 @@ function GeneratorPosterPage() {
     setScraping(true);
     setFormError('');
     setDealSnapshot(null);
+    setBackgroundCheckPending(false);
+    setBackgroundCheckMessage('');
+    const scrapeRunId = scrapeRunRef.current + 1;
+    scrapeRunRef.current = scrapeRunId;
 
     try {
       const response = await fetch(amazonScrapeApiUrl, {
@@ -420,6 +498,8 @@ function GeneratorPosterPage() {
         setScrapedTitle('');
         setFormError('');
         setDealSnapshot(null);
+        setBackgroundCheckPending(false);
+        setBackgroundCheckMessage('');
         showToast(
           data.error ||
             data.message ||
@@ -430,6 +510,109 @@ function GeneratorPosterPage() {
       }
 
       const normalizedDealImageUrl = normalizeDealImageUrl(data.image || '');
+      const initialSnapshot = buildInitialDealSnapshot(data, finalAmazonLink);
+
+      if (scrapeRunRef.current !== scrapeRunId) {
+        return;
+      }
+
+      setDealSnapshot(initialSnapshot);
+      setScrapedImageUrl(normalizedDealImageUrl);
+      setScrapedTitle(data.title || '');
+      setOldPrice(formatPrice(data.oldPrice || ''));
+      setCurrentPrice(formatPrice(data.price || ''));
+      setSelectedPrimaryOptions([]);
+      setHasScraped(true);
+      setBackgroundCheckPending(true);
+      setBackgroundCheckMessage('Basisdaten geladen. Historie und Sperrcheck werden im Hintergrund aktualisiert.');
+      showToast(
+        normalizedDealImageUrl
+          ? 'Amazon Link erfolgreich gescrapt und Produktbild geladen'
+          : 'Amazon Link erfolgreich gescrapt, aber ohne Produktbild'
+      );
+
+      if (!data.title) {
+        showToast('Produkttitel konnte nicht gelesen werden. Fallback wird verwendet.', 2600);
+      }
+
+      setScraping(false);
+
+      const fastCheckPayload = {
+        asin: data.asin || '',
+        url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
+        normalizedUrl: data.normalizedUrl || '',
+        sellerType: data.sellerType || '',
+        currentPrice: data.price || '',
+        title: data.title || '',
+        imageUrl: normalizedDealImageUrl || data.image || '',
+        includeGeneratorContext: false
+      };
+
+      void (async () => {
+        try {
+          const checkResponse = await fetch(dealsCheckApiUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(fastCheckPayload)
+          });
+
+          const checkRawResponse = await checkResponse.text();
+          let checkData = {};
+
+          try {
+            checkData = checkRawResponse ? JSON.parse(checkRawResponse) : {};
+          } catch {
+            checkData = { error: checkRawResponse || 'Unbekannte Deal-Check-Antwort' };
+          }
+
+          if (scrapeRunRef.current !== scrapeRunId) {
+            return;
+          }
+
+          if (!checkResponse.ok) {
+            setBackgroundCheckMessage(
+              'Basisdaten geladen. Historie/Sperrcheck konnte gerade nicht nachgeladen werden. Beim Veröffentlichen wird serverseitig erneut geprüft.'
+            );
+            showToast(checkData.error || 'Historie/Sperrcheck konnte nicht nachgeladen werden.', 2800);
+            return;
+          }
+
+          const resolvedSnapshot = buildCheckedDealSnapshot(checkData, data, finalAmazonLink);
+          setDealSnapshot(resolvedSnapshot);
+
+          if (checkData.blocked === true) {
+            const formattedBlockMessage = `Link bereits gepostet. Erneut möglich in ${formatRemainingTime(
+              Number(checkData.remainingSeconds || 0)
+            )}.`;
+            setBackgroundCheckMessage('');
+            setFormError(formattedBlockMessage);
+            setHasScraped(false);
+            return;
+          }
+
+          setBackgroundCheckMessage('');
+          setFormError('');
+        } catch (error) {
+          if (scrapeRunRef.current !== scrapeRunId) {
+            return;
+          }
+
+          const fallbackMessage =
+            error instanceof Error ? error.message : 'Historie/Sperrcheck konnte nicht nachgeladen werden.';
+          setBackgroundCheckMessage(
+            'Basisdaten geladen. Historie/Sperrcheck konnte gerade nicht nachgeladen werden. Beim Veröffentlichen wird serverseitig erneut geprüft.'
+          );
+          showToast(fallbackMessage, 2800);
+        } finally {
+          if (scrapeRunRef.current === scrapeRunId) {
+            setBackgroundCheckPending(false);
+          }
+        }
+      })();
+
+      return;
       const checkPayload = {
         asin: data.asin || '',
         url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
@@ -521,6 +704,8 @@ function GeneratorPosterPage() {
       setHasScraped(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
+      setBackgroundCheckPending(false);
+      setBackgroundCheckMessage('');
       setFormError(`Scrape fehlgeschlagen: ${finalError}`);
       showToast(`Scrape fehlgeschlagen: ${finalError}`);
     } finally {
@@ -602,14 +787,17 @@ function GeneratorPosterPage() {
         data = { error: rawResponse || 'Unbekannte Backend-Antwort' };
       }
 
+      const normalizedResponse = normalizeDirectPublishResponse(data);
+
       if (!response.ok) {
-        const backendMessage = data.error || data.message || `Backend-Fehler (${response.status}) beim Direkt-Posting`;
+        const backendMessage =
+          normalizedResponse.error || normalizedResponse.message || `Backend-Fehler (${response.status}) beim Direkt-Posting`;
         setFormError(backendMessage);
         showToast(backendMessage);
         return;
       }
 
-      const queueStatus = String(data?.queue?.status || '').trim().toLowerCase();
+      const queueStatus = String(normalizedResponse.queue?.status || '').trim().toLowerCase();
       const successMessage =
         queueStatus === 'retry'
           ? 'Generator-Post gespeichert. Versand laeuft ueber Retry weiter.'
@@ -625,8 +813,8 @@ function GeneratorPosterPage() {
     } catch (error) {
       const message =
         error instanceof Error
-          ? `Telegram-Verbindungsfehler: ${error.message}`
-          : 'Telegram-Verbindungsfehler';
+          ? `Veroeffentlichungsfehler: ${error.message}`
+          : 'Veroeffentlichungsfehler';
 
       setFormError(message);
       showToast(message);
@@ -716,6 +904,7 @@ function GeneratorPosterPage() {
                   type="text"
                   value={amazonLink}
                   onChange={(e) => {
+                    scrapeRunRef.current += 1;
                     setAmazonLink(e.target.value);
                     setHasScraped(false);
                     setScrapedImageUrl('');
@@ -723,6 +912,8 @@ function GeneratorPosterPage() {
                     setSelectedPrimaryOptions([]);
                     setFormError('');
                     setDealSnapshot(null);
+                    setBackgroundCheckPending(false);
+                    setBackgroundCheckMessage('');
                   }}
                   placeholder="https://amazon.de/..."
                 />
@@ -760,6 +951,12 @@ function GeneratorPosterPage() {
                 <div className="generator-history-inline">
                   <p>Zuletzt gepostet am: {formattedLastPostedAt}</p>
                   <p>Preisspanne 6 Monate: {formattedMinPrice} - {formattedMaxPrice}</p>
+                </div>
+              )}
+
+              {backgroundCheckMessage && !dealSnapshot?.blocked && (
+                <div className={`generator-scrape-meta${backgroundCheckPending ? ' is-pending' : ' is-warning'}`}>
+                  <p>{backgroundCheckMessage}</p>
                 </div>
               )}
             </div>

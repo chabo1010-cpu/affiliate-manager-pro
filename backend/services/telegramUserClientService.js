@@ -15,9 +15,21 @@ const QR_READY_WAIT_MS = 5000;
 const QR_READY_POLL_MS = 100;
 const MAX_DIALOGS = 80;
 const MAX_SYNC_PER_CHANNEL = 15;
+const MIN_READER_GROUP_SLOTS = 10;
+const MAX_READER_GROUP_SLOTS = 100;
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function clampReaderGroupSlotCount(value) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return MIN_READER_GROUP_SLOTS;
+  }
+
+  return Math.min(MAX_READER_GROUP_SLOTS, Math.max(MIN_READER_GROUP_SLOTS, Math.round(parsed)));
 }
 
 function nowIso() {
@@ -241,6 +253,45 @@ function listSessionRows() {
   return db.prepare(`SELECT * FROM telegram_reader_sessions ORDER BY updated_at DESC, id DESC`).all().map(mapSessionRow);
 }
 
+function getPreferredReaderSessionRow() {
+  return (
+    db
+      .prepare(
+        `
+          SELECT *
+          FROM telegram_reader_sessions
+          ORDER BY
+            CASE WHEN status IN ('connected', 'active', 'watching') THEN 0 ELSE 1 END,
+            updated_at DESC,
+            id DESC
+          LIMIT 1
+        `
+      )
+      .get() || null
+  );
+}
+
+function resolveReaderSessionName(sessionName = '') {
+  const explicitSessionName = cleanText(sessionName);
+  if (explicitSessionName) {
+    return normalizeSessionName(explicitSessionName);
+  }
+
+  const preferredSession = getPreferredReaderSessionRow();
+  return preferredSession?.name || DEFAULT_SESSION_NAME;
+}
+
+function getReaderGroupSlotCount() {
+  const row = db.prepare(`SELECT telegramReaderGroupSlotCount FROM app_settings WHERE id = 1`).get() || {};
+  return clampReaderGroupSlotCount(row.telegramReaderGroupSlotCount);
+}
+
+function saveReaderGroupSlotCount(slotCount) {
+  const nextSlotCount = clampReaderGroupSlotCount(slotCount);
+  db.prepare(`UPDATE app_settings SET telegramReaderGroupSlotCount = ? WHERE id = 1`).run(nextSlotCount);
+  return nextSlotCount;
+}
+
 function listWatchedChannels(sessionName = '') {
   const rows = sessionName
     ? db
@@ -250,7 +301,11 @@ function listWatchedChannels(sessionName = '') {
             FROM telegram_reader_channels c
             LEFT JOIN telegram_reader_sessions s ON s.id = c.session_id
             WHERE s.name = ?
-            ORDER BY c.channel_title COLLATE NOCASE ASC, c.id ASC
+            ORDER BY
+              CASE WHEN c.slot_index IS NULL THEN 1 ELSE 0 END,
+              c.slot_index ASC,
+              c.channel_title COLLATE NOCASE ASC,
+              c.id ASC
           `
         )
         .all(normalizeSessionName(sessionName))
@@ -260,7 +315,11 @@ function listWatchedChannels(sessionName = '') {
             SELECT c.*, s.name AS session_name
             FROM telegram_reader_channels c
             LEFT JOIN telegram_reader_sessions s ON s.id = c.session_id
-            ORDER BY c.channel_title COLLATE NOCASE ASC, c.id ASC
+            ORDER BY
+              CASE WHEN c.slot_index IS NULL THEN 1 ELSE 0 END,
+              c.slot_index ASC,
+              c.channel_title COLLATE NOCASE ASC,
+              c.id ASC
           `
         )
         .all();
@@ -268,6 +327,7 @@ function listWatchedChannels(sessionName = '') {
   return rows.map((row) => ({
     id: row.id,
     sessionName: row.session_name || '',
+    slotIndex: row.slot_index ?? null,
     channelRef: row.channel_ref,
     channelTitle: row.channel_title || '',
     channelType: row.channel_type || 'group',
@@ -408,8 +468,31 @@ async function ensureAuthorizedClient(sessionName) {
   return activeClients.get(normalizedSessionName)?.client || client;
 }
 
+function normalizeConfiguredChannelRef(value = '') {
+  const trimmed = cleanText(value);
+
+  if (!trimmed) {
+    return '';
+  }
+
+  const normalizedTelegramUrl = trimmed.match(
+    /^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(?:joinchat\/|\+)?([A-Za-z0-9_+-]+)(?:\/.*)?$/i
+  );
+
+  if (normalizedTelegramUrl?.[1]) {
+    const token = cleanText(normalizedTelegramUrl[1]);
+    return token.startsWith('+') ? `https://t.me/${token}` : `@${token.replace(/^@+/, '')}`;
+  }
+
+  if (trimmed.startsWith('@')) {
+    return `@${trimmed.replace(/^@+/, '')}`;
+  }
+
+  return trimmed;
+}
+
 function resolveDialogRef(ref) {
-  const normalizedRef = cleanText(ref);
+  const normalizedRef = normalizeConfiguredChannelRef(ref);
   if (!normalizedRef) {
     throw new Error('Dialog-Referenz fehlt.');
   }
@@ -549,6 +632,219 @@ function ensureChannelRow(sessionName, input = {}) {
 
 function removeChannelRow(channelId) {
   db.prepare(`DELETE FROM telegram_reader_channels WHERE id = ?`).run(Number(channelId));
+}
+
+function buildReaderGroupSlotStatus(item = {}) {
+  if (!cleanText(item.name)) {
+    return 'leer';
+  }
+
+  if (!item.enabled) {
+    return 'inaktiv';
+  }
+
+  if (!cleanText(item.username)) {
+    return 'unvollstaendig';
+  }
+
+  return 'aktiv';
+}
+
+function listReaderGroupSlotRows(sessionName = '') {
+  const resolvedSessionName = resolveReaderSessionName(sessionName);
+
+  return db
+    .prepare(
+      `
+        SELECT c.*, s.name AS session_name
+        FROM telegram_reader_channels c
+        LEFT JOIN telegram_reader_sessions s ON s.id = c.session_id
+        WHERE s.name = ?
+          AND c.slot_index IS NOT NULL
+        ORDER BY c.slot_index ASC, c.id ASC
+      `
+    )
+    .all(resolvedSessionName)
+    .map((row) => ({
+      id: row.id,
+      sessionName: row.session_name || resolvedSessionName,
+      slotIndex: Number(row.slot_index || 0),
+      name: row.channel_title || '',
+      username: row.channel_ref || '',
+      enabled: row.is_active === 1
+    }));
+}
+
+function mapReaderGroupSlotsPayload(sessionName = '', slotCount = MIN_READER_GROUP_SLOTS) {
+  const resolvedSessionName = resolveReaderSessionName(sessionName);
+  const resolvedSlotCount = clampReaderGroupSlotCount(slotCount);
+  const existingRows = new Map(listReaderGroupSlotRows(resolvedSessionName).map((item) => [item.slotIndex, item]));
+  const activeSession = getPreferredReaderSessionRow();
+  const sessionRow = getSessionRowByName(resolvedSessionName);
+
+  return {
+    sessionName: resolvedSessionName,
+    slotCount: resolvedSlotCount,
+    maxSlots: MAX_READER_GROUP_SLOTS,
+    stats: {
+      activeCount: Array.from(existingRows.values()).filter(
+        (item) => item.enabled && cleanText(item.name) && cleanText(item.username)
+      ).length,
+      configuredCount: Array.from(existingRows.values()).filter((item) => cleanText(item.name)).length,
+      visibleSlots: resolvedSlotCount,
+      activeSessionName: activeSession?.name || '',
+      sessionStatus: sessionRow?.status || activeSession?.status || 'disconnected'
+    },
+    items: Array.from({ length: resolvedSlotCount }, (_, index) => {
+      const slotIndex = index + 1;
+      const existing = existingRows.get(slotIndex) || null;
+      const item = {
+        id: existing?.id || null,
+        slotIndex,
+        name: existing?.name || '',
+        username: existing?.username || '',
+        enabled: existing?.enabled === true
+      };
+
+      return {
+        ...item,
+        status: buildReaderGroupSlotStatus(item)
+      };
+    })
+  };
+}
+
+function upsertReaderGroupSlot(sessionName, item = {}) {
+  const resolvedSessionName = resolveReaderSessionName(sessionName);
+  const session = upsertSessionRow({
+    name: resolvedSessionName,
+    loginMode: getSessionRowByName(resolvedSessionName)?.login_mode || 'phone',
+    phoneNumber: getSessionRowByName(resolvedSessionName)?.phone_number || ''
+  });
+  const slotIndex = Number(item.slotIndex);
+  const name = cleanText(item.name);
+  const configuredRef = normalizeConfiguredChannelRef(item.username || item.link || '');
+  const channelRef = configuredRef;
+  const existing =
+    db.prepare(`SELECT * FROM telegram_reader_channels WHERE session_id = ? AND slot_index = ? LIMIT 1`).get(session.id, slotIndex) ||
+    null;
+  const duplicateByRef =
+    channelRef
+      ? db
+          .prepare(`SELECT * FROM telegram_reader_channels WHERE session_id = ? AND channel_ref = ? LIMIT 1`)
+          .get(session.id, channelRef) || null
+      : null;
+
+  if (!name) {
+    if (existing) {
+      db.prepare(`DELETE FROM telegram_reader_channels WHERE id = ?`).run(existing.id);
+    }
+    return null;
+  }
+
+  const timestamp = nowIso();
+  let targetRow = existing;
+
+  if (duplicateByRef && (!targetRow || duplicateByRef.id !== targetRow.id)) {
+    if (targetRow && targetRow.id !== duplicateByRef.id) {
+      db.prepare(`DELETE FROM telegram_reader_channels WHERE id = ?`).run(targetRow.id);
+    }
+    targetRow = duplicateByRef;
+  }
+
+  if (targetRow) {
+    db.prepare(
+      `
+        UPDATE telegram_reader_channels
+        SET channel_ref = @channelRef,
+            channel_title = @channelTitle,
+            channel_type = 'group',
+            is_active = @isActive,
+            slot_index = @slotIndex,
+            last_seen_message_id = NULL,
+            last_seen_message_at = NULL,
+            updated_at = @updatedAt
+        WHERE id = @id
+      `
+    ).run({
+      id: targetRow.id,
+      channelRef: channelRef || '',
+      channelTitle: name,
+      isActive: item.enabled === true ? 1 : 0,
+      slotIndex,
+      updatedAt: timestamp
+    });
+  } else {
+    db.prepare(
+      `
+        INSERT INTO telegram_reader_channels (
+          session_id,
+          slot_index,
+          channel_ref,
+          channel_title,
+          channel_type,
+          is_active,
+          last_seen_message_id,
+          last_seen_message_at,
+          created_at,
+          updated_at
+        ) VALUES (
+          @sessionId,
+          @slotIndex,
+          @channelRef,
+          @channelTitle,
+          'group',
+          @isActive,
+          NULL,
+          NULL,
+          @createdAt,
+          @updatedAt
+        )
+      `
+    ).run({
+      sessionId: session.id,
+      slotIndex,
+      channelRef: channelRef || '',
+      channelTitle: name,
+      isActive: item.enabled === true ? 1 : 0,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+  }
+
+  return true;
+}
+
+export function getTelegramReaderGroupConfig(input = {}) {
+  const resolvedSessionName = resolveReaderSessionName(input.sessionName);
+  const slotCount = getReaderGroupSlotCount();
+  return mapReaderGroupSlotsPayload(resolvedSessionName, slotCount);
+}
+
+export function saveTelegramReaderGroupConfig(input = {}) {
+  const resolvedSessionName = resolveReaderSessionName(input.sessionName);
+  const slotCount = saveReaderGroupSlotCount(input.slotCount);
+  const items = Array.isArray(input.items) ? input.items : [];
+  const desiredSlotIndexes = new Set();
+
+  for (const item of items) {
+    const slotIndex = Number(item?.slotIndex || 0);
+    if (!Number.isFinite(slotIndex) || slotIndex < 1 || slotIndex > slotCount) {
+      continue;
+    }
+
+    desiredSlotIndexes.add(slotIndex);
+    upsertReaderGroupSlot(resolvedSessionName, item);
+  }
+
+  const existingRows = listReaderGroupSlotRows(resolvedSessionName);
+  for (const row of existingRows) {
+    if (row.slotIndex > slotCount || !desiredSlotIndexes.has(row.slotIndex)) {
+      db.prepare(`DELETE FROM telegram_reader_channels WHERE id = ?`).run(row.id);
+    }
+  }
+
+  return mapReaderGroupSlotsPayload(resolvedSessionName, slotCount);
 }
 
 export async function getTelegramUserClientStatus() {
@@ -946,37 +1242,55 @@ export function unwatchTelegramDialog(input = {}) {
 }
 
 export async function syncTelegramWatchedMessages(input = {}) {
-  const sessionName = normalizeSessionName(input.sessionName);
+  const sessionName = resolveReaderSessionName(input.sessionName);
   const client = await ensureAuthorizedClient(sessionName);
-  const watchedChannels = listWatchedChannels(sessionName).filter((item) => item.isActive);
+  const watchedChannels = listWatchedChannels(sessionName).filter(
+    (item) => item.isActive && cleanText(item.channelTitle) && cleanText(item.channelRef)
+  );
   const resultItems = [];
 
   for (const channel of watchedChannels) {
-    const entityRef = resolveDialogRef(channel.channelRef);
-    let latestSeenId = channel.lastSeenMessageId ? Number(channel.lastSeenMessageId) : 0;
-    let latestSeenAt = channel.lastSeenMessageAt || null;
+    try {
+      const entityRef = resolveDialogRef(channel.channelRef);
+      let latestSeenId = channel.lastSeenMessageId ? Number(channel.lastSeenMessageId) : 0;
+      let latestSeenAt = channel.lastSeenMessageAt || null;
 
-    for await (const message of client.iterMessages(entityRef, {
-      limit: Math.min(MAX_SYNC_PER_CHANNEL, Math.max(1, Number(input.limit) || MAX_SYNC_PER_CHANNEL))
-    })) {
-      const currentMessageId = Number(message?.id || 0);
+      for await (const message of client.iterMessages(entityRef, {
+        limit: Math.min(MAX_SYNC_PER_CHANNEL, Math.max(1, Number(input.limit) || MAX_SYNC_PER_CHANNEL))
+      })) {
+        const currentMessageId = Number(message?.id || 0);
 
-      if (latestSeenId && currentMessageId <= latestSeenId) {
-        continue;
+        if (latestSeenId && currentMessageId <= latestSeenId) {
+          continue;
+        }
+
+        const structuredMessage = await formatTelegramMessage(message, channel.channelTitle);
+        resultItems.push(structuredMessage);
+
+        if (currentMessageId > latestSeenId) {
+          latestSeenId = currentMessageId;
+        }
+
+        latestSeenAt = structuredMessage.timestamp;
       }
 
-      const structuredMessage = await formatTelegramMessage(message, channel.channelTitle);
-      resultItems.push(structuredMessage);
+      if (latestSeenId) {
+        updateChannelCheckpoint(channel.id, latestSeenId, latestSeenAt);
+        const session = getSessionRowByName(sessionName);
 
-      if (currentMessageId > latestSeenId) {
-        latestSeenId = currentMessageId;
+        if (session) {
+          upsertSessionRow({
+            name: sessionName,
+            loginMode: session.login_mode,
+            phoneNumber: session.phone_number || '',
+            sessionPath: session.session_path,
+            status: session.status || 'connected',
+            lastMessageAt: latestSeenAt || null,
+            lastError: ''
+          });
+        }
       }
-
-      latestSeenAt = structuredMessage.timestamp;
-    }
-
-    if (latestSeenId) {
-      updateChannelCheckpoint(channel.id, latestSeenId, latestSeenAt);
+    } catch (error) {
       const session = getSessionRowByName(sessionName);
 
       if (session) {
@@ -986,8 +1300,7 @@ export async function syncTelegramWatchedMessages(input = {}) {
           phoneNumber: session.phone_number || '',
           sessionPath: session.session_path,
           status: session.status || 'connected',
-          lastMessageAt: latestSeenAt || null,
-          lastError: ''
+          lastError: error instanceof Error ? error.message : `Gruppe ${channel.channelTitle} konnte nicht gelesen werden.`
         });
       }
     }

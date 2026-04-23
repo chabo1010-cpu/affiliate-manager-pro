@@ -132,30 +132,53 @@ function buildDirectPublishingTargets(input = {}) {
   ];
 }
 
-function buildChannelResult(base = {}, nextResult = {}) {
+function buildEmptyChannelResult(channelType = '', imageSource = '') {
+  return {
+    channelType: cleanText(channelType).toLowerCase(),
+    status: 'pending',
+    imageSource: cleanText(imageSource) || '',
+    deliveries: [],
+    messageId: null,
+    chatId: null
+  };
+}
+
+function buildChannelResult(base = null, nextResult = {}) {
+  const safeBase =
+    base && typeof base === 'object'
+      ? {
+          ...buildEmptyChannelResult(base.channelType, base.imageSource),
+          ...base,
+          deliveries: Array.isArray(base.deliveries) ? base.deliveries : []
+        }
+      : buildEmptyChannelResult(nextResult.channelType, nextResult.imageSource);
   const deliveries = Array.isArray(nextResult.deliveries) ? nextResult.deliveries : [];
   return {
-    status: nextResult.status || base.status || 'pending',
-    imageSource: nextResult.imageSource || base.imageSource || '',
-    deliveries: [...(base.deliveries || []), ...deliveries],
-    messageId: nextResult.messageId || base.messageId || null,
-    chatId: nextResult.chatId || base.chatId || null
+    channelType: cleanText(nextResult.channelType || safeBase.channelType).toLowerCase(),
+    status: nextResult.status || safeBase.status || 'pending',
+    imageSource: nextResult.imageSource || safeBase.imageSource || '',
+    deliveries: [...safeBase.deliveries, ...deliveries],
+    messageId: nextResult.messageId || safeBase.messageId || null,
+    chatId: nextResult.chatId || safeBase.chatId || null
   };
 }
 
 function summarizeQueueResults(queueProcessingResult = {}, input = {}, generatorPostId) {
   const queue = queueProcessingResult.queue || null;
+  const queueTargets = Array.isArray(queue?.targets) ? queue.targets : [];
+  const processingResults = Array.isArray(queueProcessingResult.results) ? queueProcessingResult.results : [];
   const results = {
     generatorPostId,
-    telegram: null,
-    whatsapp: null,
-    facebook: null
+    telegram: buildEmptyChannelResult('telegram', cleanText(input.telegramImageSource) || 'standard'),
+    whatsapp: buildEmptyChannelResult('whatsapp', cleanText(input.whatsappImageSource) || 'standard'),
+    facebook: buildEmptyChannelResult('facebook', cleanText(input.facebookImageSource) || 'link_preview')
   };
 
-  (queueProcessingResult.results || []).forEach((entry) => {
+  processingResults.forEach((entry) => {
     if (entry.channelType === 'telegram') {
       const deliveries = Array.isArray(entry.workerResult?.targets) ? entry.workerResult.targets : [];
       results.telegram = buildChannelResult(results.telegram, {
+        channelType: 'telegram',
         status: entry.status,
         imageSource: cleanText(input.telegramImageSource) || 'standard',
         deliveries,
@@ -167,6 +190,7 @@ function summarizeQueueResults(queueProcessingResult = {}, input = {}, generator
 
     if (entry.channelType === 'whatsapp') {
       results.whatsapp = buildChannelResult(results.whatsapp, {
+        channelType: 'whatsapp',
         status: entry.status,
         imageSource: cleanText(input.whatsappImageSource) || 'standard'
       });
@@ -175,17 +199,38 @@ function summarizeQueueResults(queueProcessingResult = {}, input = {}, generator
 
     if (entry.channelType === 'facebook') {
       results.facebook = buildChannelResult(results.facebook, {
+        channelType: 'facebook',
         status: entry.status,
         imageSource: cleanText(input.facebookImageSource) || 'link_preview'
       });
     }
   });
 
-  const sentTarget = (queue?.targets || []).find((target) => normalizePublishingQueueStatus(target.status) === 'sent') || null;
+  queueTargets.forEach((target) => {
+    const normalizedStatus = normalizePublishingQueueStatus(target?.status);
+    const channelType = cleanText(target?.channel_type).toLowerCase();
+    if (!channelType || !results[channelType] || !normalizedStatus) {
+      return;
+    }
+
+    results[channelType] = buildChannelResult(results[channelType], {
+      channelType,
+      status: normalizedStatus,
+      imageSource: results[channelType].imageSource
+    });
+  });
+
+  const sentTarget = queueTargets.find((target) => normalizePublishingQueueStatus(target.status) === 'sent') || null;
+  const deliveries = {
+    telegram: Array.isArray(results.telegram?.deliveries) ? results.telegram.deliveries : [],
+    whatsapp: Array.isArray(results.whatsapp?.deliveries) ? results.whatsapp.deliveries : [],
+    facebook: Array.isArray(results.facebook?.deliveries) ? results.facebook.deliveries : []
+  };
 
   return {
     queue,
     results,
+    deliveries,
     postedAt: sentTarget?.posted_at || null,
     telegramMessageId: results.telegram?.messageId || null
   };
@@ -198,6 +243,31 @@ function buildQueueFailureError(summary = {}) {
   error.retryable = false;
   error.queue = summary.queue || null;
   return error;
+}
+
+function assertDirectPublishingTargets(input = {}, payload = {}) {
+  const targets = buildDirectPublishingTargets(input).filter((target) => target.isEnabled);
+
+  if (!targets.length) {
+    const error = new Error('Keine aktiven Ziele fuer den manuellen Test-Post ausgewaehlt.');
+    error.code = 'NO_PUBLISH_TARGETS_SELECTED';
+    error.retryable = false;
+    throw error;
+  }
+
+  const hasTelegramTarget =
+    targets.some((target) => cleanText(target.channelType).toLowerCase() === 'telegram') &&
+    Array.isArray(payload.telegramChatIds) &&
+    payload.telegramChatIds.length > 0;
+
+  if (!hasTelegramTarget) {
+    const error = new Error('Keine Telegram-Zielgruppe fuer den manuellen Test-Post verfuegbar.');
+    error.code = 'NO_TELEGRAM_PUBLISH_TARGET';
+    error.retryable = false;
+    throw error;
+  }
+
+  return targets;
 }
 
 export async function publishGeneratorPostDirect(input = {}) {
@@ -241,12 +311,15 @@ export async function publishGeneratorPostDirect(input = {}) {
     dealHash: dealLock.dealHash || null
   });
 
+  const publishingPayload = buildDirectPublishingPayload(input, generatorPostId, generatorContext);
+  const publishingTargets = assertDirectPublishingTargets(input, publishingPayload);
+
   const queueEntry = createPublishingEntry({
     sourceType: 'generator_direct',
     sourceId: generatorPostId,
     originOverride: 'manual',
-    payload: buildDirectPublishingPayload(input, generatorPostId, generatorContext),
-    targets: buildDirectPublishingTargets(input)
+    payload: publishingPayload,
+    targets: publishingTargets
   });
 
   logGeneratorDebug('MANUAL POST SAVED TO QUEUE', {
@@ -290,6 +363,14 @@ export async function publishGeneratorPostDirect(input = {}) {
     postedAt: summary.postedAt || null,
     queue: summary.queue || queueEntry,
     results: summary.results,
+    deliveries: summary.deliveries,
     generatorContext
   };
 }
+
+export const __testablesDirectPublisher = {
+  buildEmptyChannelResult,
+  buildChannelResult,
+  summarizeQueueResults,
+  assertDirectPublishingTargets
+};

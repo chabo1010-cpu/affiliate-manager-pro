@@ -1,4 +1,5 @@
 import { cleanText, savePostedDeal } from './dealHistoryService.js';
+import { buildPublishingChannelLabel } from './databaseService.js';
 import { sendWhatsappDeal } from './whatsappClientService.js';
 
 export async function processWhatsappPublishingTarget(target, queuePayload) {
@@ -32,27 +33,29 @@ export async function processWhatsappPublishingTarget(target, queuePayload) {
     targetMeta: target.target_meta_json || null
   });
 
-  savePostedDeal({
-    asin: queuePayload.asin || '',
-    originalUrl: queuePayload.link,
-    normalizedUrl: queuePayload.normalizedUrl || queuePayload.link,
-    title: queuePayload.title,
-    currentPrice: queuePayload.currentPrice || '',
-    oldPrice: queuePayload.oldPrice || '',
-    sellerType: queuePayload.sellerType || 'FBM',
-    postedAt,
-    channel: result.targetLabel ? `WHATSAPP:${result.targetLabel}` : 'WHATSAPP',
-    couponCode: queuePayload.couponCode || '',
-    sourceType: cleanText(queuePayload.databaseSourceType) || 'publisher_queue',
-    sourceId: queuePayload.generatorPostId || queuePayload.sourceId || null,
-    queueId: target.queue_id,
-    origin: cleanText(queuePayload.databaseOrigin) || 'automatic',
-    decisionReason: 'WhatsApp Queue-Target erfolgreich verarbeitet.',
-    meta: {
-      targetId: target.id,
-      delivery: result
-    }
-  });
+  if (queuePayload.skipPostedDealHistory !== true) {
+    savePostedDeal({
+      asin: queuePayload.asin || '',
+      originalUrl: queuePayload.link,
+      normalizedUrl: queuePayload.normalizedUrl || queuePayload.link,
+      title: queuePayload.title,
+      currentPrice: queuePayload.currentPrice || '',
+      oldPrice: queuePayload.oldPrice || '',
+      sellerType: queuePayload.sellerType || 'FBM',
+      postedAt,
+      channel: buildPublishingChannelLabel('whatsapp', target.target_label || result.targetLabel || target.target_ref || ''),
+      couponCode: queuePayload.couponCode || '',
+      sourceType: cleanText(queuePayload.databaseSourceType) || 'publisher_queue',
+      sourceId: queuePayload.generatorPostId || queuePayload.sourceId || null,
+      queueId: target.queue_id,
+      origin: cleanText(queuePayload.databaseOrigin) || 'automatic',
+      decisionReason: 'WhatsApp Queue-Target erfolgreich verarbeitet.',
+      meta: {
+        targetId: target.id,
+        delivery: result
+      }
+    });
+  }
 
   return result;
 }

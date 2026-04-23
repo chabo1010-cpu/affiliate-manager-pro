@@ -70,6 +70,8 @@ router.post('/direct', upload.single('uploadedImageFile'), async (req, res) => {
       error instanceof Error && typeof error.code === 'string'
         ? error.code.startsWith('DEAL_LOCK_')
           ? 409
+          : ['NO_PUBLISH_TARGETS_SELECTED', 'NO_TELEGRAM_PUBLISH_TARGET'].includes(error.code)
+            ? 400
           : error.code === 'PUBLISHING_QUEUE_FAILED'
             ? 502
             : 500
