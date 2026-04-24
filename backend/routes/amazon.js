@@ -1,9 +1,33 @@
 import { Router } from 'express';
-import { getAmazonAffiliateStatus, runAmazonAffiliateApiTest } from '../services/amazonAffiliateService.js';
+import { getAmazonAffiliateStatus, loadAmazonAffiliateContext, runAmazonAffiliateApiTest } from '../services/amazonAffiliateService.js';
 import { classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
 import { logGeneratorDebug } from '../services/generatorFlowService.js';
 
 const router = Router();
+const AMAZON_FETCH_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
+};
+const AMAZON_SHORT_HOSTS = new Set(['amzn.to']);
+const AMAZON_REDIRECT_LIMIT = 6;
+
+function safeUrl(value) {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function isAmazonShortLink(value = '') {
+  const hostname = safeUrl(value)?.hostname?.toLowerCase().replace(/^www\./, '') || '';
+  return AMAZON_SHORT_HOSTS.has(hostname);
+}
+
+function isRedirectStatus(status) {
+  return Number(status) >= 300 && Number(status) < 400;
+}
 
 function decodeHtml(value) {
   return value
@@ -14,23 +38,291 @@ function decodeHtml(value) {
     .replace(/&gt;/g, '>');
 }
 
+function decodeEscapedValue(value) {
+  return value
+    .replace(/\\u0026/gi, '&')
+    .replace(/\\u003d/gi, '=')
+    .replace(/\\u002f/gi, '/')
+    .replace(/\\u0025/gi, '%')
+    .replace(/\\\//g, '/')
+    .replace(/\\"/g, '"');
+}
+
 function extractFirstMatch(html, patterns) {
   for (const pattern of patterns) {
     const match = html.match(pattern);
     if (match?.[1]) {
-      return decodeHtml(match[1].trim());
+      return decodeHtml(decodeEscapedValue(match[1].trim()));
     }
   }
 
   return '';
 }
 
-function extractAmazonImage(html) {
-  return extractFirstMatch(html, [
-    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
-    /"hiRes"\s*:\s*"([^"]+)"/i
+function resolveUrlCandidate(value, baseUrl = '') {
+  const trimmed = typeof value === 'string' ? decodeHtml(decodeEscapedValue(value.trim())) : '';
+  if (!trimmed) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith('//')) {
+    return `https:${trimmed}`;
+  }
+
+  try {
+    return new URL(trimmed, baseUrl || 'https://www.amazon.de/').toString();
+  } catch {
+    return '';
+  }
+}
+
+function normalizeExtractedImageUrl(imageUrl, baseUrl = '') {
+  const resolvedUrl = resolveUrlCandidate(imageUrl, baseUrl);
+  if (!resolvedUrl || !/^https?:\/\//i.test(resolvedUrl)) {
+    return '';
+  }
+
+  return normalizeDealImageUrl(resolvedUrl);
+}
+
+function extractDynamicImageUrl(html, baseUrl = '') {
+  const matches = [...html.matchAll(/data-a-dynamic-image=(["'])([\s\S]*?)\1/gi)];
+
+  for (const match of matches) {
+    const rawJson = typeof match?.[2] === 'string' ? decodeHtml(decodeEscapedValue(match[2].trim())) : '';
+    if (!rawJson) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (!parsed || typeof parsed !== 'object') {
+        continue;
+      }
+
+      for (const candidateUrl of Object.keys(parsed)) {
+        const normalizedCandidateUrl = normalizeExtractedImageUrl(candidateUrl, baseUrl);
+        if (normalizedCandidateUrl) {
+          return normalizedCandidateUrl;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return '';
+}
+
+function normalizeSrcSetValue(value = '') {
+  const trimmed = typeof value === 'string' ? decodeHtml(decodeEscapedValue(value.trim())) : '';
+  if (!trimmed) {
+    return '';
+  }
+
+  return trimmed
+    .split(',')
+    .map((part) => part.trim().split(/\s+/)[0] || '')
+    .find(Boolean);
+}
+
+function isLikelyContentImageUrl(imageUrl = '') {
+  const lowered = String(imageUrl || '').toLowerCase();
+  if (!lowered) {
+    return false;
+  }
+
+  if (lowered.endsWith('.svg') || lowered.includes('.svg?')) {
+    return false;
+  }
+
+  if (/\/(favicon|sprite|spacer|pixel|icon|logo|loading)[^/]*($|[/?#])/i.test(lowered)) {
+    return /images-amazon\.com|media-amazon\.com|ssl-images-amazon/i.test(lowered);
+  }
+
+  return true;
+}
+
+function extractMetaImage(html, fieldName, baseUrl = '') {
+  if (fieldName === 'og:image') {
+    return normalizeExtractedImageUrl(
+      extractFirstMatch(html, [/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i]),
+      baseUrl
+    );
+  }
+
+  if (fieldName === 'twitter:image') {
+    return normalizeExtractedImageUrl(
+      extractFirstMatch(html, [/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i]),
+      baseUrl
+    );
+  }
+
+  return '';
+}
+
+function extractExistingImageFields(html, baseUrl = '') {
+  return {
+    imageUrl: normalizeExtractedImageUrl(extractFirstMatch(html, [/"imageUrl"\s*:\s*"([^"]+)"/i]), baseUrl),
+    image: normalizeExtractedImageUrl(extractFirstMatch(html, [/"large"\s*:\s*"([^"]+)"/i]), baseUrl),
+    productImage: normalizeExtractedImageUrl(extractFirstMatch(html, [/"productImage"\s*:\s*"([^"]+)"/i]), baseUrl),
+    previewImage: normalizeExtractedImageUrl(extractFirstMatch(html, [/"previewImage"\s*:\s*"([^"]+)"/i]), baseUrl),
+    thumbnail: normalizeExtractedImageUrl(extractFirstMatch(html, [/"thumbnail"\s*:\s*"([^"]+)"/i]), baseUrl),
+    images0: normalizeExtractedImageUrl(extractFirstMatch(html, [/"images"\s*:\s*\[\s*"([^"]+)"/i]), baseUrl),
+    productImageUrl: normalizeExtractedImageUrl(
+      extractFirstMatch(html, [/"product"\s*:\s*\{[\s\S]*?"imageUrl"\s*:\s*"([^"]+)"/i]),
+      baseUrl
+    ),
+    dynamicImage: extractDynamicImageUrl(html, baseUrl)
+  };
+}
+
+function extractAmazonProductImage(html, baseUrl = '') {
+  const candidates = [
+    normalizeExtractedImageUrl(
+      extractFirstMatch(html, [/<img[^>]+id=["']landingImage["'][^>]+data-old-hires=["']([^"']+)["']/i]),
+      baseUrl
+    ),
+    normalizeExtractedImageUrl(extractFirstMatch(html, [/"hiRes"\s*:\s*"([^"]+)"/i]), baseUrl),
+    normalizeExtractedImageUrl(extractFirstMatch(html, [/"mainUrl"\s*:\s*"([^"]+)"/i]), baseUrl),
+    normalizeExtractedImageUrl(extractFirstMatch(html, [/"landingImageUrl"\s*:\s*"([^"]+)"/i]), baseUrl),
+    extractDynamicImageUrl(html, baseUrl),
+    normalizeExtractedImageUrl(
+      extractFirstMatch(html, [/<div[^>]+id=["']imgTagWrapperId["'][^>]*>[\s\S]*?<img[^>]+src=["']([^"']+)["']/i]),
+      baseUrl
+    ),
+    normalizeExtractedImageUrl(
+      extractFirstMatch(html, [/<img[^>]+id=["']landingImage["'][^>]+src=["']([^"']+)["']/i]),
+      baseUrl
+    )
+  ];
+
+  return candidates.find(Boolean) || '';
+}
+
+function extractFirstValidHtmlImage(html, baseUrl = '', excludedUrls = []) {
+  const seenUrls = new Set(excludedUrls.filter(Boolean));
+  const patterns = [
+    /<img[^>]+data-old-hires=["']([^"']+)["']/gi,
+    /<img[^>]+data-src=["']([^"']+)["']/gi,
+    /<img[^>]+src=["']([^"']+)["']/gi,
+    /<source[^>]+srcset=["']([^"']+)["']/gi
+  ];
+
+  for (const pattern of patterns) {
+    const matches = [...html.matchAll(pattern)];
+    for (const match of matches) {
+      const rawCandidate = pattern.source.includes('srcset') ? normalizeSrcSetValue(match?.[1] || '') : match?.[1] || '';
+      const normalizedCandidate = normalizeExtractedImageUrl(rawCandidate, baseUrl);
+      if (!normalizedCandidate || seenUrls.has(normalizedCandidate) || !isLikelyContentImageUrl(normalizedCandidate)) {
+        continue;
+      }
+
+      return normalizedCandidate;
+    }
+  }
+
+  return '';
+}
+
+function pickFirstImageValue(fields = {}, keys = []) {
+  for (const key of keys) {
+    const value = fields[key];
+    if (value) {
+      return value;
+    }
+  }
+
+  return '';
+}
+
+function resolveAmazonImage(html, options = {}) {
+  const baseUrl = options.baseUrl || '';
+  const paapiImage = normalizeExtractedImageUrl(options.paapiImage || '', baseUrl);
+  const rawScrapeImage = extractAmazonProductImage(html, baseUrl);
+  const ogImage = extractMetaImage(html, 'og:image', baseUrl);
+  const twitterImage = extractMetaImage(html, 'twitter:image', baseUrl);
+  const existingFields = extractExistingImageFields(html, baseUrl);
+  const existingFieldImage = pickFirstImageValue(existingFields, [
+    'image',
+    'imageUrl',
+    'thumbnail',
+    'previewImage',
+    'productImage',
+    'images0',
+    'productImageUrl',
+    'dynamicImage'
   ]);
+  const firstHtmlImage = extractFirstValidHtmlImage(html, baseUrl, [
+    rawScrapeImage,
+    ogImage,
+    twitterImage,
+    existingFieldImage,
+    ...Object.values(existingFields)
+  ]);
+  const candidates = [
+    { source: 'paapi', value: paapiImage },
+    { source: 'amazon_scrape', value: rawScrapeImage },
+    { source: 'og:image', value: ogImage },
+    { source: 'twitter:image', value: twitterImage },
+    { source: 'html:first_image', value: firstHtmlImage },
+    { source: 'html:existing_fields', value: existingFieldImage }
+  ];
+  const winner = candidates.find((candidate) => candidate.value) || null;
+  const resolvedImageUrl = winner?.value || null;
+  const finalImageUrl = resolvedImageUrl ? normalizeDealImageUrl(resolvedImageUrl) || null : null;
+
+  return {
+    paapiImage: paapiImage || null,
+    rawScrapeImage: rawScrapeImage || null,
+    ogImage: ogImage || null,
+    twitterImage: twitterImage || null,
+    firstHtmlImage: firstHtmlImage || null,
+    existingFieldImage: existingFieldImage || null,
+    existingFields,
+    resolvedImageUrl,
+    finalImageUrl,
+    selectedSource: winner?.source || 'none',
+    reasonIfMissing: finalImageUrl ? null : 'no_image_found_after_scrape'
+  };
+}
+
+async function resolveScrapeRequest(inputUrl) {
+  let currentUrl = inputUrl;
+  const redirectChain = [];
+
+  for (let redirectIndex = 0; redirectIndex <= AMAZON_REDIRECT_LIMIT; redirectIndex += 1) {
+    const response = await fetch(currentUrl, {
+      headers: AMAZON_FETCH_HEADERS,
+      redirect: 'manual'
+    });
+    const locationHeader = response.headers.get('location');
+    const nextLocation = typeof locationHeader === 'string' ? locationHeader.trim() : '';
+
+    redirectChain.push({
+      url: currentUrl,
+      status: response.status,
+      location: nextLocation || null
+    });
+
+    if (isRedirectStatus(response.status) && nextLocation) {
+      currentUrl = new URL(nextLocation, currentUrl).toString();
+      continue;
+    }
+
+    return {
+      response,
+      resolvedUrl: response.url || currentUrl,
+      redirectChain,
+      wasShortLink: isAmazonShortLink(inputUrl)
+    };
+  }
+
+  throw new Error('Zu viele Redirects beim Amazon-Link');
 }
 
 function normalizeDealImageUrl(imageUrl) {
@@ -133,12 +425,16 @@ async function handleScrape(req, res) {
       });
     }
 
-    const response = await fetch(trimmedUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
-      }
+    const resolvedRequest = await resolveScrapeRequest(trimmedUrl);
+    const response = resolvedRequest.response;
+    const resolvedUrl = resolvedRequest.resolvedUrl || trimmedUrl;
+
+    logGeneratorDebug('api.amazon.scrape.redirect_resolution', {
+      originalUrl: trimmedUrl,
+      resolvedUrl,
+      wasShortLink: resolvedRequest.wasShortLink,
+      redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1),
+      redirectChain: resolvedRequest.redirectChain
     });
 
     const html = await response.text();
@@ -160,30 +456,82 @@ async function handleScrape(req, res) {
     }
 
     const canonicalUrl = extractCanonicalUrl(html);
-    const asin = extractAsin(canonicalUrl) || extractAsin(trimmedUrl) || '';
-    const normalizedUrl = normalizeAmazonLink(canonicalUrl || trimmedUrl);
+    const finalUrl = canonicalUrl || resolvedUrl || trimmedUrl;
+    const asin = extractAsin(canonicalUrl) || extractAsin(resolvedUrl) || extractAsin(trimmedUrl) || '';
+    const normalizedUrl = normalizeAmazonLink(finalUrl);
     const sellerInfo = extractSellerInfo(html);
-    const imageUrl = normalizeDealImageUrl(extractAmazonImage(html)) || '';
+    const paapiContext = asin ? await loadAmazonAffiliateContext({ asin }) : null;
+    const paapiImage = paapiContext?.available ? paapiContext.result?.imageUrl || '' : '';
+    const imageResolution = resolveAmazonImage(html, {
+      baseUrl: finalUrl,
+      paapiImage
+    });
+    const finalImageUrl = imageResolution.finalImageUrl;
+    const imageDebug = {
+      rawScrapeImage: imageResolution.rawScrapeImage,
+      paapiImage: imageResolution.paapiImage,
+      ogImage: imageResolution.ogImage,
+      twitterImage: imageResolution.twitterImage,
+      firstHtmlImage: imageResolution.firstHtmlImage,
+      existingFieldImage: imageResolution.existingFieldImage,
+      resolvedImageUrl: imageResolution.resolvedImageUrl,
+      finalImageUrl,
+      selectedSource: imageResolution.selectedSource,
+      reason: imageResolution.reasonIfMissing,
+      paapiStatus: paapiContext?.status || (asin ? 'not_requested' : 'missing_asin'),
+      paapiReason: paapiContext?.available ? null : paapiContext?.reason || null,
+      resolvedUrl,
+      wasShortLink: resolvedRequest.wasShortLink,
+      redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1)
+    };
+
+    logGeneratorDebug('api.amazon.scrape.image_resolution', {
+      url: trimmedUrl,
+      resolvedUrl,
+      asin,
+      paapiImage: imageDebug.paapiImage,
+      rawScrapeImage: imageDebug.rawScrapeImage,
+      ogImage: imageDebug.ogImage,
+      twitterImage: imageDebug.twitterImage,
+      resolvedImageUrl: imageDebug.resolvedImageUrl,
+      finalImageUrl: imageDebug.finalImageUrl,
+      reasonIfMissing: imageDebug.reason,
+      selectedSource: imageDebug.selectedSource
+    });
 
     logGeneratorDebug('api.amazon.scrape.success', {
       url: trimmedUrl,
+      resolvedUrl,
       asin,
       sellerType: sellerInfo.sellerType,
-      hasImage: Boolean(imageUrl),
-      normalizedUrl
+      hasImage: Boolean(finalImageUrl),
+      normalizedUrl,
+      finalImageUrl,
+      selectedImageSource: imageResolution.selectedSource,
+      reasonIfMissing: imageResolution.reasonIfMissing
     });
 
     return res.status(200).json({
       success: true,
       title: extractAmazonTitle(html) || '',
-      image: imageUrl,
+      imageUrl: finalImageUrl,
+      image: finalImageUrl,
+      productImage: finalImageUrl,
+      previewImage: finalImageUrl,
+      thumbnail: finalImageUrl,
+      images: finalImageUrl ? [finalImageUrl] : [],
+      product: {
+        imageUrl: finalImageUrl
+      },
       price: extractAmazonPrice(html) || '',
       oldPrice: extractAmazonOldPrice(html) || '',
       asin,
-      finalUrl: canonicalUrl || response.url || trimmedUrl,
+      finalUrl,
+      resolvedUrl,
       originalUrl: trimmedUrl,
       normalizedUrl,
-      sellerType: sellerInfo.sellerType
+      sellerType: sellerInfo.sellerType,
+      imageDebug
     });
   } catch (error) {
     logGeneratorDebug('api.amazon.scrape.error', {
