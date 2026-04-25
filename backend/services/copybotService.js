@@ -5,6 +5,7 @@ import {
   classifySellerType,
   cleanText,
   extractAsin,
+  isAmazonShortLink,
   normalizeAmazonLink,
   normalizeSellerType,
   parseNumber
@@ -187,19 +188,6 @@ function logEvent({ level = 'info', eventType, sourceId = null, importedDealId =
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `
   ).run(level, eventType, sourceId, importedDealId, message, payload ? stringifyJson(payload) : null, nowIso());
-}
-
-function safeUrl(value) {
-  try {
-    return new URL(value);
-  } catch {
-    return null;
-  }
-}
-
-function isAmazonShortLink(value = '') {
-  const hostname = safeUrl(cleanText(value))?.hostname?.toLowerCase().replace(/^www\./, '') || '';
-  return hostname === 'amzn.to';
 }
 
 async function resolveAmazonShortLink(value = '') {
@@ -761,6 +749,15 @@ export async function processImportedDeal(sourceId, input = {}) {
     throw new Error('Quelle nicht gefunden.');
   }
 
+  console.info('[PIPELINE_RECEIVED]', {
+    sourceId,
+    sourceName: cleanText(source.name),
+    originalUrl: cleanText(input.originalUrl || input.url),
+    title: cleanText(input.title).slice(0, 120),
+    hasTelegramText: Boolean(cleanText(input.telegramText)),
+    hasImageUrl: Boolean(cleanText(input.imageUrl))
+  });
+
   const appSettings = db.prepare(`SELECT copybotEnabled FROM app_settings WHERE id = 1`).get();
   if (appSettings?.copybotEnabled !== 1) {
     logEvent({
@@ -774,7 +771,8 @@ export async function processImportedDeal(sourceId, input = {}) {
     return {
       blocked: true,
       reason: 'Copybot ist global deaktiviert.',
-      status: 'blocked'
+      status: 'blocked',
+      queueEntryId: null
     };
   }
 
@@ -793,6 +791,13 @@ export async function processImportedDeal(sourceId, input = {}) {
   }
 
   const originalUrl = cleanText(input.originalUrl || input.url);
+  if (isAmazonShortLink(originalUrl)) {
+    console.info('[AUTOMATION_SHORTLINK_BLOCKED]', {
+      sourceId,
+      sourceName: cleanText(source.name),
+      originalUrl
+    });
+  }
   const resolvedOriginalUrl = await resolveAmazonShortLink(originalUrl);
   const linkRecord = buildAmazonAffiliateLinkRecord(input.normalizedUrl || resolvedOriginalUrl || originalUrl || input.asin, {
     resolvedUrl: resolvedOriginalUrl,
@@ -1015,6 +1020,16 @@ export async function processImportedDeal(sourceId, input = {}) {
 
   const importedDealId = result.lastInsertRowid;
 
+  console.info('[DEAL_CREATED]', {
+    importedDealId,
+    sourceId,
+    sourceName: cleanText(source.name),
+    status: finalStatus,
+    reason: finalReason,
+    asin,
+    normalizedUrl
+  });
+
   db.prepare(`UPDATE sources SET last_import_at = ?, updated_at = ? WHERE id = ?`).run(timestamp, timestamp, sourceId);
 
   let queueEntryId = null;
@@ -1051,6 +1066,14 @@ export async function processImportedDeal(sourceId, input = {}) {
       ]
     });
     queueEntryId = queueEntry?.id ?? null;
+
+    console.info('[QUEUE_JOB_CREATED]', {
+      queueId: queueEntryId,
+      sourceType: 'copybot',
+      sourceId: importedDealId,
+      telegramEnabled: source.platform === 'telegram',
+      whatsappEnabled: source.platform === 'whatsapp'
+    });
   }
 
   logEvent({
@@ -1094,6 +1117,7 @@ export async function processImportedDeal(sourceId, input = {}) {
     id: importedDealId,
     status: finalStatus,
     reason: finalReason,
+    queueEntryId,
     sellerType,
     score,
     detectedDiscount,

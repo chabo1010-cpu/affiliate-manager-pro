@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { getAmazonAffiliateConfig } from '../env.js';
 import { DEFAULT_TELEGRAM_COPY_BUTTON_TEXT, getDb } from '../db.js';
 import { upsertDealStatusState } from './databaseService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
@@ -90,6 +91,11 @@ function normalizeHostname(value = '') {
 function isAmazonHostname(value = '') {
   const hostname = normalizeHostname(value);
   return AMAZON_SHORT_HOSTS.has(hostname) || AMAZON_HOST_PATTERN.test(hostname);
+}
+
+function getAmazonAffiliatePartnerTag() {
+  const configuredTag = cleanText(getAmazonAffiliateConfig().partnerTag);
+  return configuredTag || AMAZON_AFFILIATE_TAG;
 }
 
 function findDealsByField(field, value) {
@@ -315,6 +321,11 @@ export function extractAsin(value = '') {
   return '';
 }
 
+export function isAmazonShortLink(value = '') {
+  const hostname = safeUrl(cleanText(value))?.hostname?.toLowerCase().replace(/^www\./, '') || '';
+  return AMAZON_SHORT_HOSTS.has(hostname);
+}
+
 export function normalizeAmazonLink(value = '') {
   const trimmed = cleanText(value);
   if (!trimmed) {
@@ -359,10 +370,21 @@ export function buildAmazonAffiliateLinkRecord(value = '', options = {}) {
       asin,
       sourceHost: hostname || null
     });
+    console.info('[AMAZON_ASIN_EXTRACTED]', {
+      asin,
+      sourceHost: hostname || null,
+      originalUrl: originalUrl || null,
+      resolvedUrl: resolvedUrl || null
+    });
   }
 
   if (!asin) {
     logGeneratorDebug('INVALID LINK', {
+      originalUrl: originalUrl || null,
+      resolvedUrl: resolvedUrl || null,
+      reason: 'ASIN konnte nicht erkannt werden.'
+    });
+    console.error('[AFFILIATE_LINK_ERROR]', {
       originalUrl: originalUrl || null,
       resolvedUrl: resolvedUrl || null,
       reason: 'ASIN konnte nicht erkannt werden.'
@@ -383,6 +405,11 @@ export function buildAmazonAffiliateLinkRecord(value = '', options = {}) {
       resolvedUrl: resolvedUrl || null,
       reason: 'Link stammt nicht von Amazon.'
     });
+    console.error('[AFFILIATE_LINK_ERROR]', {
+      originalUrl: originalUrl || null,
+      resolvedUrl: resolvedUrl || null,
+      reason: 'Link stammt nicht von Amazon.'
+    });
 
     return {
       originalUrl,
@@ -395,7 +422,7 @@ export function buildAmazonAffiliateLinkRecord(value = '', options = {}) {
 
   const finalHost = AMAZON_HOST_PATTERN.test(hostname) ? hostname : normalizeHostname(options.defaultHost || AMAZON_FALLBACK_HOST);
   const normalizedUrl = `https://www.${finalHost}/dp/${asin}`;
-  const affiliateUrl = `${normalizedUrl}?tag=${AMAZON_AFFILIATE_TAG}`;
+  const affiliateUrl = `${normalizedUrl}?tag=${encodeURIComponent(getAmazonAffiliatePartnerTag())}`;
 
   logGeneratorDebug('LINK NORMALIZED', {
     asin,
@@ -403,6 +430,11 @@ export function buildAmazonAffiliateLinkRecord(value = '', options = {}) {
   });
   logGeneratorDebug('AFFILIATE LINK BUILT', {
     asin,
+    affiliateUrl
+  });
+  console.info('[AFFILIATE_LINK_BUILT]', {
+    asin,
+    normalizedUrl,
     affiliateUrl
   });
 
@@ -666,6 +698,56 @@ export function assertDealNotLocked(input = {}) {
   error.retryable = false;
   error.dealLock = lockStatus;
   throw error;
+}
+
+export function resetDealLockHistory(input = {}) {
+  const identity = buildDealLockIdentity(input);
+  const hasScopedFilter = Boolean(identity.asin || identity.normalizedUrl || identity.rawUrl);
+
+  if (!hasScopedFilter) {
+    const deletedHistory = db.prepare(`DELETE FROM deals_history`).run().changes;
+    const deletedRegistry = db.prepare(`DELETE FROM deal_status_registry`).run().changes;
+
+    return {
+      scope: 'all',
+      asin: '',
+      normalizedUrl: '',
+      rawUrl: '',
+      deletedHistory,
+      deletedRegistry
+    };
+  }
+
+  const params = {
+    asin: identity.asin || '',
+    normalizedUrl: identity.normalizedUrl || '',
+    rawUrl: identity.rawUrl || ''
+  };
+  const whereClause = `
+    (@asin != '' AND asin = @asin)
+    OR (@normalizedUrl != '' AND normalizedUrl = @normalizedUrl)
+    OR (@rawUrl != '' AND (url = @rawUrl OR originalUrl = @rawUrl))
+  `;
+  const deletedHistory = db.prepare(`DELETE FROM deals_history WHERE ${whereClause}`).run(params).changes;
+  const deletedRegistry = db
+    .prepare(
+      `
+        DELETE FROM deal_status_registry
+        WHERE (@asin != '' AND asin = @asin)
+           OR (@normalizedUrl != '' AND normalized_url = @normalizedUrl)
+           OR (@rawUrl != '' AND original_url = @rawUrl)
+      `
+    )
+    .run(params).changes;
+
+  return {
+    scope: 'filtered',
+    asin: identity.asin || '',
+    normalizedUrl: identity.normalizedUrl || '',
+    rawUrl: identity.rawUrl || '',
+    deletedHistory,
+    deletedRegistry
+  };
 }
 
 export function savePostedDeal(input = {}) {

@@ -415,6 +415,27 @@ export async function sendTelegramDealToTargets(input = {}) {
     throw buildTelegramBotError('Keine Telegram-Zielgruppe fuer den Publisher konfiguriert.', { retryable: false });
   }
 
+  console.info('[OUTPUT_CONFIG]', {
+    configSource: 'telegram_bot_client',
+    enabled: config.enabled,
+    tokenConfigured: config.tokenConfigured,
+    fallbackChatConfigured: config.fallbackChatConfigured,
+    targetMode: resolution.targetMode,
+    requestedChatIds,
+    resolvedTargetCount: resolution.targets.length,
+    resolvedChatIds: resolution.targets.map((target) => target.chatId)
+  });
+  console.info('[OUTPUT_PAYLOAD]', {
+    configSource: 'telegram_bot_client',
+    textLength: text.length,
+    textPreview: text.slice(0, 160),
+    hasUploadedFile: Boolean(input.uploadedFile),
+    hasUploadedImage: Boolean(cleanText(input.uploadedImage)),
+    hasImageUrl: Boolean(cleanText(input.imageUrl)),
+    disableWebPagePreview: input.disableWebPagePreview === true,
+    hasCouponCode: Boolean(cleanText(input.rabattgutscheinCode))
+  });
+
   const deliveredTargets = [];
   const failedTargets = [];
 

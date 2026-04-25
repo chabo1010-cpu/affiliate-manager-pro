@@ -53,6 +53,14 @@ function maskSecret(value, visibleStart = 4, visibleEnd = 2) {
   return `${trimmed.slice(0, visibleStart)}***${trimmed.slice(-visibleEnd)}`;
 }
 
+function buildAmazonPaapiEndpoint(config = {}) {
+  return `https://${cleanText(config.host)}${AMAZON_API_PATH}`;
+}
+
+function getAccessKeyPrefix(accessKey = '') {
+  return cleanText(accessKey).slice(0, 4) || '';
+}
+
 function hasAmazonAffiliateCredentials(config = {}) {
   return Boolean(config.enabled && config.accessKey && config.secretKey && config.partnerTag);
 }
@@ -278,6 +286,8 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
     host: config.host,
     region: config.region,
     marketplace: config.marketplace,
+    endpoint: buildAmazonPaapiEndpoint(config),
+    accessKeyMasked: maskSecret(config.accessKey, 4, 3),
     partnerTagMasked: maskSecret(config.partnerTag, 4, 3),
     requestedAt: amzDate
   };
@@ -302,6 +312,11 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
     const responseText = await response.text();
     const responseJson = parseJson(responseText, null);
     const apiErrors = Array.isArray(responseJson?.Errors) ? responseJson.Errors : [];
+    const requestId =
+      cleanText(response.headers.get('x-amzn-requestid')) ||
+      cleanText(response.headers.get('x-amzn-RequestId')) ||
+      cleanText(responseJson?.RequestId) ||
+      null;
 
     if (!response.ok || apiErrors.length) {
       const topError = apiErrors[0] || null;
@@ -317,7 +332,9 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
             ? 403
             : response.status || 502;
       const error = createAmazonAffiliateError(errorMessage, errorCode || 'AMAZON_API_ERROR', statusCode, {
-        response: responseJson
+        response: responseJson,
+        requestId,
+        httpStatus: statusCode
       });
 
       logGeneratorDebug('AMAZON API ERROR', {
@@ -325,6 +342,15 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
         statusCode,
         errorCode,
         message: errorMessage
+      });
+      console.error('[AMAZON_PAAPI_REQUEST_ERROR]', {
+        accessKeyMasked: requestMeta.accessKeyMasked,
+        region: requestMeta.region,
+        endpoint: requestMeta.endpoint,
+        errorCode,
+        errorMessage,
+        httpStatus: statusCode,
+        requestId
       });
       logAmazonApiEvent('error', 'amazon.request.error', 'GetItems', errorMessage, {
         asin: context.asin,
@@ -374,6 +400,15 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
         errorCode: timeoutError.code,
         message: timeoutError.message
       });
+      console.error('[AMAZON_PAAPI_REQUEST_ERROR]', {
+        accessKeyMasked: requestMeta.accessKeyMasked,
+        region: requestMeta.region,
+        endpoint: requestMeta.endpoint,
+        errorCode: timeoutError.code,
+        errorMessage: timeoutError.message,
+        httpStatus: 504,
+        requestId: null
+      });
       logAmazonApiEvent('error', 'amazon.request.timeout', 'GetItems', timeoutError.message, {
         asin: context.asin,
         status: 'api_error',
@@ -399,6 +434,15 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
       statusCode: 502,
       errorCode: networkError.code,
       message: networkError.message
+    });
+    console.error('[AMAZON_PAAPI_REQUEST_ERROR]', {
+      accessKeyMasked: requestMeta.accessKeyMasked,
+      region: requestMeta.region,
+      endpoint: requestMeta.endpoint,
+      errorCode: networkError.code,
+      errorMessage: networkError.message,
+      httpStatus: 502,
+      requestId: null
     });
     logAmazonApiEvent('error', 'amazon.request.network_error', 'GetItems', networkError.message, {
       asin: context.asin,
@@ -501,7 +545,10 @@ export async function loadAmazonAffiliateContext(input = {}) {
       available: false,
       status: deriveErrorStatus(error),
       requestedAt,
-      reason: error instanceof Error ? error.message : 'Amazon API Request fehlgeschlagen.'
+      reason: error instanceof Error ? error.message : 'Amazon API Request fehlgeschlagen.',
+      errorCode: error instanceof Error ? error.code || 'AMAZON_API_ERROR' : 'AMAZON_API_ERROR',
+      httpStatus: error instanceof Error ? error.statusCode || 502 : 502,
+      requestId: error instanceof Error ? error.details?.requestId || null : null
     };
   }
 }
@@ -510,6 +557,24 @@ export async function runAmazonAffiliateApiTest(input = {}) {
   const asin = cleanText(input.asin || AMAZON_TEST_ASIN).toUpperCase() || AMAZON_TEST_ASIN;
   const config = getAmazonAffiliateConfig();
   ensureAmazonConfigLog(config);
+  const diagnosticMeta = {
+    asin,
+    AccessKeyPrefix: getAccessKeyPrefix(config.accessKey),
+    PartnerTag: config.partnerTag,
+    Host: config.host,
+    Region: config.region,
+    Marketplace: config.marketplace,
+    Endpoint: buildAmazonPaapiEndpoint(config),
+    Timestamp: nowIso()
+  };
+
+  console.info('[PAAPI_TEST_START]', diagnosticMeta);
+  logGeneratorDebug('PAAPI TEST START', {
+    ...diagnosticMeta,
+    accessKeyMasked: maskSecret(config.accessKey, 4, 3),
+    region: config.region,
+    endpoint: buildAmazonPaapiEndpoint(config)
+  });
 
   if (!config.enabled) {
     throw createAmazonAffiliateError('Amazon Product Advertising API ist im Backend deaktiviert.', 'AMAZON_API_DISABLED', 400);
@@ -525,8 +590,29 @@ export async function runAmazonAffiliateApiTest(input = {}) {
 
   const context = await loadAmazonAffiliateContext({ asin });
   if (!context.available || !context.result) {
-    throw createAmazonAffiliateError(context.reason || 'Amazon API Test fehlgeschlagen.', 'AMAZON_API_TEST_FAILED', 502);
+    const error = createAmazonAffiliateError(
+      context.reason || 'Amazon API Test fehlgeschlagen.',
+      context.errorCode || 'AMAZON_API_TEST_FAILED',
+      context.httpStatus || 502,
+      {
+        requestId: context.requestId || null
+      }
+    );
+    console.error('[PAAPI_TEST_ERROR]', {
+      ...diagnosticMeta,
+      errorMessage: error.message,
+      errorCode: error.code || 'AMAZON_API_TEST_FAILED',
+      httpStatus: error.statusCode || 502,
+      requestId: error.details?.requestId || null
+    });
+    throw error;
   }
+
+  console.info('[PAAPI_TEST_SUCCESS]', {
+    ...diagnosticMeta,
+    title: context.result.title || '',
+    detailPageUrl: context.result.detailPageUrl || ''
+  });
 
   return {
     success: true,

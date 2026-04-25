@@ -17,6 +17,9 @@ process.env.WHATSAPP_DELIVERY_ENABLED = '0';
 process.env.WHATSAPP_DELIVERY_ENDPOINT = '';
 process.env.WHATSAPP_DELIVERY_TOKEN = '';
 process.env.WHATSAPP_DELIVERY_SENDER = '';
+process.env.READER_TEST_MODE = '0';
+process.env.READER_DEBUG_MODE = '0';
+process.env.ALLOW_RAW_READER_FALLBACK = '0';
 
 const { getDb } = await import('../db.js');
 const { analyzeDealWithEngine } = await import('../services/dealEngine/service.js');

@@ -1,4 +1,5 @@
 import { getDb } from '../db.js';
+import { getReaderRuntimeConfig } from '../env.js';
 import { assertDealNotLocked, cleanText } from './dealHistoryService.js';
 import { buildDealStatusKey, syncDealStatusWithQueue } from './databaseService.js';
 import {
@@ -22,6 +23,16 @@ const SQLITE_RETRY_ATTEMPTS = 6;
 const SQLITE_RETRY_BASE_DELAY_MS = 40;
 let publishingWorkerLoopStarted = false;
 let publishingWorkerLoopRunning = false;
+
+function getDealLockBypassMeta(explicitSkipDealLock = false) {
+  const runtimeConfig = getReaderRuntimeConfig();
+  return {
+    active: explicitSkipDealLock === true || runtimeConfig.dealLockBypass,
+    explicitSkipDealLock: explicitSkipDealLock === true,
+    readerTestMode: runtimeConfig.readerTestMode,
+    readerDebugMode: runtimeConfig.readerDebugMode
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -219,31 +230,62 @@ const insertPublishingEntryTransaction = db.transaction(
   ({ sourceType, sourceId, payload, targets, originOverride = '', skipDealLock = false }) => {
     const timestamp = nowIso();
     const origin = getPublishingOrigin(sourceType, originOverride);
+    const dealLockBypass = getDealLockBypassMeta(
+      skipDealLock === true || (payload && typeof payload === 'object' && payload.skipDealLock === true)
+    );
     const enrichedPayload = {
       ...(payload && typeof payload === 'object' ? payload : {}),
       sourceId: sourceId ?? payload?.sourceId ?? null,
       databaseSourceType: sourceType,
-      databaseOrigin: origin
+      databaseOrigin: origin,
+      ...(dealLockBypass.active ? { skipDealLock: true } : {})
     };
     const normalizedTargets = expandPublishingTargets(
       enrichedPayload,
       (Array.isArray(targets) ? targets : []).map(normalizeTarget).filter((item) => item.channelType)
     );
-    const dealKey = buildDealStatusKey({
+    const baseDealKey = buildDealStatusKey({
       asin: enrichedPayload.asin,
       normalizedUrl: enrichedPayload.normalizedUrl || enrichedPayload.link,
       originalUrl: enrichedPayload.link,
       queueId: null
     });
+    const dealKey = dealLockBypass.active ? null : baseDealKey;
 
-    if (!skipDealLock && enrichedPayload.skipDealLock !== true) {
-      assertDealNotLocked({
-        asin: enrichedPayload.asin,
-        url: enrichedPayload.link,
-        normalizedUrl: enrichedPayload.normalizedUrl || enrichedPayload.link,
-        sourceType,
-        origin
+    if (dealLockBypass.active) {
+      console.info('[DEAL_LOCK_BYPASSED]', {
+        phase: 'queue_create',
+        sourceType: cleanText(sourceType),
+        sourceId: sourceId ?? null,
+        asin: cleanText(enrichedPayload.asin).toUpperCase() || '',
+        normalizedUrl: cleanText(enrichedPayload.normalizedUrl || enrichedPayload.link) || '',
+        explicitSkipDealLock: dealLockBypass.explicitSkipDealLock,
+        readerTestMode: dealLockBypass.readerTestMode,
+        readerDebugMode: dealLockBypass.readerDebugMode
       });
+    } else {
+      try {
+        assertDealNotLocked({
+          asin: enrichedPayload.asin,
+          url: enrichedPayload.link,
+          normalizedUrl: enrichedPayload.normalizedUrl || enrichedPayload.link,
+          sourceType,
+          origin
+        });
+      } catch (error) {
+        console.error('[DEAL_LOCK_BLOCKED]', {
+          phase: 'queue_create',
+          sourceType: cleanText(sourceType),
+          sourceId: sourceId ?? null,
+          asin: cleanText(enrichedPayload.asin).toUpperCase() || '',
+          normalizedUrl: cleanText(enrichedPayload.normalizedUrl || enrichedPayload.link) || '',
+          reason: error instanceof Error ? error.message : 'Deal-Lock aktiv.',
+          blockCode: error instanceof Error ? error.code || error.dealLock?.blockCode || '' : '',
+          readerTestMode: dealLockBypass.readerTestMode,
+          readerDebugMode: dealLockBypass.readerDebugMode
+        });
+        throw error;
+      }
     }
 
     const queueResult = db
@@ -344,6 +386,14 @@ export function createPublishingEntry(input = {}) {
     return getPublishingQueueEntry(queueId);
   } catch (error) {
     if (isActiveDealKeyConstraintError(error)) {
+      console.error('[DEAL_LOCK_BLOCKED]', {
+        phase: 'queue_create_constraint',
+        sourceType: cleanText(input.sourceType),
+        sourceId: input.sourceId ?? null,
+        asin: cleanText(input.payload?.asin).toUpperCase() || '',
+        normalizedUrl: cleanText(input.payload?.normalizedUrl || input.payload?.link) || '',
+        reason: error instanceof Error ? error.message : 'Aktiver Queue-Deal-Key blockiert.'
+      });
       throw buildDealLockError(undefined, {
         sourceType: cleanText(input.sourceType),
         asin: cleanText(input.payload?.asin),
@@ -695,6 +745,7 @@ async function processTarget(target, processorOverrides = {}) {
   const queue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
   const payload = parseJson(queue?.payload_json, {});
   const origin = getPublishingOrigin(queue?.source_type || '', payload.databaseOrigin || '');
+  const dealLockBypass = getDealLockBypassMeta(payload.skipDealLock === true);
   const channelPayload = buildChannelPayload(payload, target.channel_type);
   const workerPayload = {
     ...payload,
@@ -707,15 +758,43 @@ async function processTarget(target, processorOverrides = {}) {
   markTargetProcessing(target);
 
   try {
-    if (payload.skipDealLock !== true) {
-      assertDealNotLocked({
-        asin: payload.asin,
-        url: payload.link,
-        normalizedUrl: payload.normalizedUrl || payload.link,
+    if (dealLockBypass.active) {
+      console.info('[DEAL_LOCK_BYPASSED]', {
+        phase: 'publisher_worker',
         queueId: target.queue_id,
-        sourceType: queue?.source_type || '',
-        origin
+        targetId: target.id,
+        channelType: target.channel_type,
+        asin: cleanText(payload.asin).toUpperCase() || '',
+        normalizedUrl: cleanText(payload.normalizedUrl || payload.link) || '',
+        explicitSkipDealLock: dealLockBypass.explicitSkipDealLock,
+        readerTestMode: dealLockBypass.readerTestMode,
+        readerDebugMode: dealLockBypass.readerDebugMode
       });
+    } else {
+      try {
+        assertDealNotLocked({
+          asin: payload.asin,
+          url: payload.link,
+          normalizedUrl: payload.normalizedUrl || payload.link,
+          queueId: target.queue_id,
+          sourceType: queue?.source_type || '',
+          origin
+        });
+      } catch (error) {
+        console.error('[DEAL_LOCK_BLOCKED]', {
+          phase: 'publisher_worker',
+          queueId: target.queue_id,
+          targetId: target.id,
+          channelType: target.channel_type,
+          asin: cleanText(payload.asin).toUpperCase() || '',
+          normalizedUrl: cleanText(payload.normalizedUrl || payload.link) || '',
+          reason: error instanceof Error ? error.message : 'Deal-Lock aktiv.',
+          blockCode: error instanceof Error ? error.code || error.dealLock?.blockCode || '' : '',
+          readerTestMode: dealLockBypass.readerTestMode,
+          readerDebugMode: dealLockBypass.readerDebugMode
+        });
+        throw error;
+      }
     }
 
     const processor = getTargetProcessor(target, processorOverrides);
@@ -749,6 +828,18 @@ async function processTarget(target, processorOverrides = {}) {
       workerResult
     };
   } catch (error) {
+    console.error('[PUBLISHER_ERROR]', {
+      queueId: target.queue_id,
+      targetId: target.id,
+      channelType: target.channel_type,
+      error: error instanceof Error ? error.message : 'Worker-Fehler'
+    });
+    console.error('[ERROR_REASON]', {
+      reason: error instanceof Error ? error.message : 'Worker-Fehler',
+      queueId: target.queue_id,
+      targetId: target.id,
+      channelType: target.channel_type
+    });
     try {
       markTargetFailed(
         target,
@@ -895,6 +986,14 @@ export async function runPublishingWorkers(channelType = null, options = {}) {
 }
 
 export async function processPublishingQueueEntry(queueId, options = {}) {
+  const queue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(queueId);
+  console.info('[PUBLISHER_TRIGGERED]', {
+    queueId,
+    sourceType: queue?.source_type || '',
+    sourceId: queue?.source_id ?? null,
+    status: queue?.status || ''
+  });
+
   const results = [];
 
   while (true) {

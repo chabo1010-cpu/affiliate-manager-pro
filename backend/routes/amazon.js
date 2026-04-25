@@ -345,6 +345,14 @@ function extractAmazonTitle(html) {
   ]);
 }
 
+function extractAmazonDescription(html) {
+  return extractFirstMatch(html, [
+    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
+    /<div[^>]+id=["']productDescription["'][^>]*>([\s\S]*?)<\/div>/i,
+    /"productDescription"\s*:\s*"([^"]+)"/i
+  ]);
+}
+
 function extractCanonicalUrl(html) {
   return extractFirstMatch(html, [
     /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
@@ -373,10 +381,250 @@ function extractAmazonOldPrice(html) {
   ]);
 }
 
+function parseGermanNumericValue(value = '') {
+  const normalized = String(value || '')
+    .replace(/[^\d,.-]/g, '')
+    .replace(/\.(?=\d{3}(?:\D|$))/g, '')
+    .replace(',', '.');
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizePercentValueText(value = '') {
+  const parsed = parseGermanNumericValue(value);
+  if (parsed === null) {
+    return '';
+  }
+
+  return `${Number.isInteger(parsed) ? parsed : parsed.toFixed(1).replace('.', ',')}%`;
+}
+
+function normalizeEuroValueText(value = '') {
+  const parsed = parseGermanNumericValue(value);
+  if (parsed === null) {
+    return '';
+  }
+
+  return new Intl.NumberFormat('de-DE', {
+    minimumFractionDigits: parsed % 1 === 0 ? 0 : 2,
+    maximumFractionDigits: 2
+  }).format(parsed) + '€';
+}
+
+function normalizeCouponValueText(value = '') {
+  const trimmed = stripHtml(value || '');
+  if (!trimmed) {
+    return '';
+  }
+
+  if (/%/.test(trimmed)) {
+    const normalizedPercent = normalizePercentValueText(trimmed);
+    return normalizedPercent ? `${normalizedPercent} sparen` : '';
+  }
+
+  if (/€|eur/i.test(trimmed)) {
+    const normalizedEuro = normalizeEuroValueText(trimmed);
+    return normalizedEuro ? `${normalizedEuro} Rabatt` : '';
+  }
+
+  return '';
+}
+
+function normalizeSubscribeValueText(value = '') {
+  const trimmed = stripHtml(value || '');
+  if (!trimmed) {
+    return '';
+  }
+
+  if (/%/.test(trimmed)) {
+    const normalizedPercent = normalizePercentValueText(trimmed);
+    return normalizedPercent ? `bis zu ${normalizedPercent} extra` : '';
+  }
+
+  if (/€|eur/i.test(trimmed)) {
+    const normalizedEuro = normalizeEuroValueText(trimmed);
+    return normalizedEuro ? `${normalizedEuro} extra` : '';
+  }
+
+  return '';
+}
+
 function stripHtml(value) {
   return decodeHtml(value.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' '))
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function extractCouponDetails(html) {
+  const strippedHtml = stripHtml(html);
+  const couponSnippet = extractFirstMatch(html, [
+    /<div[^>]+id=["']couponBadge["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<div[^>]+class=["'][^"']*coupon[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
+    /data-coupon=["']([^"']+)["']/i,
+    /"couponBadgeText"\s*:\s*"([^"]+)"/i,
+    /"couponText"\s*:\s*"([^"]+)"/i
+  ]);
+  const couponContext =
+    couponSnippet ||
+    strippedHtml.match(/(?:coupon|coupon anwenden|coupon aktivieren|gutschein|sparen)[^.]{0,140}/i)?.[0] ||
+    '';
+  const couponDetected = /coupon|gutschein/i.test(couponContext) || /coupon|gutschein/i.test(strippedHtml);
+  const couponValueRaw =
+    couponContext.match(/(\d{1,3}(?:[.,]\d{1,2})?\s*%)/i)?.[1] ||
+    couponContext.match(/(\d{1,3}(?:[.,]\d{1,2})?\s*(?:€|eur))/i)?.[1] ||
+    '';
+  const couponValue = normalizeCouponValueText(couponValueRaw);
+
+  if (couponDetected) {
+    console.info('[COUPON_DETECTED]', {
+      detected: true,
+      context: stripHtml(couponContext).slice(0, 160)
+    });
+  }
+
+  if (couponValue) {
+    console.info('[COUPON_VALUE_FOUND]', {
+      couponValue
+    });
+  }
+
+  return {
+    couponDetected,
+    couponValue,
+    couponContext: stripHtml(couponContext)
+  };
+}
+
+function extractSubscribeDetails(html) {
+  const strippedHtml = stripHtml(html);
+  const subscribeSnippet = extractFirstMatch(html, [
+    /<div[^>]+id=["']snsAccordion["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<div[^>]+id=["']subscribeAndSave[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
+    /"subscribeAndSave"\s*:\s*"([^"]+)"/i
+  ]);
+  const subscribeContext =
+    subscribeSnippet ||
+    strippedHtml.match(/(?:spar-abo|subscribe\s*&\s*save|spare bis zu)[^.]{0,160}/i)?.[0] ||
+    '';
+  const subscribeDetected = /spar-abo|subscribe\s*&\s*save|spare bis zu/i.test(subscribeContext) || /spar-abo|subscribe\s*&\s*save/i.test(strippedHtml);
+  const subscribeValueRaw =
+    subscribeContext.match(/(\d{1,3}(?:[.,]\d{1,2})?\s*%)/i)?.[1] ||
+    subscribeContext.match(/(\d{1,3}(?:[.,]\d{1,2})?\s*(?:€|eur))/i)?.[1] ||
+    '';
+  const subscribeDiscount = normalizeSubscribeValueText(subscribeValueRaw);
+
+  if (subscribeDetected) {
+    console.info('[SUBSCRIBE_DETECTED]', {
+      detected: true,
+      context: stripHtml(subscribeContext).slice(0, 160)
+    });
+  }
+
+  if (subscribeDiscount) {
+    console.info('[SUBSCRIBE_VALUE_FOUND]', {
+      subscribeDiscount
+    });
+  }
+
+  return {
+    subscribeDetected,
+    subscribeDiscount,
+    subscribeContext: stripHtml(subscribeContext)
+  };
+}
+
+function parseDiscountDescriptor(value = '') {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/%/.test(trimmed)) {
+    const percentValue = parseGermanNumericValue(trimmed);
+    return percentValue === null ? null : { type: 'percent', value: percentValue };
+  }
+
+  if (/€|eur/i.test(trimmed)) {
+    const amountValue = parseGermanNumericValue(trimmed);
+    return amountValue === null ? null : { type: 'amount', value: amountValue };
+  }
+
+  return null;
+}
+
+function calculateFinalPriceFromDiscounts(basePriceText = '', couponValue = '', subscribeDiscount = '') {
+  const basePriceValue = parseGermanNumericValue(basePriceText);
+  if (basePriceValue === null) {
+    return {
+      finalPriceCalculated: false,
+      finalPrice: '',
+      finalPriceValue: null
+    };
+  }
+
+  const couponDescriptor = parseDiscountDescriptor(couponValue);
+  const subscribeDescriptor = parseDiscountDescriptor(subscribeDiscount);
+  let finalPriceValue = basePriceValue;
+  let appliedDiscount = false;
+
+  if (couponDescriptor) {
+    appliedDiscount = true;
+    finalPriceValue =
+      couponDescriptor.type === 'percent'
+        ? finalPriceValue * (1 - couponDescriptor.value / 100)
+        : finalPriceValue - couponDescriptor.value;
+  }
+
+  if (subscribeDescriptor) {
+    appliedDiscount = true;
+    finalPriceValue =
+      subscribeDescriptor.type === 'percent'
+        ? finalPriceValue * (1 - subscribeDescriptor.value / 100)
+        : finalPriceValue - subscribeDescriptor.value;
+  }
+
+  if (!appliedDiscount || !Number.isFinite(finalPriceValue) || finalPriceValue <= 0) {
+    return {
+      finalPriceCalculated: false,
+      finalPrice: '',
+      finalPriceValue: null
+    };
+  }
+
+  const finalPrice = new Intl.NumberFormat('de-DE', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(finalPriceValue);
+
+  console.info('[FINAL_PRICE_CALCULATED]', {
+    basePrice: basePriceText,
+    couponValue,
+    subscribeDiscount,
+    finalPrice
+  });
+
+  return {
+    finalPriceCalculated: true,
+    finalPrice,
+    finalPriceValue
+  };
+}
+
+function extractAmazonBulletPoints(html) {
+  const bulletMatches = [
+    ...html.matchAll(
+      /<div[^>]+id=["']feature-bullets["'][^>]*>[\s\S]*?<span[^>]+class=["'][^"']*a-list-item[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
+    ),
+    ...html.matchAll(
+      /<li[^>]+class=["'][^"']*a-spacing-mini[^"']*["'][^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/gi
+    )
+  ];
+
+  return bulletMatches
+    .map((match) => stripHtml(match?.[1] || ''))
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 6);
 }
 
 function extractSellerInfo(html) {
@@ -400,147 +648,162 @@ function extractSellerInfo(html) {
   };
 }
 
+export async function scrapeAmazonProduct(inputUrl = '') {
+  if (!inputUrl || typeof inputUrl !== 'string' || !inputUrl.trim()) {
+    const error = new Error('Kein url uebergeben');
+    error.code = 'MISSING_URL';
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const trimmedUrl = inputUrl.trim();
+  logGeneratorDebug('api.amazon.scrape.request', {
+    url: trimmedUrl
+  });
+
+  if (!/^https?:\/\//i.test(trimmedUrl)) {
+    const error = new Error('Ungueltige URL');
+    error.code = 'INVALID_URL';
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const resolvedRequest = await resolveScrapeRequest(trimmedUrl);
+  const response = resolvedRequest.response;
+  const resolvedUrl = resolvedRequest.resolvedUrl || trimmedUrl;
+
+  logGeneratorDebug('api.amazon.scrape.redirect_resolution', {
+    originalUrl: trimmedUrl,
+    resolvedUrl,
+    wasShortLink: resolvedRequest.wasShortLink,
+    redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1),
+    redirectChain: resolvedRequest.redirectChain
+  });
+
+  const html = await response.text();
+
+  if (response.status === 403 || /captcha|robot check|sorry/i.test(html)) {
+    const error = new Error('Amazon blockiert den Scrape-Zugriff');
+    error.code = 'AMAZON_BLOCKED';
+    error.statusCode = 502;
+    throw error;
+  }
+
+  if (!response.ok) {
+    const error = new Error(`Scrape failed (${response.status})`);
+    error.code = 'SCRAPE_FAILED';
+    error.statusCode = 502;
+    throw error;
+  }
+
+  const canonicalUrl = extractCanonicalUrl(html);
+  const productTitle = extractAmazonTitle(html) || '';
+  const productDescription = stripHtml(extractAmazonDescription(html) || '');
+  const bulletPoints = extractAmazonBulletPoints(html);
+  const basePrice = extractAmazonPrice(html) || '';
+  const couponDetails = extractCouponDetails(html);
+  const subscribeDetails = extractSubscribeDetails(html);
+  const finalPriceResult = calculateFinalPriceFromDiscounts(basePrice, couponDetails.couponValue, subscribeDetails.subscribeDiscount);
+  const finalUrl = canonicalUrl || resolvedUrl || trimmedUrl;
+  const asin = extractAsin(canonicalUrl) || extractAsin(resolvedUrl) || extractAsin(trimmedUrl) || '';
+  const normalizedUrl = normalizeAmazonLink(finalUrl);
+  const sellerInfo = extractSellerInfo(html);
+  const paapiContext = asin ? await loadAmazonAffiliateContext({ asin }) : null;
+  const paapiImage = paapiContext?.available ? paapiContext.result?.imageUrl || '' : '';
+  const imageResolution = resolveAmazonImage(html, {
+    baseUrl: finalUrl,
+    paapiImage
+  });
+  const finalImageUrl = imageResolution.finalImageUrl;
+  const imageDebug = {
+    rawScrapeImage: imageResolution.rawScrapeImage,
+    paapiImage: imageResolution.paapiImage,
+    ogImage: imageResolution.ogImage,
+    twitterImage: imageResolution.twitterImage,
+    firstHtmlImage: imageResolution.firstHtmlImage,
+    existingFieldImage: imageResolution.existingFieldImage,
+    resolvedImageUrl: imageResolution.resolvedImageUrl,
+    finalImageUrl,
+    selectedSource: imageResolution.selectedSource,
+    reason: imageResolution.reasonIfMissing,
+    paapiStatus: paapiContext?.status || (asin ? 'not_requested' : 'missing_asin'),
+    paapiReason: paapiContext?.available ? null : paapiContext?.reason || null,
+    resolvedUrl,
+    wasShortLink: resolvedRequest.wasShortLink,
+    redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1)
+  };
+
+  logGeneratorDebug('api.amazon.scrape.image_resolution', {
+    url: trimmedUrl,
+    resolvedUrl,
+    asin,
+    paapiImage: imageDebug.paapiImage,
+    rawScrapeImage: imageDebug.rawScrapeImage,
+    ogImage: imageDebug.ogImage,
+    twitterImage: imageDebug.twitterImage,
+    resolvedImageUrl: imageDebug.resolvedImageUrl,
+    finalImageUrl: imageDebug.finalImageUrl,
+    reasonIfMissing: imageDebug.reason,
+    selectedSource: imageDebug.selectedSource
+  });
+
+  logGeneratorDebug('api.amazon.scrape.success', {
+    url: trimmedUrl,
+    resolvedUrl,
+    asin,
+    sellerType: sellerInfo.sellerType,
+    hasImage: Boolean(finalImageUrl),
+    normalizedUrl,
+    finalImageUrl,
+    selectedImageSource: imageResolution.selectedSource,
+    reasonIfMissing: imageResolution.reasonIfMissing
+  });
+
+  return {
+    success: true,
+    title: productTitle,
+    productTitle,
+    productDescription,
+    bulletPoints,
+    imageUrl: finalImageUrl,
+    image: finalImageUrl,
+    productImage: finalImageUrl,
+    previewImage: finalImageUrl,
+    thumbnail: finalImageUrl,
+    images: finalImageUrl ? [finalImageUrl] : [],
+    product: {
+      imageUrl: finalImageUrl
+    },
+    basePrice,
+    price: finalPriceResult.finalPriceCalculated ? finalPriceResult.finalPrice : basePrice,
+    oldPrice: extractAmazonOldPrice(html) || '',
+    couponDetected: couponDetails.couponDetected,
+    couponValue: couponDetails.couponValue,
+    subscribeDetected: subscribeDetails.subscribeDetected,
+    subscribeDiscount: subscribeDetails.subscribeDiscount,
+    finalPrice: finalPriceResult.finalPrice,
+    finalPriceCalculated: finalPriceResult.finalPriceCalculated,
+    asin,
+    finalUrl,
+    resolvedUrl,
+    originalUrl: trimmedUrl,
+    normalizedUrl,
+    sellerType: sellerInfo.sellerType,
+    imageDebug
+  };
+}
+
 async function handleScrape(req, res) {
   try {
-    const { url } = req.body ?? {};
-
-    if (!url || typeof url !== 'string' || !url.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Kein url uebergeben',
-        code: 'MISSING_URL'
-      });
-    }
-
-    const trimmedUrl = url.trim();
-    logGeneratorDebug('api.amazon.scrape.request', {
-      url: trimmedUrl
-    });
-
-    if (!/^https?:\/\//i.test(trimmedUrl)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Ungueltige URL',
-        code: 'INVALID_URL'
-      });
-    }
-
-    const resolvedRequest = await resolveScrapeRequest(trimmedUrl);
-    const response = resolvedRequest.response;
-    const resolvedUrl = resolvedRequest.resolvedUrl || trimmedUrl;
-
-    logGeneratorDebug('api.amazon.scrape.redirect_resolution', {
-      originalUrl: trimmedUrl,
-      resolvedUrl,
-      wasShortLink: resolvedRequest.wasShortLink,
-      redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1),
-      redirectChain: resolvedRequest.redirectChain
-    });
-
-    const html = await response.text();
-
-    if (response.status === 403 || /captcha|robot check|sorry/i.test(html)) {
-      return res.status(502).json({
-        success: false,
-        error: 'Amazon blockiert den Scrape-Zugriff',
-        code: 'AMAZON_BLOCKED'
-      });
-    }
-
-    if (!response.ok) {
-      return res.status(502).json({
-        success: false,
-        error: `Scrape failed (${response.status})`,
-        code: 'SCRAPE_FAILED'
-      });
-    }
-
-    const canonicalUrl = extractCanonicalUrl(html);
-    const finalUrl = canonicalUrl || resolvedUrl || trimmedUrl;
-    const asin = extractAsin(canonicalUrl) || extractAsin(resolvedUrl) || extractAsin(trimmedUrl) || '';
-    const normalizedUrl = normalizeAmazonLink(finalUrl);
-    const sellerInfo = extractSellerInfo(html);
-    const paapiContext = asin ? await loadAmazonAffiliateContext({ asin }) : null;
-    const paapiImage = paapiContext?.available ? paapiContext.result?.imageUrl || '' : '';
-    const imageResolution = resolveAmazonImage(html, {
-      baseUrl: finalUrl,
-      paapiImage
-    });
-    const finalImageUrl = imageResolution.finalImageUrl;
-    const imageDebug = {
-      rawScrapeImage: imageResolution.rawScrapeImage,
-      paapiImage: imageResolution.paapiImage,
-      ogImage: imageResolution.ogImage,
-      twitterImage: imageResolution.twitterImage,
-      firstHtmlImage: imageResolution.firstHtmlImage,
-      existingFieldImage: imageResolution.existingFieldImage,
-      resolvedImageUrl: imageResolution.resolvedImageUrl,
-      finalImageUrl,
-      selectedSource: imageResolution.selectedSource,
-      reason: imageResolution.reasonIfMissing,
-      paapiStatus: paapiContext?.status || (asin ? 'not_requested' : 'missing_asin'),
-      paapiReason: paapiContext?.available ? null : paapiContext?.reason || null,
-      resolvedUrl,
-      wasShortLink: resolvedRequest.wasShortLink,
-      redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1)
-    };
-
-    logGeneratorDebug('api.amazon.scrape.image_resolution', {
-      url: trimmedUrl,
-      resolvedUrl,
-      asin,
-      paapiImage: imageDebug.paapiImage,
-      rawScrapeImage: imageDebug.rawScrapeImage,
-      ogImage: imageDebug.ogImage,
-      twitterImage: imageDebug.twitterImage,
-      resolvedImageUrl: imageDebug.resolvedImageUrl,
-      finalImageUrl: imageDebug.finalImageUrl,
-      reasonIfMissing: imageDebug.reason,
-      selectedSource: imageDebug.selectedSource
-    });
-
-    logGeneratorDebug('api.amazon.scrape.success', {
-      url: trimmedUrl,
-      resolvedUrl,
-      asin,
-      sellerType: sellerInfo.sellerType,
-      hasImage: Boolean(finalImageUrl),
-      normalizedUrl,
-      finalImageUrl,
-      selectedImageSource: imageResolution.selectedSource,
-      reasonIfMissing: imageResolution.reasonIfMissing
-    });
-
-    return res.status(200).json({
-      success: true,
-      title: extractAmazonTitle(html) || '',
-      imageUrl: finalImageUrl,
-      image: finalImageUrl,
-      productImage: finalImageUrl,
-      previewImage: finalImageUrl,
-      thumbnail: finalImageUrl,
-      images: finalImageUrl ? [finalImageUrl] : [],
-      product: {
-        imageUrl: finalImageUrl
-      },
-      price: extractAmazonPrice(html) || '',
-      oldPrice: extractAmazonOldPrice(html) || '',
-      asin,
-      finalUrl,
-      resolvedUrl,
-      originalUrl: trimmedUrl,
-      normalizedUrl,
-      sellerType: sellerInfo.sellerType,
-      imageDebug
-    });
+    return res.status(200).json(await scrapeAmazonProduct(req.body?.url));
   } catch (error) {
     logGeneratorDebug('api.amazon.scrape.error', {
       error: error instanceof Error ? error.message : 'Scrape failed'
     });
-    return res.status(500).json({
+    return res.status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 500).json({
       success: false,
       error: error instanceof Error ? `Scrape failed: ${error.message}` : 'Scrape failed',
-      code: 'SCRAPE_FAILED'
+      code: error instanceof Error ? error.code || 'SCRAPE_FAILED' : 'SCRAPE_FAILED'
     });
   }
 }

@@ -18,6 +18,19 @@ function normalizeSecret(rawValue, placeholders = []) {
   return placeholders.includes(value.toUpperCase()) ? '' : value;
 }
 
+function getReaderRuntimeFlags() {
+  const readerTestMode = (process.env.READER_TEST_MODE?.trim() || '0') === '1';
+  const readerDebugMode = (process.env.READER_DEBUG_MODE?.trim() || '0') === '1';
+  const allowRawReaderFallbackFlag =
+    process.env.ALLOW_RAW_READER_FALLBACK?.trim() || process.env.READER_ALLOW_RAW_FALLBACK?.trim() || '0';
+
+  return {
+    readerTestMode,
+    readerDebugMode,
+    allowRawReaderFallback: allowRawReaderFallbackFlag === '1'
+  };
+}
+
 export function getTelegramConfig() {
   return {
     token: process.env.TELEGRAM_BOT_TOKEN?.trim() || '',
@@ -51,15 +64,40 @@ export function getDatabaseConfig() {
 
 export function getTelegramUserReaderConfig() {
   const storage = getStorageConfig();
+  const apiId = process.env.TELEGRAM_USER_API_ID?.trim() || '';
+  const apiHash = normalizeSecret(process.env.TELEGRAM_USER_API_HASH, ['DEIN_API_HASH_HIER', 'YOUR_API_HASH_HERE', 'CHANGE_ME']);
+  const explicitEnabled = process.env.TELEGRAM_USER_API_ENABLED?.trim();
+  const runtimeFlags = getReaderRuntimeFlags();
 
   return {
-    enabled: (process.env.TELEGRAM_USER_API_ENABLED?.trim() || '0') === '1',
-    apiId: process.env.TELEGRAM_USER_API_ID?.trim() || '',
-    apiHash: normalizeSecret(process.env.TELEGRAM_USER_API_HASH, ['DEIN_API_HASH_HIER', 'YOUR_API_HASH_HERE', 'CHANGE_ME']),
+    enabled: explicitEnabled ? explicitEnabled === '1' : Boolean(apiId && apiHash),
+    apiId,
+    apiHash,
     phoneNumber: process.env.TELEGRAM_USER_PHONE?.trim() || '',
     loginMode: (process.env.TELEGRAM_USER_LOGIN_MODE?.trim() || 'phone') === 'qr' ? 'qr' : 'phone',
-    sessionDir: storage.telegramUserSessionDir
+    sessionDir: storage.telegramUserSessionDir,
+    readerTestMode: runtimeFlags.readerTestMode,
+    readerDebugMode: runtimeFlags.readerDebugMode,
+    allowRawReaderFallback: runtimeFlags.allowRawReaderFallback,
+    readerTestThresholds: {
+      minDiscountPercent: runtimeFlags.readerTestMode ? 5 : 12,
+      minScore: runtimeFlags.readerTestMode ? 0 : 58,
+      clearFakeRejectRisk: runtimeFlags.readerTestMode ? 100 : 90
+    }
   };
+}
+
+export function getReaderRuntimeConfig() {
+  const runtimeFlags = getReaderRuntimeFlags();
+
+  return {
+    ...runtimeFlags,
+    dealLockBypass: runtimeFlags.readerTestMode || runtimeFlags.readerDebugMode
+  };
+}
+
+export function isDealLockBypassEnabled() {
+  return getReaderRuntimeConfig().dealLockBypass;
 }
 
 export function getTelegramTestGroupConfig() {

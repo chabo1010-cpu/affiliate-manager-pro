@@ -204,24 +204,92 @@ export async function sendTelegramPost({
         ]
       }
     : undefined;
+  const effectiveImageUrl = parsedUploadedImage ? '' : trimmedImageUrl;
+  const resolvedDisableWebPagePreview = disableWebPagePreview || (!parsedUploadedImage && !effectiveImageUrl);
+  const telegramMethod = parsedUploadedImage || effectiveImageUrl ? 'sendPhoto' : 'sendMessage';
+
+  console.info('[OUTPUT_CONFIG]', {
+    configSource: 'telegram_sender',
+    explicitChatId: (chatId || '').toString().trim() || null,
+    envChatId: envChatId || null,
+    finalChatId: finalChatId || null,
+    tokenConfigured: Boolean(token),
+    method: telegramMethod
+  });
+  console.info('[OUTPUT_PAYLOAD]', {
+    configSource: 'telegram_sender',
+    textLength: typeof text === 'string' ? text.trim().length : 0,
+    textPreview: typeof text === 'string' ? text.trim().slice(0, 160) : '',
+    hasUploadedImage: Boolean(parsedUploadedImage),
+    hasImageUrl: Boolean(effectiveImageUrl),
+    disableWebPagePreview: resolvedDisableWebPagePreview,
+    hasCouponCode: Boolean(trimmedCouponCode)
+  });
 
   if (!text || typeof text !== 'string' || text.trim().length === 0) {
+    console.error('[TELEGRAM_SEND_ERROR]', {
+      chatId: finalChatId || null,
+      method: telegramMethod,
+      error: 'Text ist erforderlich'
+    });
+    console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
+      chatId: finalChatId || null,
+      method: telegramMethod,
+      reason: 'Text ist erforderlich'
+    });
     throw new Error('Text ist erforderlich');
   }
 
   if (!token) {
+    console.error('[TELEGRAM_SEND_ERROR]', {
+      chatId: finalChatId || null,
+      method: telegramMethod,
+      error: 'TELEGRAM_BOT_TOKEN fehlt im Backend'
+    });
+    console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
+      chatId: finalChatId || null,
+      method: telegramMethod,
+      reason: 'TELEGRAM_BOT_TOKEN fehlt im Backend'
+    });
     throw new Error('TELEGRAM_BOT_TOKEN fehlt im Backend');
   }
 
   if (!finalChatId) {
+    console.error('[TELEGRAM_SEND_ERROR]', {
+      chatId: null,
+      method: telegramMethod,
+      error: 'TELEGRAM_CHAT_ID fehlt im Backend'
+    });
+    console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
+      chatId: null,
+      method: telegramMethod,
+      reason: 'TELEGRAM_CHAT_ID fehlt im Backend'
+    });
     throw new Error('TELEGRAM_CHAT_ID fehlt im Backend');
   }
-
-  const effectiveImageUrl = parsedUploadedImage ? '' : trimmedImageUrl;
-  const resolvedDisableWebPagePreview = disableWebPagePreview || (!parsedUploadedImage && !effectiveImageUrl);
-  const telegramMethod = parsedUploadedImage || effectiveImageUrl ? 'sendPhoto' : 'sendMessage';
   let telegramResponse;
   let telegramData;
+
+  console.info('[TELEGRAM_SEND_START]', {
+    chatId: finalChatId,
+    method: telegramMethod,
+    textLength: text.trim().length,
+    hasUploadedImage: Boolean(parsedUploadedImage),
+    hasImageUrl: Boolean(effectiveImageUrl),
+    hasCouponCode: Boolean(trimmedCouponCode)
+  });
+  console.info('[TELEGRAM_FORCE_SEND_START]', {
+    chatId: finalChatId,
+    method: telegramMethod,
+    payload: {
+      text: String(text),
+      textLength: text.trim().length,
+      uploadedImage: Boolean(parsedUploadedImage),
+      imageUrl: effectiveImageUrl || null,
+      disableWebPagePreview: resolvedDisableWebPagePreview,
+      rabattgutscheinCode: trimmedCouponCode || null
+    }
+  });
 
   logGeneratorDebug('api.telegram.request', {
     method: telegramMethod,
@@ -272,6 +340,16 @@ export async function sendTelegramPost({
   if (!telegramResponse.ok || !telegramData?.ok) {
     const telegramDescription =
       telegramData?.description || telegramData?.raw || 'Telegram API hat einen unbekannten Fehler geliefert';
+    console.error('[TELEGRAM_SEND_ERROR]', {
+      chatId: finalChatId,
+      method: telegramMethod,
+      error: telegramDescription
+    });
+    console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
+      chatId: finalChatId,
+      method: telegramMethod,
+      reason: telegramDescription
+    });
     logGeneratorDebug('api.telegram.error', {
       method: telegramMethod,
       error: telegramDescription,
@@ -285,6 +363,17 @@ export async function sendTelegramPost({
     messageId: telegramData.result?.message_id,
     hasImageUrl: Boolean(effectiveImageUrl),
     disableWebPagePreview: resolvedDisableWebPagePreview
+  });
+
+  console.info('[TELEGRAM_SEND_SUCCESS]', {
+    chatId: telegramData.result?.chat?.id ?? finalChatId,
+    method: telegramMethod,
+    messageId: telegramData.result?.message_id
+  });
+  console.info('[TELEGRAM_FORCE_SEND_SUCCESS]', {
+    chatId: telegramData.result?.chat?.id ?? finalChatId,
+    method: telegramMethod,
+    messageId: telegramData.result?.message_id
   });
 
   return {

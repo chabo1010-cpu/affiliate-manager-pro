@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { publishGeneratorPostDirect } from '../services/directPublisher.js';
+import { isAmazonShortLink } from '../services/dealHistoryService.js';
 import {
   buildGeneratorDebugPayload,
   getGeneratorValidationError,
@@ -41,6 +42,12 @@ router.post('/direct', upload.single('uploadedImageFile'), async (req, res) => {
   const normalizedInput = normalizeDirectPublishInput(req);
   const debugPayload = buildGeneratorDebugPayload(normalizedInput);
   logGeneratorDebug('api.posts.direct.request', debugPayload);
+  if (isAmazonShortLink(normalizedInput.link)) {
+    console.info('[MANUAL_SHORTLINK_ALLOWED]', {
+      link: normalizedInput.link,
+      normalizedUrl: normalizedInput.normalizedUrl || null
+    });
+  }
 
   const validationError = getGeneratorValidationError(normalizedInput, { mode: 'direct' });
   if (validationError) {

@@ -6,17 +6,19 @@ import { getKeepaStatus } from '../services/keepaService.js';
 import { getFakeDropSummary } from '../services/keepaFakeDropService.js';
 import { getLearningLogicOverview } from '../services/learningLogicService.js';
 import { getWorkerStatus } from '../services/publisherService.js';
+import { getTelegramUserClientStatus } from '../services/telegramUserClientService.js';
 
 const router = Router();
 
 router.get('/overview', async (req, res) => {
   try {
-    const [keepaStatus, amazonStatus, fakeDropSummary, copybotOverview, publishingStatus] = await Promise.all([
+    const [keepaStatus, amazonStatus, fakeDropSummary, copybotOverview, publishingStatus, telegramReaderStatus] = await Promise.all([
       getKeepaStatus(),
       Promise.resolve(getAmazonAffiliateStatus()),
       Promise.resolve(getFakeDropSummary()),
       Promise.resolve(getCopybotOverview()),
-      Promise.resolve(getWorkerStatus())
+      Promise.resolve(getWorkerStatus()),
+      getTelegramUserClientStatus()
     ]);
     const learningOverview = getLearningLogicOverview();
     const drawerConfigs = keepaStatus?.settings?.drawerConfigs || {};
@@ -75,7 +77,13 @@ router.get('/overview', async (req, res) => {
       keepa: sourceStatuses[0].status,
       amazon: sourceStatuses[1].status,
       scrapper: sourceStatuses[2].status,
-      telegram: sourceStatuses[4].status
+      telegramReader:
+        telegramReaderStatus?.listenerSessions > 0
+          ? 'aktiv'
+          : telegramReaderStatus?.enabled
+            ? 'bereit'
+            : 'deaktiviert',
+      telegramOutput: sourceStatuses[4].status
     });
     logGeneratorDebug('FLOW STATUS UPDATED', {
       reviewCount: outputStatuses.reviewCount,

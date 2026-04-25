@@ -1,5 +1,5 @@
 import { getDb } from '../db.js';
-import { getTelegramTestGroupConfig } from '../env.js';
+import { getReaderRuntimeConfig, getTelegramTestGroupConfig } from '../env.js';
 import { assertDealNotLocked, cleanText } from './dealHistoryService.js';
 import { buildGeneratorDealContext } from './generatorDealScoringService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
@@ -7,6 +7,17 @@ import { createPublishingEntry, processPublishingQueueEntry } from './publisherS
 import { isFailedPublishingQueueStatus, normalizePublishingQueueStatus } from './publishingQueueStateService.js';
 
 const db = getDb();
+const DEBUG_QUEUE_ID_PLACEHOLDER = '__QUEUE_ID__';
+
+function getDealLockBypassMeta(explicitSkipDealLock = false) {
+  const runtimeConfig = getReaderRuntimeConfig();
+  return {
+    active: explicitSkipDealLock === true || runtimeConfig.dealLockBypass,
+    explicitSkipDealLock: explicitSkipDealLock === true,
+    readerTestMode: runtimeConfig.readerTestMode,
+    readerDebugMode: runtimeConfig.readerDebugMode
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -122,6 +133,53 @@ function buildDirectPublishingPayload(input = {}, generatorPostId, generatorCont
       facebook: cleanText(input.facebookImageSource) || 'link_preview'
     }
   };
+}
+
+function replaceQueueIdPlaceholder(value, queueId) {
+  if (typeof value !== 'string' || !value.includes(DEBUG_QUEUE_ID_PLACEHOLDER)) {
+    return value;
+  }
+
+  return value.replaceAll(DEBUG_QUEUE_ID_PLACEHOLDER, queueId ? String(queueId) : 'n/a');
+}
+
+function applyQueueIdPlaceholderToPayload(payload = {}, queueId) {
+  const nextTextByChannel =
+    payload.textByChannel && typeof payload.textByChannel === 'object'
+      ? Object.fromEntries(
+          Object.entries(payload.textByChannel).map(([channel, text]) => [channel, replaceQueueIdPlaceholder(text, queueId)])
+        )
+      : payload.textByChannel;
+
+  return {
+    ...payload,
+    textByChannel: nextTextByChannel
+  };
+}
+
+function persistPublishingPayload(queueId, generatorPostId, payload = {}) {
+  db.prepare(`UPDATE publishing_queue SET payload_json = ?, updated_at = ? WHERE id = ?`).run(
+    JSON.stringify(payload ?? {}),
+    nowIso(),
+    queueId
+  );
+
+  db.prepare(
+    `
+      UPDATE generator_posts
+      SET telegram_text = ?,
+          whatsapp_text = ?,
+          facebook_text = ?,
+          updated_at = ?
+      WHERE id = ?
+    `
+  ).run(
+    cleanText(payload?.textByChannel?.telegram),
+    cleanText(payload?.textByChannel?.whatsapp),
+    cleanText(payload?.textByChannel?.facebook),
+    nowIso(),
+    generatorPostId
+  );
 }
 
 function buildDirectPublishingTargets(input = {}) {
@@ -271,15 +329,18 @@ function assertDirectPublishingTargets(input = {}, payload = {}) {
 }
 
 export async function publishGeneratorPostDirect(input = {}) {
-  const generatorContext = await buildGeneratorDealContext({
-    asin: input.asin,
-    sellerType: input.sellerType,
-    currentPrice: input.currentPrice,
-    title: input.title,
-    productUrl: input.normalizedUrl || input.link,
-    imageUrl: input.generatedImagePath,
-    source: 'generator_direct_publish'
-  });
+  const generatorContext =
+    input.generatorContext ||
+    (await buildGeneratorDealContext({
+      asin: input.asin,
+      sellerType: input.sellerType,
+      currentPrice: input.currentPrice,
+      title: input.title,
+      productUrl: input.normalizedUrl || input.link,
+      imageUrl: input.generatedImagePath,
+      source: cleanText(input.contextSource) || 'generator_direct_publish',
+      origin: cleanText(input.originOverride) || 'manual'
+    }));
   const preparedInput = {
     ...input,
     generatorContext
@@ -296,30 +357,125 @@ export async function publishGeneratorPostDirect(input = {}) {
     keepaStatus: generatorContext?.keepa?.status || 'missing'
   });
 
-  const dealLock = assertDealNotLocked({
-    asin: input.asin,
-    url: input.link,
-    normalizedUrl: input.normalizedUrl || input.link,
-    sourceType: 'generator_direct',
-    origin: 'manual'
-  });
+  const dealLockBypass = getDealLockBypassMeta(input.skipDealLock === true);
+  const skipDealLock = dealLockBypass.active;
+  const dealLock = skipDealLock
+    ? {
+        blocked: false,
+        dealHash: null
+      }
+    : (() => {
+        try {
+          return assertDealNotLocked({
+            asin: input.asin,
+            url: input.link,
+            normalizedUrl: input.normalizedUrl || input.link,
+            sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+            origin: cleanText(input.originOverride) || 'manual'
+          });
+        } catch (error) {
+          console.error('[DEAL_LOCK_BLOCKED]', {
+            phase: 'direct_publish_pre_queue',
+            sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+            sourceId: generatorPostId,
+            asin: cleanText(input.asin).toUpperCase() || '',
+            normalizedUrl: cleanText(input.normalizedUrl || input.link) || '',
+            reason: error instanceof Error ? error.message : 'Deal-Lock aktiv.',
+            blockCode: error instanceof Error ? error.code || error.dealLock?.blockCode || '' : '',
+            readerTestMode: dealLockBypass.readerTestMode,
+            readerDebugMode: dealLockBypass.readerDebugMode
+          });
+          throw error;
+        }
+      })();
+
+  if (skipDealLock) {
+    console.info('[DEAL_LOCK_BYPASSED]', {
+      phase: 'direct_publish_pre_queue',
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      normalizedUrl: cleanText(input.normalizedUrl || input.link) || '',
+      explicitSkipDealLock: dealLockBypass.explicitSkipDealLock,
+      readerTestMode: dealLockBypass.readerTestMode,
+      readerDebugMode: dealLockBypass.readerDebugMode
+    });
+    console.info('[DEAL_LOCK_FORCE_DISABLED]', {
+      phase: 'direct_publish_pre_queue',
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || ''
+    });
+  }
 
   logGeneratorDebug('DEAL LOCK CHECK BEFORE DIRECT POST', {
     generatorPostId,
     asin: cleanText(input.asin).toUpperCase(),
     blocked: dealLock.blocked,
-    dealHash: dealLock.dealHash || null
+    dealHash: dealLock.dealHash || null,
+    skipped: skipDealLock
   });
 
   const publishingPayload = buildDirectPublishingPayload(input, generatorPostId, generatorContext);
-  const publishingTargets = assertDirectPublishingTargets(input, publishingPayload);
+  let publishingTargets;
+  try {
+    publishingTargets = assertDirectPublishingTargets(input, publishingPayload);
+  } catch (error) {
+    const queuePreparationError =
+      error instanceof Error ? error.message : 'Publishing-Ziele konnten nicht vorbereitet werden.';
+    console.error('[QUEUE_ERROR]', {
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      error: queuePreparationError
+    });
+    console.error('[ERROR_REASON]', {
+      reason: queuePreparationError,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId
+    });
+    throw error;
+  }
 
-  const queueEntry = createPublishingEntry({
-    sourceType: 'generator_direct',
+  let queueEntry;
+  try {
+    queueEntry = createPublishingEntry({
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      originOverride: cleanText(input.originOverride) || 'manual',
+      skipDealLock,
+      payload: {
+        ...publishingPayload,
+        ...(skipDealLock ? { skipDealLock: true } : {})
+      },
+      targets: publishingTargets
+    });
+  } catch (error) {
+    const queueErrorMessage = error instanceof Error ? error.message : 'Queue-Eintrag konnte nicht erstellt werden.';
+    console.error('[QUEUE_ERROR]', {
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      error: queueErrorMessage
+    });
+    console.error('[ERROR_REASON]', {
+      reason: queueErrorMessage,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId
+    });
+    throw error;
+  }
+
+  const finalizedPublishingPayload = applyQueueIdPlaceholderToPayload(publishingPayload, queueEntry?.id || null);
+  if (finalizedPublishingPayload.textByChannel !== publishingPayload.textByChannel) {
+    persistPublishingPayload(queueEntry.id, generatorPostId, finalizedPublishingPayload);
+  }
+
+  console.info('[QUEUE_JOB_CREATED]', {
+    queueId: queueEntry?.id || null,
+    sourceType: cleanText(input.queueSourceType) || 'generator_direct',
     sourceId: generatorPostId,
-    originOverride: 'manual',
-    payload: publishingPayload,
-    targets: publishingTargets
+    asin: cleanText(input.asin).toUpperCase() || ''
   });
 
   logGeneratorDebug('MANUAL POST SAVED TO QUEUE', {
@@ -328,7 +484,39 @@ export async function publishGeneratorPostDirect(input = {}) {
     asin: cleanText(input.asin).toUpperCase()
   });
 
-  const queueProcessingResult = await processPublishingQueueEntry(queueEntry.id);
+  let queueProcessingResult;
+  try {
+    console.info('[PUBLISHER_FORCE_SEND]', {
+      queueId: queueEntry?.id || null,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || ''
+    });
+    queueProcessingResult = await processPublishingQueueEntry(queueEntry.id);
+  } catch (error) {
+    const publisherErrorMessage =
+      error instanceof Error ? error.message : 'Publisher konnte den Queue-Eintrag nicht verarbeiten.';
+    console.error('[PUBLISHER_ERROR]', {
+      queueId: queueEntry?.id || null,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      error: publisherErrorMessage
+    });
+    console.error('[ERROR_REASON]', {
+      reason: publisherErrorMessage,
+      queueId: queueEntry?.id || null,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct'
+    });
+    console.error('[PUBLISHER_FORCE_ERROR]', {
+      queueId: queueEntry?.id || null,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      reason: publisherErrorMessage
+    });
+    throw error;
+  }
   const summary = summarizeQueueResults(queueProcessingResult, input, generatorPostId);
 
   updateGeneratorPostMeta(generatorPostId, {
@@ -345,10 +533,29 @@ export async function publishGeneratorPostDirect(input = {}) {
   });
 
   if (isFailedPublishingQueueStatus(summary.queue?.status)) {
-    throw buildQueueFailureError(summary);
+    const queueFailureError = buildQueueFailureError(summary);
+    console.error('[QUEUE_ERROR]', {
+      queueId: summary.queue?.id || queueEntry?.id || null,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      error: queueFailureError.message
+    });
+    console.error('[ERROR_REASON]', {
+      reason: queueFailureError.message,
+      queueId: summary.queue?.id || queueEntry?.id || null
+    });
+    throw queueFailureError;
   }
 
   if (summary.results.telegram?.messageId) {
+    console.info('[PUBLISHER_FORCE_SUCCESS]', {
+      queueId: summary.queue?.id || queueEntry?.id || null,
+      sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+      sourceId: generatorPostId,
+      asin: cleanText(input.asin).toUpperCase() || '',
+      telegramMessageId: summary.results.telegram.messageId
+    });
     logGeneratorDebug('TEST GROUP POST SENT', {
       generatorPostId,
       asin: cleanText(input.asin).toUpperCase(),

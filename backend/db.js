@@ -358,6 +358,7 @@ db.exec(`
     is_active INTEGER NOT NULL DEFAULT 1,
     last_seen_message_id TEXT,
     last_seen_message_at TEXT,
+    last_checked_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES telegram_reader_sessions(id) ON DELETE SET NULL
@@ -878,6 +879,7 @@ ensureColumn(
 );
 ensureColumn('app_settings', 'facebookDefaultTarget', `facebookDefaultTarget TEXT`);
 ensureColumn('telegram_reader_channels', 'slot_index', `slot_index INTEGER`);
+ensureColumn('telegram_reader_channels', 'last_checked_at', `last_checked_at TEXT`);
 
 db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_reader_channels_session_slot
