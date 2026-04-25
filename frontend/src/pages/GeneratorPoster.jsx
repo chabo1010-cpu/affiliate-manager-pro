@@ -38,6 +38,8 @@ const directPublishApiUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://loca
 const COUPON_PREVIEW_PREFIX = COUPON_LINE_PREFIX;
 const BLITZANGEBOT_LABEL = '\u26A1\uFE0F Blitzangebot';
 const ZEITLICH_BEGRENZT_LABEL = '\u23F0\uFE0F Zeitlich begrenztes Angebot';
+const GENERATOR_PREVIEW_FALLBACK_IMAGE =
+  'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect width="640" height="480" rx="28" fill="%23f3f4f6"/><rect x="32" y="32" width="576" height="416" rx="24" fill="%23ffffff" stroke="%23d1d5db" stroke-width="4"/><text x="50%" y="46%" text-anchor="middle" fill="%236b7280" font-family="Arial" font-size="30">Kein Bild</text><text x="50%" y="55%" text-anchor="middle" fill="%239ca3af" font-family="Arial" font-size="20">Preview-Fallback</text></svg>';
 
 function parseEnabledFlag(value, fallback = false) {
   if (value === undefined || value === null || value === '') {
@@ -156,6 +158,39 @@ function buildCheckedDealSnapshot(checkData = {}, scrapeData = {}, fallbackUrl =
   };
 }
 
+function getScrapeImageFieldMap(scrapeData = {}) {
+  return {
+    imageUrl: scrapeData.imageUrl || '',
+    image: scrapeData.image || '',
+    productImage: scrapeData.productImage || '',
+    previewImage: scrapeData.previewImage || '',
+    thumbnail: scrapeData.thumbnail || '',
+    'images[0]': Array.isArray(scrapeData.images) ? scrapeData.images[0] || '' : '',
+    'product.imageUrl': scrapeData.product?.imageUrl || ''
+  };
+}
+
+function resolveScrapedImageUrl(scrapeData = {}) {
+  const imageCandidates = Object.values(getScrapeImageFieldMap(scrapeData));
+
+  for (const imageCandidate of imageCandidates) {
+    const normalizedImageUrl = normalizeDealImageUrl(imageCandidate || '');
+    if (normalizedImageUrl) {
+      return normalizedImageUrl;
+    }
+  }
+
+  return '';
+}
+
+function logGeneratorImageDebug(eventType, payload = {}) {
+  try {
+    console.info(`[generator-debug] ${eventType}`, JSON.stringify(payload));
+  } catch {
+    console.info(`[generator-debug] ${eventType}`, payload);
+  }
+}
+
 function normalizeDirectPublishResponse(data = {}) {
   const safeData = data && typeof data === 'object' ? data : {};
   const safeResults = safeData.results && typeof safeData.results === 'object' ? safeData.results : {};
@@ -224,6 +259,7 @@ function GeneratorPosterPage() {
   const [whatsappEnabled, setWhatsappEnabled] = useState(false);
   const [facebookEnabled, setFacebookEnabled] = useState(false);
   const [scrapedTitle, setScrapedTitle] = useState('');
+  const [scrapeImageWarning, setScrapeImageWarning] = useState('');
   const [rabattgutscheinCode, setRabattgutscheinCode] = useState('');
   const [formError, setFormError] = useState('');
   const [dealSnapshot, setDealSnapshot] = useState(null);
@@ -303,12 +339,36 @@ function GeneratorPosterPage() {
   const isFinalPostTextValid = Boolean(cleanValidationText);
 
   const hasUploadedImage = Boolean(uploadedImageFile && uploadedImagePreviewUrl);
-  const generatorPreviewImageUrl = uploadedImagePreviewUrl || scrapedImageUrl || '';
-  const generatorPreviewImageLabel = uploadedImagePreviewUrl
-    ? uploadedImageName || 'Eigener Upload'
+  const hasScrapePreviewFallback = Boolean(!uploadedImagePreviewUrl && !scrapedImageUrl && (scrapedTitle || dealSnapshot));
+  const selectedImageSource = uploadedImagePreviewUrl
+    ? 'upload'
     : scrapedImageUrl
+      ? 'standard'
+      : hasScrapePreviewFallback
+        ? 'fallback'
+        : 'none';
+  const generatorPreviewImageUrl =
+    selectedImageSource === 'upload'
+      ? uploadedImagePreviewUrl
+      : selectedImageSource === 'standard'
+        ? scrapedImageUrl
+        : selectedImageSource === 'fallback'
+          ? GENERATOR_PREVIEW_FALLBACK_IMAGE
+          : '';
+  const generatorPreviewImageSectionTitle = selectedImageSource === 'upload'
+    ? 'Aktives Upload-Bild'
+    : selectedImageSource === 'standard'
+      ? 'Aktives Standardbild'
+      : selectedImageSource === 'fallback'
+        ? 'Aktive Fallback-Vorschau'
+        : '';
+  const generatorPreviewImageLabel = selectedImageSource === 'upload'
+    ? uploadedImageName || 'Eigener Upload'
+    : selectedImageSource === 'standard'
       ? 'Standardbild'
-      : '';
+      : selectedImageSource === 'fallback'
+        ? 'Preview-Fallback'
+        : '';
 
   const effectiveTelegramImageSource =
     telegramImageSource === 'upload' && !hasUploadedImage ? 'standard' : telegramImageSource;
@@ -375,6 +435,7 @@ function GeneratorPosterPage() {
     setWhatsappEnabled(false);
     setFacebookEnabled(false);
     setScrapedTitle('');
+    setScrapeImageWarning('');
     setRabattgutscheinCode('');
     setFormError('');
     setDealSnapshot(null);
@@ -430,6 +491,16 @@ function GeneratorPosterPage() {
     });
   }, [hasUploadedImage]);
 
+  useEffect(() => {
+    logGeneratorImageDebug('generator.preview.image_state', {
+      scrapedImageUrl,
+      previewImageUrl: generatorPreviewImageUrl,
+      selectedImageSource,
+      hasScrapePreviewFallback,
+      warning: scrapeImageWarning || ''
+    });
+  }, [scrapedImageUrl, generatorPreviewImageUrl, selectedImageSource, hasScrapePreviewFallback, scrapeImageWarning]);
+
   const handleTogglePrimaryOption = (option) => {
     setSelectedPrimaryOptions((prev) => {
       if (option === WITHOUT_OPTIONS_LABEL) {
@@ -459,6 +530,7 @@ function GeneratorPosterPage() {
       setHasScraped(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
+      setScrapeImageWarning('');
       setFormError('Link vergessen.');
       setDealSnapshot(null);
       setBackgroundCheckPending(false);
@@ -469,6 +541,7 @@ function GeneratorPosterPage() {
 
     setScraping(true);
     setFormError('');
+    setScrapeImageWarning('');
     setDealSnapshot(null);
     setBackgroundCheckPending(false);
     setBackgroundCheckMessage('');
@@ -496,6 +569,7 @@ function GeneratorPosterPage() {
         setHasScraped(false);
         setScrapedImageUrl('');
         setScrapedTitle('');
+        setScrapeImageWarning('');
         setFormError('');
         setDealSnapshot(null);
         setBackgroundCheckPending(false);
@@ -509,7 +583,17 @@ function GeneratorPosterPage() {
         return;
       }
 
-      const normalizedDealImageUrl = normalizeDealImageUrl(data.image || '');
+      const scrapeImageFields = getScrapeImageFieldMap(data);
+      const normalizedDealImageUrl = resolveScrapedImageUrl(data);
+      const nextSelectedImageSource = normalizedDealImageUrl ? 'standard' : 'fallback';
+      const nextPreviewImageUrl = normalizedDealImageUrl || (data.title || data.asin ? GENERATOR_PREVIEW_FALLBACK_IMAGE : '');
+      logGeneratorImageDebug('generator.scrape.image_resolution', {
+        imageFields: scrapeImageFields,
+        normalizedImageUrl: normalizedDealImageUrl,
+        scrapedImageUrl: normalizedDealImageUrl,
+        previewImageUrl: nextPreviewImageUrl,
+        selectedImageSource: nextSelectedImageSource
+      });
       const initialSnapshot = buildInitialDealSnapshot(data, finalAmazonLink);
 
       if (scrapeRunRef.current !== scrapeRunId) {
@@ -525,6 +609,12 @@ function GeneratorPosterPage() {
       setHasScraped(true);
       setBackgroundCheckPending(true);
       setBackgroundCheckMessage('Basisdaten geladen. Historie und Sperrcheck werden im Hintergrund aktualisiert.');
+      if (normalizedDealImageUrl) {
+        setScrapeImageWarning('');
+      } else {
+        setScrapeImageWarning('Kein Produktbild aus Scrape erhalten');
+        showToast('Kein Produktbild aus Scrape erhalten', 2800);
+      }
       showToast(
         normalizedDealImageUrl
           ? 'Amazon Link erfolgreich gescrapt und Produktbild geladen'
@@ -544,7 +634,7 @@ function GeneratorPosterPage() {
         sellerType: data.sellerType || '',
         currentPrice: data.price || '',
         title: data.title || '',
-        imageUrl: normalizedDealImageUrl || data.image || '',
+        imageUrl: normalizedDealImageUrl || '',
         includeGeneratorContext: false
       };
 
@@ -620,7 +710,7 @@ function GeneratorPosterPage() {
         sellerType: data.sellerType || '',
         currentPrice: data.price || '',
         title: data.title || '',
-        imageUrl: normalizedDealImageUrl || data.image || ''
+        imageUrl: normalizedDealImageUrl || ''
       };
       const checkResponse = await fetch(dealsCheckApiUrl, {
         method: 'POST',
@@ -704,6 +794,7 @@ function GeneratorPosterPage() {
       setHasScraped(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
+      setScrapeImageWarning('');
       setBackgroundCheckPending(false);
       setBackgroundCheckMessage('');
       setFormError(`Scrape fehlgeschlagen: ${finalError}`);
@@ -909,6 +1000,7 @@ function GeneratorPosterPage() {
                     setHasScraped(false);
                     setScrapedImageUrl('');
                     setScrapedTitle('');
+                    setScrapeImageWarning('');
                     setSelectedPrimaryOptions([]);
                     setFormError('');
                     setDealSnapshot(null);
@@ -1151,7 +1243,7 @@ function GeneratorPosterPage() {
                     <div className="generator-image-preview-card">
                       <div className="generator-image-preview-meta">
                         <div>
-                          <p className="section-title">{hasUploadedImage ? 'Aktives Upload-Bild' : 'Aktives Standardbild'}</p>
+                          <p className="section-title">{generatorPreviewImageSectionTitle}</p>
                           <strong>{generatorPreviewImageLabel}</strong>
                         </div>
                         {hasUploadedImage && (
@@ -1167,9 +1259,18 @@ function GeneratorPosterPage() {
                       <img
                         className="generator-image-preview"
                         src={generatorPreviewImageUrl}
-                        alt={hasUploadedImage ? 'Hochgeladenes Bild' : 'Standardbild'}
+                        alt={
+                          selectedImageSource === 'upload'
+                            ? 'Hochgeladenes Bild'
+                            : selectedImageSource === 'standard'
+                              ? 'Standardbild'
+                              : 'Fallback-Vorschau'
+                        }
                       />
                     </div>
+                  )}
+                  {selectedImageSource === 'fallback' && scrapeImageWarning && (
+                    <p className="generator-form-error">{scrapeImageWarning}</p>
                   )}
                   <div className="form-row">
                     <label className="checkbox-card">

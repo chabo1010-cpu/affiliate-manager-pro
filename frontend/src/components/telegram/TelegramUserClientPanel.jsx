@@ -326,6 +326,7 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
             {statusData?.configured ? 'GramJS bereit' : 'API Konfiguration fehlt'}
           </span>
           <span className="status-chip info">{Array.isArray(statusData?.sessions) ? statusData.sessions.length : 0} Sessions</span>
+          <span className="status-chip info">{statusData?.listenerSessions || 0} Listener aktiv</span>
           <span className="status-chip info">{Array.isArray(statusData?.channels) ? statusData.channels.length : 0} Watchlists</span>
         </div>
       </div>
@@ -444,7 +445,13 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
         {(statusData?.sessions || []).map((session) => (
           <article key={session.name} className="card" style={{ padding: '1rem', display: 'grid', gap: '0.35rem' }}>
             <strong>{session.name}</strong>
-            <span className={`status-chip ${session.status === 'connected' ? 'success' : 'info'}`}>{session.status}</span>
+            <span
+              className={`status-chip ${
+                ['connected', 'watching', 'active'].includes(session.status) || session.listenerActive ? 'success' : 'info'
+              }`}
+            >
+              {session.status}
+            </span>
             <p className="text-muted" style={{ margin: 0 }}>
               {session.phoneNumberMasked || 'ohne Telefonnummer'} · letzter Connect {formatDateTime(session.lastConnectedAt)}
             </p>

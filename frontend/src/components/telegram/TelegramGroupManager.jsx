@@ -214,7 +214,11 @@ function TelegramGroupManager({ onStatusChange, onSessionNameChange }) {
           <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
             <span className="status-chip info">Aktive Gruppen: {summary.activeCount} / {groupsData.slotCount}</span>
             <span className="status-chip info">Gesamt konfiguriert: {summary.configuredCount}</span>
-            <span className={`status-chip ${groupsData.stats.sessionStatus === 'connected' ? 'success' : 'warning'}`}>
+            <span
+              className={`status-chip ${
+                ['connected', 'watching', 'active'].includes(groupsData.stats.sessionStatus) ? 'success' : 'warning'
+              }`}
+            >
               Session: {groupsData.sessionName} ({groupsData.stats.sessionStatus})
             </span>
           </div>
