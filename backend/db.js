@@ -809,6 +809,17 @@ db.exec(`
     telegram_output_enabled INTEGER NOT NULL DEFAULT 1,
     whatsapp_output_enabled INTEGER NOT NULL DEFAULT 1,
     ai_resolver_enabled INTEGER NOT NULL DEFAULT 0,
+    ai_amazon_direct_enabled INTEGER NOT NULL DEFAULT 1,
+    ai_only_on_uncertainty INTEGER NOT NULL DEFAULT 1,
+    ai_always_in_debug INTEGER NOT NULL DEFAULT 1,
+    market_compare_amazon_direct_enabled INTEGER NOT NULL DEFAULT 1,
+    market_compare_amazon_direct_only INTEGER NOT NULL DEFAULT 1,
+    ai_amazon_direct_only INTEGER NOT NULL DEFAULT 1,
+    allow_fba_market_compare INTEGER NOT NULL DEFAULT 0,
+    allow_fba_ai INTEGER NOT NULL DEFAULT 0,
+    allow_fbm_market_compare INTEGER NOT NULL DEFAULT 0,
+    allow_fbm_ai INTEGER NOT NULL DEFAULT 0,
+    unknown_seller_mode TEXT NOT NULL DEFAULT 'review',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -855,6 +866,30 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_deal_engine_runs_decision ON deal_engine_runs (decision, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_deal_engine_runs_output_queue ON deal_engine_runs (output_queue_id);
 `);
+
+ensureColumn(
+  'deal_engine_settings',
+  'ai_amazon_direct_enabled',
+  `ai_amazon_direct_enabled INTEGER NOT NULL DEFAULT 1`
+);
+ensureColumn('deal_engine_settings', 'ai_only_on_uncertainty', `ai_only_on_uncertainty INTEGER NOT NULL DEFAULT 1`);
+ensureColumn('deal_engine_settings', 'ai_always_in_debug', `ai_always_in_debug INTEGER NOT NULL DEFAULT 1`);
+ensureColumn(
+  'deal_engine_settings',
+  'market_compare_amazon_direct_enabled',
+  `market_compare_amazon_direct_enabled INTEGER NOT NULL DEFAULT 1`
+);
+ensureColumn(
+  'deal_engine_settings',
+  'market_compare_amazon_direct_only',
+  `market_compare_amazon_direct_only INTEGER NOT NULL DEFAULT 1`
+);
+ensureColumn('deal_engine_settings', 'ai_amazon_direct_only', `ai_amazon_direct_only INTEGER NOT NULL DEFAULT 1`);
+ensureColumn('deal_engine_settings', 'allow_fba_market_compare', `allow_fba_market_compare INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_settings', 'allow_fba_ai', `allow_fba_ai INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_settings', 'allow_fbm_market_compare', `allow_fbm_market_compare INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_settings', 'allow_fbm_ai', `allow_fbm_ai INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('deal_engine_settings', 'unknown_seller_mode', `unknown_seller_mode TEXT NOT NULL DEFAULT 'review'`);
 
 ensureColumn(
   'app_settings',
@@ -1408,6 +1443,17 @@ if (!dealEngineSettingsRow?.count) {
         telegram_output_enabled,
         whatsapp_output_enabled,
         ai_resolver_enabled,
+        ai_amazon_direct_enabled,
+        ai_only_on_uncertainty,
+        ai_always_in_debug,
+        market_compare_amazon_direct_enabled,
+        market_compare_amazon_direct_only,
+        ai_amazon_direct_only,
+        allow_fba_market_compare,
+        allow_fba_ai,
+        allow_fbm_market_compare,
+        allow_fbm_ai,
+        unknown_seller_mode,
         created_at,
         updated_at
       ) VALUES (
@@ -1429,6 +1475,17 @@ if (!dealEngineSettingsRow?.count) {
         1,
         1,
         0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        'review',
         @now,
         @now
       )
@@ -1457,6 +1514,17 @@ if (!dealEngineSettingsRow?.count) {
         telegram_output_enabled,
         whatsapp_output_enabled,
         ai_resolver_enabled,
+        ai_amazon_direct_enabled,
+        ai_only_on_uncertainty,
+        ai_always_in_debug,
+        market_compare_amazon_direct_enabled,
+        market_compare_amazon_direct_only,
+        ai_amazon_direct_only,
+        allow_fba_market_compare,
+        allow_fba_ai,
+        allow_fbm_market_compare,
+        allow_fbm_ai,
+        unknown_seller_mode,
         created_at,
         updated_at
       ) VALUES (
@@ -1478,6 +1546,17 @@ if (!dealEngineSettingsRow?.count) {
         1,
         1,
         0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        'review',
         @now,
         @now
       )
@@ -1503,6 +1582,17 @@ if (!dealEngineSettingsRow?.count) {
           telegram_output_enabled = COALESCE(telegram_output_enabled, 1),
           whatsapp_output_enabled = COALESCE(whatsapp_output_enabled, 1),
           ai_resolver_enabled = COALESCE(ai_resolver_enabled, 0),
+          ai_amazon_direct_enabled = COALESCE(ai_amazon_direct_enabled, 1),
+          ai_only_on_uncertainty = COALESCE(ai_only_on_uncertainty, 1),
+          ai_always_in_debug = COALESCE(ai_always_in_debug, 1),
+          market_compare_amazon_direct_enabled = COALESCE(market_compare_amazon_direct_enabled, 1),
+          market_compare_amazon_direct_only = COALESCE(market_compare_amazon_direct_only, 1),
+          ai_amazon_direct_only = COALESCE(ai_amazon_direct_only, 1),
+          allow_fba_market_compare = COALESCE(allow_fba_market_compare, 0),
+          allow_fba_ai = COALESCE(allow_fba_ai, 0),
+          allow_fbm_market_compare = COALESCE(allow_fbm_market_compare, 0),
+          allow_fbm_ai = COALESCE(allow_fbm_ai, 0),
+          unknown_seller_mode = COALESCE(NULLIF(TRIM(unknown_seller_mode), ''), 'review'),
           updated_at = @now
       WHERE id = 1
     `

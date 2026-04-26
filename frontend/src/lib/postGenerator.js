@@ -301,6 +301,27 @@ export function normalizeDealImageUrl(imageUrl) {
   return trimmed;
 }
 
+export function resolveDealImageUrlFromScrape(scrapeData = {}) {
+  const imageCandidates = [
+    scrapeData.imageUrl || '',
+    scrapeData.image || '',
+    scrapeData.productImage || '',
+    scrapeData.previewImage || '',
+    scrapeData.thumbnail || '',
+    Array.isArray(scrapeData.images) ? scrapeData.images[0] || '' : '',
+    scrapeData.product?.imageUrl || ''
+  ];
+
+  for (const imageCandidate of imageCandidates) {
+    const normalizedImageUrl = normalizeDealImageUrl(imageCandidate || '');
+    if (normalizedImageUrl) {
+      return normalizedImageUrl;
+    }
+  }
+
+  return '';
+}
+
 export function copyToClipboard(text) {
   return navigator.clipboard
     .writeText(text)

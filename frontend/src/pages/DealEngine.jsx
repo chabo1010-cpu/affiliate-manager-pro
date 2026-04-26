@@ -30,6 +30,30 @@ function prettyJson(value) {
   return JSON.stringify(value ?? null, null, 2);
 }
 
+function toSellerFlagValue(value) {
+  if (value === true) {
+    return 'yes';
+  }
+
+  if (value === false) {
+    return 'no';
+  }
+
+  return 'unknown';
+}
+
+function fromSellerFlagValue(value) {
+  if (value === 'yes') {
+    return true;
+  }
+
+  if (value === 'no') {
+    return false;
+  }
+
+  return null;
+}
+
 function buildFormFromSample(sample = {}) {
   return {
     sourceName: sample.source?.name || 'Demo Quelle',
@@ -39,6 +63,9 @@ function buildFormFromSample(sample = {}) {
     amazonUrl: sample.deal?.amazonUrl || '',
     amazonPrice: String(sample.deal?.amazonPrice ?? ''),
     sellerType: sample.deal?.sellerType || 'AMAZON',
+    sellerClass: sample.deal?.sellerClass || 'AMAZON_DIRECT',
+    soldByAmazon: toSellerFlagValue(sample.deal?.soldByAmazon ?? true),
+    shippedByAmazon: toSellerFlagValue(sample.deal?.shippedByAmazon ?? true),
     brand: sample.deal?.brand || '',
     category: sample.deal?.category || '',
     variantKey: sample.deal?.variantKey || '',
@@ -73,6 +100,9 @@ function buildAnalyzePayload(form) {
       amazonUrl: form.amazonUrl,
       amazonPrice: form.amazonPrice,
       sellerType: form.sellerType,
+      sellerClass: form.sellerClass,
+      soldByAmazon: fromSellerFlagValue(form.soldByAmazon),
+      shippedByAmazon: fromSellerFlagValue(form.shippedByAmazon),
       brand: form.brand,
       category: form.category,
       variantKey: form.variantKey,
@@ -297,7 +327,7 @@ function DealEnginePage() {
       {
         title: 'Internet entscheidet',
         value: `${toNumber(metrics.marketRuns)} Markt-Runs`,
-        detail: 'Marktpreis ist immer die Hauptentscheidung.',
+        detail: 'Marktpreis bleibt die Hauptentscheidung, wenn die Seller-Regeln Marktvergleich erlauben.',
         tone: 'success'
       },
       {
@@ -326,8 +356,8 @@ function DealEnginePage() {
               <p className="section-title">Deal Engine</p>
               <h1 className="page-title">Internet zuerst, Keepa nur Fallback, KI nur im Unsicherheitsfall</h1>
               <p className="page-subtitle">
-                Dashboard, Quellen, Regler und Output sind direkt an die bestehende App gekoppelt. APPROVE geht an
-                Telegram und WhatsApp, QUEUE bleibt intern sichtbar, REJECT wird verworfen.
+                Dashboard, Quellen, Regler und Output sind direkt an die bestehende App gekoppelt. Marktvergleich und
+                KI koennen jetzt seller-genau fuer Amazon Direct, FBA, FBM und Unknown gesteuert werden.
               </p>
             </div>
             <div className="engine-hero-side">
@@ -601,6 +631,155 @@ function DealEnginePage() {
                         disabled={user?.role !== 'admin'}
                       />
                     </label>
+                    <label className="engine-checkbox">
+                      <span>KI fuer Amazon Direct</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.ai.amazonDirectEnabled}
+                        onChange={(event) =>
+                          updateSettings('ai', {
+                            amazonDirectEnabled: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>KI nur bei Unsicherheit</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.ai.onlyOnUncertainty}
+                        onChange={(event) =>
+                          updateSettings('ai', {
+                            onlyOnUncertainty: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>KI immer im Debugmodus</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.ai.alwaysInDebug}
+                        onChange={(event) =>
+                          updateSettings('ai', {
+                            alwaysInDebug: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <div className="engine-settings-section engine-span-2">
+                      <p className="section-title">Qualitaet</p>
+                      <p className="engine-header-note">Seller-Gates fuer Marktvergleich, KI und unbekannte Verkaeufer.</p>
+                    </div>
+                    <label className="engine-checkbox">
+                      <span>Marktvergleich fuer Amazon Direct</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.marketCompareAmazonDirectEnabled}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            marketCompareAmazonDirectEnabled: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>Marktvergleich nur bei Verkauf & Versand durch Amazon</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.marketCompareAmazonDirectOnly}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            marketCompareAmazonDirectOnly: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>KI nur bei Verkauf & Versand durch Amazon</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.aiAmazonDirectOnly}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            aiAmazonDirectOnly: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>FBA Drittanbieter fuer Marktvergleich erlauben</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.allowFbaThirdPartyMarketCompare}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            allowFbaThirdPartyMarketCompare: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>FBA Drittanbieter fuer KI erlauben</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.allowFbaThirdPartyAi}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            allowFbaThirdPartyAi: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>FBM fuer Marktvergleich erlauben</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.allowFbmMarketCompare}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            allowFbmMarketCompare: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label className="engine-checkbox">
+                      <span>FBM fuer KI erlauben</span>
+                      <input
+                        type="checkbox"
+                        checked={settings.quality.allowFbmAi}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            allowFbmAi: event.target.checked
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      />
+                    </label>
+                    <label>
+                      <span>Unbekannte Verkaeufer</span>
+                      <select
+                        value={settings.quality.unknownSellerMode}
+                        onChange={(event) =>
+                          updateSettings('quality', {
+                            unknownSellerMode: event.target.value
+                          })
+                        }
+                        disabled={user?.role !== 'admin'}
+                      >
+                        <option value="review">REVIEW</option>
+                        <option value="block">BLOCK</option>
+                      </select>
+                    </label>
                   </div>
                 ) : null}
 
@@ -670,7 +849,7 @@ function DealEnginePage() {
                   <p className="section-title">Analyse Engine</p>
                   <h2 className="page-title">Kompletter Deal-Durchlauf</h2>
                 </div>
-                <span className="engine-header-note">Internetvergleich bleibt immer Prioritaet 1</span>
+                <span className="engine-header-note">Amazon Direct kann Markt + KI nutzen, andere Seller fallen standardmaessig auf Keepa zurueck</span>
               </div>
 
               <div className="engine-form-grid">
@@ -696,6 +875,32 @@ function DealEnginePage() {
                     <option value="AMAZON">AMAZON</option>
                     <option value="FBA">FBA</option>
                     <option value="FBM">FBM</option>
+                    <option value="UNKNOWN">UNKNOWN</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Seller Klasse</span>
+                  <select value={form.sellerClass} onChange={(event) => updateForm('sellerClass', event.target.value)}>
+                    <option value="AMAZON_DIRECT">AMAZON_DIRECT</option>
+                    <option value="FBA_THIRDPARTY">FBA_THIRDPARTY</option>
+                    <option value="FBM_THIRDPARTY">FBM_THIRDPARTY</option>
+                    <option value="UNKNOWN">UNKNOWN</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Verkauf durch Amazon</span>
+                  <select value={form.soldByAmazon} onChange={(event) => updateForm('soldByAmazon', event.target.value)}>
+                    <option value="yes">ja</option>
+                    <option value="no">nein</option>
+                    <option value="unknown">unbekannt</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Versand durch Amazon</span>
+                  <select value={form.shippedByAmazon} onChange={(event) => updateForm('shippedByAmazon', event.target.value)}>
+                    <option value="yes">ja</option>
+                    <option value="no">nein</option>
+                    <option value="unknown">unbekannt</option>
                   </select>
                 </label>
                 <label className="engine-span-2">
@@ -812,6 +1017,17 @@ function DealEnginePage() {
                         </div>
                         <h3>{currentResult.marketAdvantagePct ?? '-'}%</h3>
                         <p>Marktpreis {currentResult.marketPrice ?? '-'} | Schwelle {currentResult.analysis?.thresholdPct ?? '-'}</p>
+                      </article>
+                      <article className="engine-card engine-tone-info">
+                        <div className="engine-card-head">
+                          <p className="section-title">Seller</p>
+                          <span className="status-chip info">{currentResult.analysis?.seller?.sellerClass || currentResult.sellerArea || 'UNKNOWN'}</span>
+                        </div>
+                        <h3>{currentResult.analysis?.seller?.sellerType || currentResult.sellerArea || '-'}</h3>
+                        <p>
+                          Verkauf Amazon {currentResult.analysis?.seller?.soldByAmazonLabel || '-'} | Versand Amazon{' '}
+                          {currentResult.analysis?.seller?.shippedByAmazonLabel || '-'}
+                        </p>
                       </article>
                       <article className="engine-card engine-tone-info">
                         <div className="engine-card-head">

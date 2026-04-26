@@ -1,8 +1,9 @@
 import { Router } from 'express';
-import { getReaderRuntimeConfig } from '../env.js';
+import { getReaderRuntimeConfig, getTelegramTestGroupConfig } from '../env.js';
 import { buildAmazonAffiliateLinkRecord, normalizeSellerType, resetDealLockHistory } from '../services/dealHistoryService.js';
 import { publishGeneratorPostDirect } from '../services/directPublisher.js';
-import { forceScanTelegramReader } from '../services/telegramUserClientService.js';
+import { forceScanTelegramReader, forceTestgroupFeed, getTelegramUserClientStatus } from '../services/telegramUserClientService.js';
+import { sendTelegramPost } from '../services/telegramSenderService.js';
 import { generatePostText } from '../../frontend/src/lib/postGenerator.js';
 
 const router = Router();
@@ -13,7 +14,7 @@ function getRequesterRole(req) {
 
 function requireAdmin(req, res, next) {
   if (getRequesterRole(req) !== 'admin') {
-    return res.status(403).json({ error: 'Nur Admin darf Debug-Generator-Posts ausloesen.' });
+    return res.status(403).json({ error: 'Nur Admin darf Force-Reader-Scans ausloesen.' });
   }
 
   return next();
@@ -21,6 +22,54 @@ function requireAdmin(req, res, next) {
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function resolveTestgroupTargetMeta() {
+  const testGroupConfig = getTelegramTestGroupConfig();
+  const explicitTestChatId = cleanText(process.env.TELEGRAM_TEST_CHAT_ID);
+  const fallbackChatId = cleanText(process.env.TELEGRAM_CHAT_ID);
+  const targetChatId = cleanText(testGroupConfig.chatId);
+  const targetSource = explicitTestChatId
+    ? 'TELEGRAM_TEST_CHAT_ID'
+    : fallbackChatId
+      ? 'TELEGRAM_CHAT_ID'
+      : 'missing';
+
+  return {
+    tokenConfigured: Boolean(cleanText(testGroupConfig.token)),
+    targetChatId,
+    targetSource
+  };
+}
+
+function classifyTelegramSendError(error) {
+  const message = error instanceof Error ? error.message : 'Telegram API Fehler';
+  const normalized = cleanText(message).toLowerCase();
+
+  if (!normalized || normalized.includes('telegram_bot_token fehlt')) {
+    return 'Bot Token fehlt';
+  }
+  if (normalized.includes('telegram_chat_id fehlt')) {
+    return 'Chat ID fehlt';
+  }
+  if (normalized.includes('chat not found')) {
+    return 'Chat ID falsch';
+  }
+  if (normalized.includes('bot is not a member')) {
+    return 'Bot nicht in Gruppe';
+  }
+  if (
+    normalized.includes('have no rights to send') ||
+    normalized.includes('chat_write_forbidden') ||
+    normalized.includes('forbidden')
+  ) {
+    return 'Bot hat keine Rechte';
+  }
+  if (normalized.includes('unauthorized')) {
+    return 'Bot Token falsch';
+  }
+
+  return 'Telegram API Fehler';
 }
 
 function getDealLockDebugGuard() {
@@ -31,6 +80,33 @@ function getDealLockDebugGuard() {
     readerDebugMode: runtimeConfig.readerDebugMode
   };
 }
+
+router.get('/test', async (req, res) => {
+  const runtimeConfig = getReaderRuntimeConfig();
+  const readerStatus = await getTelegramUserClientStatus();
+
+  return res.json({
+    success: true,
+    ok: true,
+    runtimeFlags: {
+      readerTestMode: runtimeConfig.readerTestMode === true,
+      readerDebugMode: runtimeConfig.readerDebugMode === true,
+      allowRawReaderFallback: runtimeConfig.allowRawReaderFallback === true,
+      dealLockBypass: runtimeConfig.dealLockBypass === true
+    },
+    readerStatus: {
+      configured: readerStatus.configured === true,
+      enabled: readerStatus.enabled === true,
+      listenerActive: readerStatus.listenerActive === true,
+      pollingActive: readerStatus.pollingActive === true,
+      listenerSessions: Number(readerStatus.listenerSessions || 0),
+      watchedChannels: Array.isArray(readerStatus.channels) ? readerStatus.channels.length : 0,
+      activeSourceCount: Number(readerStatus.activeSourceCount || 0),
+      lastPollAt: readerStatus.lastPollAt || null,
+      lastFoundMessageAt: readerStatus.lastFoundMessageAt || null
+    }
+  });
+});
 
 router.post('/test-generator-publish', requireAdmin, async (req, res) => {
   const asin = cleanText(req.body?.asin).toUpperCase();
@@ -166,10 +242,18 @@ router.post('/reset-deal-lock', requireAdmin, async (req, res) => {
   });
 });
 
-router.post('/force-reader-scan', requireAdmin, async (req, res) => {
-  const dealLockDebugGuard = getDealLockDebugGuard();
+router.post('/force-reader-scan', async (req, res) => {
+  console.info('[FORCE_SCAN_ENDPOINT_HIT]', {
+    ignoreLastSeen: true,
+    requestedSessionName: cleanText(req.body?.sessionName),
+    requestedChannelRef: cleanText(req.body?.channelRef)
+  });
 
-  console.log('[FORCE_SCAN_ENDPOINT_HIT]');
+  if (getRequesterRole(req) !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admin darf Debug-Generator-Posts ausloesen.' });
+  }
+
+  const dealLockDebugGuard = getDealLockDebugGuard();
 
   if (!dealLockDebugGuard.enabled) {
     return res.status(403).json({
@@ -196,6 +280,76 @@ router.post('/force-reader-scan', requireAdmin, async (req, res) => {
     return res.status(400).json({
       success: false,
       error: error instanceof Error ? error.message : 'Force-Reader-Scan konnte nicht gestartet werden.'
+    });
+  }
+});
+
+router.post('/force-testgroup-feed', async (req, res) => {
+  if (getRequesterRole(req) !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admin darf den Testgruppen-Feed erzwingen.' });
+  }
+
+  try {
+    const result = await forceTestgroupFeed({
+      limitPerGroup: 20,
+      maxGroups: 100,
+      ignoreLastSeen: true,
+      sendEverythingToTestGroup: true,
+      ...(req.body ?? {})
+    });
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Force-Testgruppen-Feed konnte nicht gestartet werden.'
+    });
+  }
+});
+
+router.post('/send-testgroup-ping', async (req, res) => {
+  if (getRequesterRole(req) !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admin darf den Testgruppen-Ping ausloesen.' });
+  }
+
+  const targetMeta = resolveTestgroupTargetMeta();
+  const timestamp = new Date().toISOString();
+  const text = `PING Testgruppe ${timestamp}`;
+
+  console.info('[TESTGROUP_PING_START]', {
+    timestamp
+  });
+  console.info('[TESTGROUP_TARGET]', {
+    explicitTestChatId: cleanText(process.env.TELEGRAM_TEST_CHAT_ID) || null,
+    fallbackChatId: cleanText(process.env.TELEGRAM_CHAT_ID) || null
+  });
+  console.info('[TESTGROUP_TARGET_RESOLVED]', targetMeta);
+
+  try {
+    const result = await sendTelegramPost({
+      text,
+      disableWebPagePreview: true,
+      chatId: targetMeta.targetChatId
+    });
+
+    return res.json({
+      success: true,
+      pingSent: true,
+      targetChatId: targetMeta.targetChatId || null,
+      targetSource: targetMeta.targetSource,
+      tokenConfigured: targetMeta.tokenConfigured,
+      telegram: result,
+      text
+    });
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      pingSent: false,
+      targetChatId: targetMeta.targetChatId || null,
+      targetSource: targetMeta.targetSource,
+      tokenConfigured: targetMeta.tokenConfigured,
+      errorReason: classifyTelegramSendError(error),
+      error: error instanceof Error ? error.message : 'Telegram API Fehler'
     });
   }
 });

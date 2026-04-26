@@ -118,6 +118,9 @@ export function normalizeGeneratorInput(input = {}) {
     normalizedUrl: cleanText(input.normalizedUrl),
     asin: cleanText(input.asin).toUpperCase(),
     sellerType: cleanText(input.sellerType) || 'FBM',
+    sellerClass: cleanText(input.sellerClass),
+    soldByAmazon: input.soldByAmazon ?? null,
+    shippedByAmazon: input.shippedByAmazon ?? null,
     currentPrice: input.currentPrice ?? '',
     oldPrice: input.oldPrice ?? '',
     couponCode: cleanText(input.couponCode),
@@ -179,6 +182,12 @@ export function getGeneratorValidationError(input = {}, options = {}) {
 export function buildGeneratorDebugPayload(input = {}) {
   return {
     enabledChannels: getEnabledGeneratorChannels(input),
+    seller: {
+      sellerType: input.sellerType || 'FBM',
+      sellerClass: input.sellerClass || 'UNKNOWN',
+      soldByAmazon: input.soldByAmazon ?? null,
+      shippedByAmazon: input.shippedByAmazon ?? null
+    },
     imageSources: {
       telegram: input.telegramImageSource || 'standard',
       whatsapp: input.whatsappImageSource || 'standard',

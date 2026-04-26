@@ -2025,7 +2025,15 @@ function resolveKeepaDealAffiliateUrl(item = {}, productUrl = '') {
     cleanText(item.keepaPayload?.affiliateUrl) ||
     cleanText(item.keepaPayload?.product?.affiliateUrl);
 
-  return existingAffiliateUrl || buildAmazonAffiliateUrl(asin, domainId, productUrl);
+  if (existingAffiliateUrl) {
+    return existingAffiliateUrl;
+  }
+
+  if (cleanText(productUrl) && !/amazon\./i.test(cleanText(productUrl))) {
+    return '';
+  }
+
+  return buildAmazonAffiliateUrl(asin, domainId, productUrl);
 }
 
 function enrichKeepaRecord(item = {}, options = {}) {
@@ -3960,6 +3968,41 @@ async function compareAgainstLegalSources(item) {
   };
 }
 
+function buildActiveComparisonSeed(input = {}, domainId, existingResult = null) {
+  return enrichKeepaRecord(
+    {
+      asin: cleanText(input.asin).toUpperCase(),
+      domainId,
+      title: cleanText(input.title) || cleanText(existingResult?.title) || cleanText(input.asin).toUpperCase(),
+      productUrl: cleanText(input.productUrl || input.link) || cleanText(existingResult?.productUrl),
+      imageUrl: cleanText(input.imageUrl) || cleanText(existingResult?.imageUrl),
+      currentPrice: parseNumber(input.currentPrice, parseNumber(existingResult?.currentPrice, null)),
+      referencePrice: parseNumber(input.referencePrice, parseNumber(existingResult?.referencePrice, null)),
+      referenceLabel: cleanText(existingResult?.referenceLabel) || 'Reader / Generator Kontext',
+      keepaDiscount: parseNumber(existingResult?.keepaDiscount, 0) ?? 0,
+      sellerType: cleanText(input.sellerType || existingResult?.sellerType) || 'UNKNOWN',
+      categoryId: parseInteger(existingResult?.categoryId, null),
+      categoryName: cleanText(existingResult?.categoryName),
+      rating: normalizeRating(existingResult?.rating),
+      reviewCount: parseInteger(existingResult?.reviewCount, null),
+      isPrime: existingResult?.isPrime === true,
+      isInStock: existingResult?.isInStock !== false,
+      comparisonSource: cleanText(existingResult?.comparisonSource),
+      comparisonStatus: cleanText(existingResult?.comparisonStatus) || 'not_connected',
+      comparisonPrice: parseNumber(existingResult?.comparisonPrice, null),
+      comparisonPayload: existingResult?.comparisonPayload || {
+        source: null,
+        status: 'not_connected',
+        notes: 'Aktiver Marktvergleich wurde vorbereitet, aber es liegt noch kein externer Vergleichspreis vor.'
+      },
+      keepaPayload: existingResult?.keepaPayload || null
+    },
+    {
+      log: false
+    }
+  );
+}
+
 function saveKeepaResult(item, meta = {}) {
   const existing = getExistingResult(item.asin, item.domainId);
   const mergedItem = enrichKeepaRecord(mergeExistingComparison(item, existing), {
@@ -4676,7 +4719,7 @@ export function loadStoredInternetComparisonContext(input = {}) {
     existingResult &&
       ((existingResult.comparisonPrice !== null && existingResult.comparisonPrice > 0) ||
         existingResult.priceDifferencePct !== null ||
-        cleanText(existingResult.comparisonSource))
+        (cleanText(existingResult.comparisonSource) && cleanText(existingResult.comparisonStatus) !== 'not_connected'))
   );
 
   if (!hasStoredMarketComparison) {
@@ -4697,6 +4740,111 @@ export function loadStoredInternetComparisonContext(input = {}) {
     requestedAt,
     result: existingResult
   };
+}
+
+export async function refreshInternetComparisonContext(input = {}) {
+  const asin = cleanText(input.asin).toUpperCase();
+  const settings = getKeepaSettings();
+  const requestedAt = nowIso();
+  const domainId =
+    DOMAIN_OPTIONS.some((item) => item.id === Number(input.domainId || settings.domainId))
+      ? Number(input.domainId || settings.domainId)
+      : settings.domainId;
+
+  if (!asin) {
+    return {
+      available: false,
+      status: 'comparison_lookup_error',
+      cached: false,
+      requestedAt,
+      reason: 'ASIN fehlt fuer den aktiven Marktvergleich.'
+    };
+  }
+
+  let existingResult = getExistingResult(asin, domainId);
+
+  if (!existingResult) {
+    const seededResult = saveKeepaResult(
+      buildActiveComparisonSeed(
+        {
+          ...input,
+          asin
+        },
+        domainId,
+        null
+      ),
+      {
+        origin: cleanText(input.origin || input.source || 'generator') || 'generator',
+        searchPayload: {
+          source: cleanText(input.source || 'generator') || 'generator',
+          mode: 'comparison_seed',
+          asin,
+          domainId
+        }
+      }
+    );
+    existingResult = seededResult || getExistingResult(asin, domainId);
+  }
+
+  if (!existingResult) {
+    return {
+      available: false,
+      status: 'comparison_lookup_error',
+      cached: false,
+      requestedAt,
+      reason: 'Produktkontext fuer den aktiven Marktvergleich konnte nicht vorbereitet werden.'
+    };
+  }
+
+  try {
+    const comparedItem = await compareAgainstLegalSources({
+      ...buildActiveComparisonSeed(input, domainId, existingResult),
+      asin,
+      domainId
+    });
+    const storedResult = saveKeepaResult(
+      {
+        ...comparedItem,
+        comparisonPayload: comparedItem.comparisonPayload || null
+      },
+      {
+        origin: cleanText(input.origin || input.source || 'generator') || 'generator',
+        searchPayload: {
+          source: cleanText(input.source || 'generator') || 'generator',
+          mode: 'comparison_refresh',
+          asin,
+          domainId
+        }
+      }
+    );
+    const available = Boolean(
+      storedResult &&
+        ((storedResult.comparisonPrice !== null && storedResult.comparisonPrice > 0) ||
+          storedResult.priceDifferencePct !== null ||
+          (cleanText(storedResult.comparisonSource) && cleanText(storedResult.comparisonStatus) !== 'not_connected'))
+    );
+    const comparisonNotes = cleanText(storedResult?.comparisonPayload?.notes);
+
+    return {
+      available,
+      status: available ? 'refreshed_market_comparison' : 'comparison_lookup_error',
+      cached: false,
+      requestedAt,
+      result: storedResult,
+      reason: available ? '' : comparisonNotes || 'Aktiver Marktvergleich lieferte keinen gueltigen Marktpreis.',
+      comparisonAttempted: true
+    };
+  } catch (error) {
+    return {
+      available: false,
+      status: 'comparison_lookup_error',
+      cached: Boolean(existingResult),
+      requestedAt,
+      result: existingResult,
+      reason: error instanceof Error ? error.message : 'Aktiver Marktvergleich ist fehlgeschlagen.',
+      comparisonAttempted: true
+    };
+  }
 }
 
 export async function runKeepaManualSearch(input = {}) {

@@ -70,6 +70,13 @@ function TelegramGroupManager({ onStatusChange, onSessionNameChange }) {
   const [loading, setLoading] = useState(isAdmin);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [forceFeedState, setForceFeedState] = useState({
+    status: 'idle',
+    error: '',
+    groupsScanned: 0,
+    messagesChecked: 0,
+    sentToTestGroup: 0
+  });
 
   async function apiFetch(path, options = {}) {
     const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -188,6 +195,63 @@ function TelegramGroupManager({ onStatusChange, onSessionNameChange }) {
     }
   }
 
+  async function handleForceTestgroupFeed() {
+    if (!isAdmin) {
+      return;
+    }
+
+    setForceFeedState({
+      status: 'running',
+      error: '',
+      groupsScanned: 0,
+      messagesChecked: 0,
+      sentToTestGroup: 0
+    });
+    onStatusChange?.('Testgruppen-Notfallfeed laeuft...');
+
+    try {
+      const data = await apiFetch('/api/debug/force-testgroup-feed', {
+        method: 'POST',
+        body: JSON.stringify({
+          limitPerGroup: 20,
+          maxGroups: 100,
+          ignoreLastSeen: true,
+          sendEverythingToTestGroup: true
+        })
+      });
+      const summary = data.summary || {};
+      setForceFeedState({
+        status: 'success',
+        error: '',
+        groupsScanned: Number(summary.groupsScanned || 0),
+        messagesChecked: Number(summary.messagesChecked || 0),
+        sentToTestGroup: Number(summary.sentToTestGroup || 0)
+      });
+      onStatusChange?.(
+        `Testgruppen-Notfallfeed fertig: ${Number(summary.sentToTestGroup || 0)} Testposts aus ${Number(summary.messagesChecked || 0)} Nachrichten.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Force-Testgruppen-Feed konnte nicht gestartet werden.';
+      setForceFeedState({
+        status: 'error',
+        error: message,
+        groupsScanned: 0,
+        messagesChecked: 0,
+        sentToTestGroup: 0
+      });
+      onStatusChange?.(message);
+    }
+  }
+
+  const forceFeedStatus =
+    forceFeedState.status === 'running'
+      ? { label: 'laeuft', className: 'info' }
+      : forceFeedState.status === 'success'
+        ? { label: 'fertig', className: 'success' }
+        : forceFeedState.status === 'error'
+          ? { label: 'Fehler', className: 'warning' }
+          : { label: 'bereit', className: 'info' };
+
   if (!isAdmin) {
     return null;
   }
@@ -225,6 +289,9 @@ function TelegramGroupManager({ onStatusChange, onSessionNameChange }) {
         </div>
 
         <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap', alignItems: 'start' }}>
+          <button className="primary" onClick={() => void handleForceTestgroupFeed()} disabled={saving || forceFeedState.status === 'running'}>
+            {forceFeedState.status === 'running' ? 'Testgruppe laeuft...' : 'Testgruppe erzwingen'}
+          </button>
           <button className="secondary" onClick={handleAddSlot} disabled={saving || groupsData.slotCount >= groupsData.maxSlots}>
             Neue Gruppe hinzufuegen
           </button>
@@ -238,6 +305,20 @@ function TelegramGroupManager({ onStatusChange, onSessionNameChange }) {
             {saving ? 'Speichert...' : 'Speichern'}
           </button>
         </div>
+      </div>
+
+      <div className="radio-card" style={{ display: 'grid', gap: '0.75rem' }}>
+        <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
+          <span className={`status-chip ${forceFeedStatus.className}`}>Status: {forceFeedStatus.label}</span>
+          <span className="status-chip info">Gruppen: {forceFeedState.groupsScanned}</span>
+          <span className="status-chip info">Nachrichten: {forceFeedState.messagesChecked}</span>
+          <span className="status-chip info">Testposts: {forceFeedState.sentToTestGroup}</span>
+        </div>
+        {forceFeedState.error && (
+          <p className="text-muted" style={{ margin: 0 }}>
+            Fehler: {forceFeedState.error}
+          </p>
+        )}
       </div>
 
       <div

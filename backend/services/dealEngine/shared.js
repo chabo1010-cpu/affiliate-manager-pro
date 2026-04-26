@@ -1,3 +1,5 @@
+import { normalizeSellerType } from '../sellerClassificationService.js';
+
 export function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -93,8 +95,13 @@ export function formatMoney(value, currency = 'EUR') {
 }
 
 export function normalizeSellerArea(value) {
-  const normalized = cleanText(String(value || '')).toUpperCase();
-  return ['AMAZON', 'FBA', 'AFN'].includes(normalized) ? 'AMAZON' : 'FBM';
+  const normalized = normalizeSellerType(value);
+
+  if (normalized === 'AMAZON' || normalized === 'FBA' || normalized === 'FBM') {
+    return normalized;
+  }
+
+  return 'UNKNOWN';
 }
 
 export function isAmazonLink(value) {

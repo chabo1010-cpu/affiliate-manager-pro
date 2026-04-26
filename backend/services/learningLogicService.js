@@ -3,6 +3,7 @@ import { normalizeSellerType } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 import { SELLER_TYPE_LOGIC, evaluateSellerTypeDeal, getSellerTypeFeedbackSummary, getSellerTypeLogicConfig } from './sellerTypeLogicService.js';
 import { getSimilarCaseSignals } from './keepaFakeDropService.js';
+import { evaluateSellerDecisionPolicy, resolveSellerIdentity } from './sellerClassificationService.js';
 
 const db = getDb();
 
@@ -48,6 +49,16 @@ function parseInteger(value, fallback = null) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function logDecisionFlow(tag, payload = {}) {
+  try {
+    console.info(`[${tag}]`, payload);
+  } catch {
+    console.info(`[${tag}]`);
+  }
+
+  logGeneratorDebug(tag, payload);
 }
 
 function buildKeepaPreview(context = {}) {
@@ -131,6 +142,7 @@ function buildInternetPreview(context = {}, keepaPreview = null) {
     return {
       available: false,
       marketAvailable: false,
+      blocked: context.blocked === true,
       status: cleanText(context.status) || comparisonStatus || 'missing',
       reason: cleanText(context.reason) || 'Kein Marktvergleich verfuegbar.',
       requestedAt,
@@ -146,6 +158,7 @@ function buildInternetPreview(context = {}, keepaPreview = null) {
   return {
     available: true,
     marketAvailable: true,
+    blocked: context.blocked === true,
     status: cleanText(context.status) || comparisonStatus || 'available',
     reason: '',
     requestedAt,
@@ -403,7 +416,7 @@ function buildDecisionEnginePreview({ internetPreview, keepaPreview, dealLock, r
     aiOptional: true,
     worksWithoutAi: true,
     modules: {
-      internet: internetPreview.available ? 'primary' : 'waiting_for_fallback',
+      internet: internetPreview.blocked === true ? 'blocked' : internetPreview.available ? 'primary' : 'waiting_for_fallback',
       keepa: routing.strategy === 'keepa_fallback' ? (keepaPreview.available ? 'active_fallback' : 'fallback_missing') : 'standby',
       sperrmodul: dealLock.blocked ? 'blocked' : dealLock.checked ? 'passed' : 'not_checked',
       regler: regler.decisionStatus || 'active',
@@ -418,7 +431,7 @@ function buildDecisionEnginePreview({ internetPreview, keepaPreview, dealLock, r
       {
         id: 'internet',
         label: 'Internetvergleich',
-        status: internetPreview.available ? 'primary' : 'missing'
+        status: internetPreview.blocked === true ? 'blocked' : internetPreview.available ? 'primary' : 'missing'
       },
       {
         id: 'keepa',
@@ -558,12 +571,282 @@ function buildRoutingDecision(input = {}, internetPreview, keepaPreview, evaluat
   return internetDecision || buildKeepaFallbackDecision(input, keepaPreview, evaluation);
 }
 
+function applySellerPolicyToRouting(routing = {}, sellerDecisionPolicy = {}) {
+  if (sellerDecisionPolicy?.unknownSellerAction === 'block') {
+    logDecisionFlow('SELLER_UNKNOWN_REVIEW', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      action: 'block'
+    });
+
+    return {
+      ...routing,
+      decision: 'block',
+      reason: `${routing.reason} | Unbekannter Verkaeufer erzwingt Block.`
+    };
+  }
+
+  if (sellerDecisionPolicy?.unknownSellerAction === 'review' && routing.decision === 'test_group') {
+    logDecisionFlow('SELLER_UNKNOWN_REVIEW', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      action: 'review'
+    });
+
+    return {
+      ...routing,
+      decision: 'review',
+      reason: `${routing.reason} | Unbekannter Verkaeufer erzwingt Review.`
+    };
+  }
+
+  return routing;
+}
+
+function resolveMarketComparisonExecutionState({
+  input = {},
+  settings = {},
+  sellerDecisionPolicy = {},
+  internetPreview = {},
+  runtimeConfig = {}
+}) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const strictReaderMode = runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
+  const forceMarketCompare = strictReaderMode && seller.isAmazonDirect === true;
+  const required =
+    (sellerDecisionPolicy.marketComparison?.allowed === true || forceMarketCompare) &&
+    (seller.isAmazonDirect === true || sellerDecisionPolicy.marketComparison?.allowed === true);
+  const started = required === true && cleanText(input.asin) !== '';
+  let status = 'skipped';
+  let reason = '';
+
+  if (sellerDecisionPolicy.marketComparison?.allowed !== true && forceMarketCompare !== true) {
+    status = 'skipped';
+    reason = sellerDecisionPolicy.marketComparison?.reason || 'Marktvergleich ist nicht freigegeben.';
+  } else if (!cleanText(input.asin)) {
+    status = 'skipped';
+    reason = 'ASIN fehlt fuer den Marktvergleich.';
+  } else if (internetPreview.available === true) {
+    status = 'success';
+    reason = `${internetPreview.comparisonSource || 'Internetvergleich'} erfolgreich geladen.`;
+  } else if (cleanText(internetPreview.status).includes('error')) {
+    status = 'error';
+    reason = cleanText(internetPreview.reason) || 'Marktvergleich hat einen Fehler geliefert.';
+  } else {
+    status = 'skipped';
+    reason = cleanText(internetPreview.reason) || 'Kein Marktvergleichsergebnis gefunden.';
+  }
+
+  return {
+    required,
+    started,
+    used: internetPreview.available === true,
+    success: internetPreview.available === true,
+    error: status === 'error',
+    forceMarketCompare,
+    status,
+    reason
+  };
+}
+
+function resolveAiCheckExecutionState({
+  settings = {},
+  sellerDecisionPolicy = {},
+  runtimeConfig = {},
+  routing = {},
+  marketExecution = {},
+  aiRuntimeContext = null
+}) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const aiSettings = settings.ai || {};
+  const strictReaderMode = runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
+  const forceAiCheck = strictReaderMode && seller.isAmazonDirect === true && aiSettings.alwaysInDebug !== false;
+  const uncertaintyDetected = routing.decision === 'review';
+  const required = sellerDecisionPolicy.marketComparison?.allowed === true && (sellerDecisionPolicy.ai?.allowed === true || forceAiCheck);
+  if (aiRuntimeContext && typeof aiRuntimeContext === 'object' && aiRuntimeContext.attempted === true) {
+    return {
+      required,
+      started: aiRuntimeContext.started !== false,
+      used: aiRuntimeContext.used === true,
+      success: cleanText(aiRuntimeContext.status) === 'success',
+      error: cleanText(aiRuntimeContext.status) === 'error',
+      forceAiCheck,
+      uncertaintyDetected,
+      status: cleanText(aiRuntimeContext.status) || 'success',
+      reason: cleanText(aiRuntimeContext.reason) || 'KI-Pruefung wurde aktiv ausgefuehrt.'
+    };
+  }
+  const shouldRunByRule = forceAiCheck === true || aiSettings.onlyOnUncertainty !== true || uncertaintyDetected === true;
+  const resolverAvailable = aiSettings.resolverEnabled === true;
+  const started =
+    required === true && marketExecution.used === true && shouldRunByRule === true && resolverAvailable === true;
+  let status = 'skipped';
+  let reason = '';
+  let used = false;
+
+  if (sellerDecisionPolicy.marketComparison?.allowed !== true && forceAiCheck !== true) {
+    status = 'skipped';
+    reason = 'Kein Marktvergleichsergebnis fuer die KI-Pruefung freigegeben.';
+  } else if (sellerDecisionPolicy.ai?.allowed !== true && forceAiCheck !== true) {
+    status = 'skipped';
+    reason = sellerDecisionPolicy.ai?.reason || 'KI ist fuer diesen Seller deaktiviert.';
+  } else if (marketExecution.used !== true) {
+    status = 'skipped';
+    reason = cleanText(marketExecution.reason) || 'Kein Marktvergleichsergebnis vorhanden.';
+  } else if (shouldRunByRule !== true) {
+    status = 'skipped';
+    reason = 'Nicht noetig, Score eindeutig.';
+  } else if (resolverAvailable !== true) {
+    status = 'skipped';
+    reason =
+      forceAiCheck === true
+        ? 'Debugmodus hat die KI-Pruefung angefordert, aber der AI Resolver ist deaktiviert.'
+        : 'AI Resolver ist deaktiviert. System bleibt ohne KI entscheidungsfaehig.';
+  } else if (uncertaintyDetected === true) {
+    status = 'success';
+    reason =
+      forceAiCheck === true
+        ? 'Debugmodus hat die KI-Pruefung fuer einen Unsicherheitsfall gestartet.'
+        : 'KI-Pruefung fuer einen Unsicherheitsfall gestartet.';
+    used = true;
+  } else {
+    status = 'success';
+    reason =
+      forceAiCheck === true
+        ? 'Debugmodus hat die KI-Pruefung ausgefuehrt; kein Unsicherheitsfall erkannt.'
+        : 'KI-Pruefung wurde ausgefuehrt.';
+    used = true;
+  }
+
+  return {
+    required,
+    started,
+    used,
+    success: status === 'success',
+    error: status === 'error',
+    forceAiCheck,
+    uncertaintyDetected,
+    status,
+    reason
+  };
+}
+
 export function evaluateLearningRoute(input = {}) {
-  const sellerType = normalizeSellerType(input.sellerType);
+  const sellerIdentity = resolveSellerIdentity({
+    sellerType: input.sellerType,
+    sellerClass: input.sellerClass,
+    soldByAmazon: input.soldByAmazon,
+    shippedByAmazon: input.shippedByAmazon,
+    sellerDetectionSource: input.sellerDetectionSource,
+    detectionSources: input.sellerDetectionSources,
+    matchedPatterns: input.sellerMatchedPatterns,
+    sellerDetails: input.sellerDetails,
+    merchantText: input.sellerRawText,
+    dealType: input.dealType,
+    isAmazonDeal: input.isAmazonDeal
+  });
+  const sellerType = normalizeSellerType(sellerIdentity.sellerType || input.sellerType);
+  const dealEngineSettings = input.dealEngineSettings || {};
+  const runtimeConfig = input.runtimeConfig && typeof input.runtimeConfig === 'object' ? input.runtimeConfig : {};
   const keepaPreview = normalizeKeepaContext(input);
-  const internetPreview = normalizeInternetContext(input, keepaPreview);
+  const sellerDecisionPolicy = input.sellerDecisionPolicy || evaluateSellerDecisionPolicy(dealEngineSettings, sellerIdentity);
+  const rawInternetPreview = normalizeInternetContext(input, keepaPreview);
+  const internetPreview =
+    sellerDecisionPolicy.marketComparison?.allowed === true
+      ? rawInternetPreview
+      : {
+          ...rawInternetPreview,
+          available: false,
+          marketAvailable: false,
+          blocked: true,
+          status: 'blocked_by_seller_policy',
+          reason: sellerDecisionPolicy.marketComparison?.reason || 'Marktvergleich blockiert.'
+        };
   const amazonPreview = normalizeAmazonContext(input);
   const patternSupportEnabled = input.patternSupportEnabled !== false;
+  const marketExecution = resolveMarketComparisonExecutionState({
+    input,
+    settings: dealEngineSettings,
+    sellerDecisionPolicy,
+    internetPreview,
+    runtimeConfig
+  });
+
+  logDecisionFlow('SELLER_DETAILS', {
+    sellerType: sellerDecisionPolicy.seller?.sellerType || 'UNKNOWN',
+    sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+    dealType: sellerDecisionPolicy.seller?.details?.dealType || 'AMAZON',
+    soldByAmazon: sellerDecisionPolicy.seller?.soldByAmazon,
+    shippedByAmazon: sellerDecisionPolicy.seller?.shippedByAmazon,
+    soldByAmazonLabel: sellerDecisionPolicy.seller?.details?.soldByAmazonLabel || 'unbekannt',
+    shippedByAmazonLabel: sellerDecisionPolicy.seller?.details?.shippedByAmazonLabel || 'unbekannt',
+    detectionSource: sellerDecisionPolicy.seller?.details?.detectionSource || 'unknown'
+  });
+  logDecisionFlow('SELLER_TYPE_DETECTED', {
+    sellerType: sellerDecisionPolicy.seller?.sellerType || 'UNKNOWN'
+  });
+  logDecisionFlow('SELLER_CLASS_DETECTED', {
+    sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN'
+  });
+  logDecisionFlow('MARKET_COMPARE_TRIGGER', {
+    sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+    allowed: sellerDecisionPolicy.marketComparison?.allowed === true,
+    reason: sellerDecisionPolicy.marketComparison?.reason || ''
+  });
+  if (marketExecution.forceMarketCompare === true && sellerDecisionPolicy.seller?.isAmazonDirect === true) {
+    logDecisionFlow('AMAZON_DIRECT_FORCE_MARKET_COMPARE', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'AMAZON_DIRECT',
+      reason: 'Reader-Debug/Testmodus erzwingt den Marktvergleich fuer Amazon Direct.'
+    });
+  }
+  if (marketExecution.required === true) {
+    logDecisionFlow('MARKET_COMPARE_REQUIRED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: marketExecution.reason || sellerDecisionPolicy.marketComparison?.reason || ''
+    });
+  }
+  if (marketExecution.started === true) {
+    logDecisionFlow('MARKET_COMPARE_STARTED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: 'Marktvergleich wurde gestartet.'
+    });
+    logDecisionFlow('MARKET_CHECK_STARTED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: 'Marktpruefung wurde gestartet.'
+    });
+  }
+  logDecisionFlow(
+    sellerDecisionPolicy.marketComparison?.allowed === true ? 'MARKET_COMPARE_ALLOWED' : 'MARKET_COMPARE_BLOCKED',
+    {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: sellerDecisionPolicy.marketComparison?.reason || ''
+    }
+  );
+
+  if (marketExecution.success === true) {
+    logDecisionFlow('MARKET_COMPARE_SUCCESS', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: marketExecution.reason
+    });
+  } else if (marketExecution.error === true) {
+    logDecisionFlow('MARKET_COMPARE_ERROR', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: marketExecution.reason
+    });
+  } else {
+    logDecisionFlow('MARKET_COMPARE_SKIPPED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: marketExecution.reason
+    });
+    logDecisionFlow('MARKET_COMPARE_SKIPPED_REASON', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: marketExecution.reason
+    });
+  }
+
+  if (sellerDecisionPolicy.seller?.isAmazonDirect === true) {
+    logDecisionFlow('AMAZON_DIRECT_CONFIRMED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'AMAZON_DIRECT'
+    });
+  }
 
   logGeneratorDebug('LEARNING LOGIC LOADED', {
     sourceType: input.sourceType || 'generator',
@@ -625,7 +908,20 @@ export function evaluateLearningRoute(input = {}) {
     feedbackSummary,
     similarCaseSummary: similarCaseSignals.summary
   });
-  const routing = buildRoutingDecision(input, internetPreview, keepaPreview, evaluation);
+  let routing = buildRoutingDecision(input, internetPreview, keepaPreview, evaluation);
+  routing = applySellerPolicyToRouting(routing, sellerDecisionPolicy);
+  const aiExecution = resolveAiCheckExecutionState({
+    settings: dealEngineSettings,
+    sellerDecisionPolicy,
+    runtimeConfig,
+    routing,
+    marketExecution,
+    aiRuntimeContext: input.aiRuntimeContext
+  });
+  const aiAllowedByPolicy =
+    sellerDecisionPolicy.marketComparison?.allowed === true &&
+    (sellerDecisionPolicy.ai?.allowed === true || aiExecution.forceAiCheck === true);
+  const aiBlockedReason = aiAllowedByPolicy ? '' : aiExecution.reason || sellerDecisionPolicy.ai?.reason || '';
   const dealLock = buildDealLockPreview(input);
   const regler = buildReglerPreview(input, evaluation);
   const queue = buildQueuePreview(input, routing);
@@ -638,6 +934,53 @@ export function evaluateLearningRoute(input = {}) {
     routing
   });
   const sourceLabel = getSourceLabel(input.sourceType || 'generator');
+  if (aiExecution.forceAiCheck === true && sellerDecisionPolicy.seller?.isAmazonDirect === true) {
+    logDecisionFlow('AMAZON_DIRECT_FORCE_AI_CHECK', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'AMAZON_DIRECT',
+      reason: 'Reader-Debug/Testmodus erzwingt die KI-Pruefung fuer Amazon Direct.'
+    });
+  }
+  if (aiExecution.required === true) {
+    logDecisionFlow('AI_CHECK_REQUIRED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: aiExecution.reason || sellerDecisionPolicy.ai?.reason || ''
+    });
+  }
+  if (aiExecution.started === true) {
+    logDecisionFlow('AI_CHECK_STARTED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: 'KI-Pruefung wurde gestartet.'
+    });
+  }
+  logDecisionFlow(aiAllowedByPolicy ? 'AI_ALLOWED' : 'AI_BLOCKED', {
+    sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+    reason: aiAllowedByPolicy ? sellerDecisionPolicy.ai?.reason || '' : aiBlockedReason
+  });
+  if (aiExecution.success === true) {
+    logDecisionFlow('AI_CHECK_SUCCESS', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: aiExecution.reason
+    });
+  } else if (aiExecution.error === true) {
+    logDecisionFlow('AI_CHECK_ERROR', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: aiExecution.reason
+    });
+  } else {
+    logDecisionFlow('AI_CHECK_SKIPPED', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: aiExecution.reason
+    });
+    logDecisionFlow('AI_CHECK_SKIPPED_REASON', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: aiExecution.reason
+    });
+  }
+  logDecisionFlow('AI_TRIGGER_REASON', {
+    sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+    allowed: aiAllowedByPolicy,
+    reason: aiExecution.reason || aiBlockedReason
+  });
   const learning = {
     sourceType: input.sourceType || 'generator',
     sourceLabel,
@@ -647,8 +990,25 @@ export function evaluateLearningRoute(input = {}) {
     fallbackUsed: routing.strategy === 'keepa_fallback',
     internetPrimary: routing.strategy === 'internet_primary',
     keepaFallbackUsed: routing.strategy === 'keepa_fallback',
-    aiRequired: false,
-    worksWithoutAi: true,
+    aiRequired: aiExecution.required,
+    worksWithoutAi: aiExecution.used !== true,
+    aiAllowed: aiAllowedByPolicy,
+    aiBlockedReason,
+    aiCheckStarted: aiExecution.started,
+    aiCheckStatus: aiExecution.status,
+    aiCheckReason: aiExecution.reason,
+    aiResolutionUsed: aiExecution.used,
+    aiForcedInDebug: aiExecution.forceAiCheck === true,
+    aiOnlyOnUncertainty: (dealEngineSettings.ai || {}).onlyOnUncertainty !== false,
+    marketComparisonAllowed: sellerDecisionPolicy.marketComparison?.allowed === true,
+    marketComparisonBlockedReason:
+      sellerDecisionPolicy.marketComparison?.allowed === true ? '' : sellerDecisionPolicy.marketComparison?.reason || '',
+    marketComparisonRequired: marketExecution.required,
+    marketComparisonStarted: marketExecution.started,
+    marketComparisonStatus: marketExecution.status,
+    marketComparisonReason: marketExecution.reason,
+    marketComparisonUsed: marketExecution.used,
+    marketComparisonForcedInDebug: marketExecution.forceMarketCompare === true,
     queueRequired: true,
     queueIntegrated: true,
     reglerIntegrated: true,
@@ -664,6 +1024,12 @@ export function evaluateLearningRoute(input = {}) {
     reglerMode: regler.mode,
     patternSupportEnabled,
     reason: routing.reason,
+    amazonDirectExecutionWarning:
+      sellerDecisionPolicy.seller?.isAmazonDirect === true &&
+      ((marketExecution.required === true && marketExecution.status !== 'success') ||
+        (aiExecution.required === true && aiExecution.status !== 'success'))
+        ? 'Amazon Direct erkannt, aber Pruefung nicht ausgefuehrt.'
+        : '',
     decisionEngine,
     workflow:
       routing.strategy === 'internet_primary'
@@ -716,6 +1082,12 @@ export function evaluateLearningRoute(input = {}) {
     keepaStatus: keepaPreview.status,
     routingDecision: routing.decision
   });
+  if (routing.strategy === 'keepa_fallback') {
+    logDecisionFlow('KEEPA_FALLBACK_TRIGGER', {
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      reason: internetPreview.reason || 'Kein brauchbarer Marktvergleich vorhanden.'
+    });
+  }
   logGeneratorDebug('DECISION ENGINE INTEGRATED', {
     sourceType: input.sourceType || 'generator',
     sellerType,
@@ -738,6 +1110,8 @@ export function evaluateLearningRoute(input = {}) {
   return {
     asin: cleanText(input.asin).toUpperCase(),
     sellerType,
+    seller: sellerDecisionPolicy.seller,
+    decisionPolicy: sellerDecisionPolicy,
     currentPrice: parseNumber(input.currentPrice, null),
     sperrmodul: dealLock,
     dealLock,

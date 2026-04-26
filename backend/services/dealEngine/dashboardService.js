@@ -90,7 +90,7 @@ export function getDealEngineDashboard() {
       {
         id: 'internet',
         label: 'Internet zuerst',
-        detail: 'Der guenstigste echte Marktpreis bleibt die Hauptentscheidung.'
+        detail: 'Der guenstigste echte Marktpreis bleibt die Hauptentscheidung, sobald die Seller-Regeln Marktvergleich erlauben.'
       },
       {
         id: 'keepa',
@@ -109,7 +109,7 @@ export function getDealEngineDashboard() {
       internetDecision: {
         label: 'produktiv',
         tone: 'success',
-        detail: 'Marktvergleich mit billigstem echten Marktpreis ist live.'
+        detail: 'Marktvergleich mit billigstem echten Marktpreis ist live und wird ueber Seller-Regeln gegated.'
       },
       keepaFallback: {
         label: 'produktiv',
@@ -139,7 +139,7 @@ export function getDealEngineDashboard() {
         id: 'market',
         label: 'Internetvergleich',
         title: `${metrics.marketRuns} Marktentscheidungen`,
-        detail: 'Internetvergleich bleibt die primaere Entscheidungsstufe und nutzt den billigsten echten Marktpreis.',
+        detail: 'Internetvergleich bleibt die primaere Entscheidungsstufe, wenn die Seller-Regeln ihn freigeben.',
         tone: 'success'
       },
       {

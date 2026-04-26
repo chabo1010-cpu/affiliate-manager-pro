@@ -106,6 +106,43 @@ function serializeUploadedFileAsDataUrl(uploadedFile) {
   return `data:${mimeType};base64,${uploadedFile.buffer.toString('base64')}`;
 }
 
+function parsePublishingPriceValue(value = '') {
+  const raw = cleanText(String(value || '')).replace(/[^0-9.,-]/g, '');
+  if (!raw) {
+    return null;
+  }
+
+  let normalized = raw;
+  if (raw.includes(',') && raw.includes('.')) {
+    normalized =
+      raw.lastIndexOf(',') > raw.lastIndexOf('.')
+        ? raw.replace(/\./g, '').replace(',', '.')
+        : raw.replace(/,/g, '');
+  } else if (raw.includes(',')) {
+    normalized = raw.replace(',', '.');
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function validatePublishingPrice(input = {}) {
+  const parsedPrice = parsePublishingPriceValue(input.currentPrice);
+  if (parsedPrice !== null && parsedPrice > 0) {
+    return {
+      valid: true,
+      parsedPrice,
+      reason: ''
+    };
+  }
+
+  return {
+    valid: false,
+    parsedPrice,
+    reason: cleanText(input.currentPrice) ? 'Preis ist 0,00€ oder ungueltig.' : 'Preis fehlt oder ist ungueltig.'
+  };
+}
+
 function buildDirectPublishingPayload(input = {}, generatorPostId, generatorContext) {
   const testGroupConfig = getTelegramTestGroupConfig();
   const uploadedImageDataUrl = serializeUploadedFileAsDataUrl(input.uploadedImageFile);
@@ -117,6 +154,9 @@ function buildDirectPublishingPayload(input = {}, generatorPostId, generatorCont
     normalizedUrl: cleanText(input.normalizedUrl || input.link),
     asin: cleanText(input.asin).toUpperCase(),
     sellerType: cleanText(input.sellerType) || 'FBM',
+    sellerClass: cleanText(input.sellerClass) || '',
+    soldByAmazon: input.soldByAmazon ?? null,
+    shippedByAmazon: input.shippedByAmazon ?? null,
     title: cleanText(input.title),
     currentPrice: cleanText(input.currentPrice),
     oldPrice: cleanText(input.oldPrice),
@@ -334,6 +374,9 @@ export async function publishGeneratorPostDirect(input = {}) {
     (await buildGeneratorDealContext({
       asin: input.asin,
       sellerType: input.sellerType,
+      sellerClass: input.sellerClass,
+      soldByAmazon: input.soldByAmazon,
+      shippedByAmazon: input.shippedByAmazon,
       currentPrice: input.currentPrice,
       title: input.title,
       productUrl: input.normalizedUrl || input.link,
@@ -345,6 +388,28 @@ export async function publishGeneratorPostDirect(input = {}) {
     ...input,
     generatorContext
   };
+  const priceValidation = validatePublishingPrice(preparedInput);
+
+  if (!priceValidation.valid) {
+    if (input.allowInvalidPriceTestPost === true) {
+      console.info('[TEST_POST_INVALID_PRICE_ONLY]', {
+        asin: cleanText(input.asin).toUpperCase(),
+        sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+        reason: priceValidation.reason
+      });
+    } else {
+      console.error('[POST_BLOCKED_INVALID_PRICE]', {
+        asin: cleanText(input.asin).toUpperCase(),
+        sourceType: cleanText(input.queueSourceType) || 'generator_direct',
+        reason: priceValidation.reason
+      });
+      const invalidPriceError = new Error(priceValidation.reason);
+      invalidPriceError.code = 'INVALID_PRICE_BLOCKED';
+      invalidPriceError.retryable = false;
+      throw invalidPriceError;
+    }
+  }
+
   const generatorPostId = insertGeneratorPost(preparedInput);
 
   logGeneratorDebug('GENERATOR DIRECT TEST POST', {
@@ -579,5 +644,6 @@ export const __testablesDirectPublisher = {
   buildEmptyChannelResult,
   buildChannelResult,
   summarizeQueueResults,
-  assertDirectPublishingTargets
+  assertDirectPublishingTargets,
+  validatePublishingPrice
 };

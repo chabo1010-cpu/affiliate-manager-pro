@@ -62,9 +62,9 @@ export function evaluateKeepaFallback({ deal = {}, keepa = {}, sellerArea = 'FBM
     score += 10;
     scoreParts.push({ label: 'amazon_bonus', value: 10 });
   } else {
-    const fbmPenalty = discount90 !== null && discount90 < 20 ? 20 : 15;
-    score -= fbmPenalty;
-    scoreParts.push({ label: 'fbm_risk', value: -fbmPenalty });
+    const thirdPartyPenalty = discount90 !== null && discount90 < 20 ? 20 : 15;
+    score -= thirdPartyPenalty;
+    scoreParts.push({ label: 'third_party_risk', value: -thirdPartyPenalty });
   }
 
   const finalScore = clamp(round(score, 2), 0, 100);
@@ -79,7 +79,7 @@ export function evaluateKeepaFallback({ deal = {}, keepa = {}, sellerArea = 'FBM
   const reasons = [
     discount90 !== null ? `Rabatt vs avg90 ${discount90}%` : 'avg90 nicht verfuegbar',
     discount180 !== null ? `Rabatt vs avg180 ${discount180}%` : 'avg180 nicht verfuegbar',
-    sellerArea === 'AMAZON' ? 'Amazon Bonus aktiv.' : 'FBM Risikoabzug aktiv.'
+    sellerArea === 'AMAZON' ? 'Amazon Bonus aktiv.' : 'Drittanbieter Risikoabzug aktiv.'
   ];
 
   if (fakePatterns.reject) {
@@ -99,4 +99,3 @@ export function evaluateKeepaFallback({ deal = {}, keepa = {}, sellerArea = 'FBM
     scoreParts
   };
 }
-

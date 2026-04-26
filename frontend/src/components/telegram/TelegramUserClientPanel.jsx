@@ -27,6 +27,7 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
   const [phoneCode, setPhoneCode] = useState('');
   const [password, setPassword] = useState('');
   const [statusData, setStatusData] = useState(null);
+  const [statusError, setStatusError] = useState('');
   const [dialogs, setDialogs] = useState([]);
   const [messages, setMessages] = useState([]);
   const [loadingStatus, setLoadingStatus] = useState(isAdmin);
@@ -40,9 +41,21 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
   }, [sessionName, statusData?.pendingLogins]);
 
   const watchedChannels = useMemo(() => {
-    const channels = Array.isArray(statusData?.channels) ? statusData.channels : [];
-    return channels.filter((item) => item.sessionName === sessionName);
-  }, [sessionName, statusData?.channels]);
+    const watchlists = Array.isArray(statusData?.watchlists)
+      ? statusData.watchlists
+      : Array.isArray(statusData?.channels)
+        ? statusData.channels
+        : [];
+    return watchlists.filter((item) => item.sessionName === sessionName);
+  }, [sessionName, statusData?.watchlists, statusData?.channels]);
+  const configured = statusData?.configured === true;
+  const sessionCount = Number(statusData?.sessionsCount ?? (Array.isArray(statusData?.sessions) ? statusData.sessions.length : 0));
+  const watchlistCount = Number(
+    statusData?.watchlistCount ??
+      (Array.isArray(statusData?.watchlists) ? statusData.watchlists.length : Array.isArray(statusData?.channels) ? statusData.channels.length : 0)
+  );
+  const listenerActive = statusData?.listenerActive === true;
+  const apiEndpoint = `${API_BASE_URL}/api/telegram/user-client/status`;
 
   async function apiFetch(path, options = {}) {
     const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -72,8 +85,11 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
     try {
       const data = await apiFetch('/api/telegram/user-client/status');
       setStatusData(data);
+      setStatusError('');
     } catch (error) {
-      onStatusChange?.(error instanceof Error ? error.message : 'Telegram User Client konnte nicht geladen werden.');
+      const message = error instanceof Error ? error.message : 'Telegram User Client konnte nicht geladen werden.';
+      setStatusError(message);
+      onStatusChange?.(message);
     } finally {
       setLoadingStatus(false);
     }
@@ -322,14 +338,32 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
           </p>
         </div>
         <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
-          <span className={`status-chip ${statusData?.configured ? 'success' : 'warning'}`}>
-            {statusData?.configured ? 'GramJS bereit' : 'API Konfiguration fehlt'}
+          <span className={`status-chip ${configured ? 'success' : 'warning'}`}>
+            {configured ? 'GramJS bereit' : 'API Konfiguration fehlt'}
           </span>
-          <span className="status-chip info">{Array.isArray(statusData?.sessions) ? statusData.sessions.length : 0} Sessions</span>
-          <span className="status-chip info">{statusData?.listenerSessions || 0} Listener aktiv</span>
-          <span className="status-chip info">{Array.isArray(statusData?.channels) ? statusData.channels.length : 0} Watchlists</span>
+          <span className="status-chip info">{sessionCount} Sessions</span>
+          <span className={`status-chip ${listenerActive ? 'success' : 'info'}`}>
+            {listenerActive ? 'Listener aktiv' : 'Listener inaktiv'}
+          </span>
+          <span className="status-chip info">{watchlistCount} Watchlists</span>
         </div>
       </div>
+
+      {statusError && (
+        <article className="card" style={{ padding: '1rem', border: '1px solid rgba(220,53,69,0.35)' }}>
+          <strong>Statusfehler</strong>
+          <p className="text-muted" style={{ margin: '0.35rem 0 0' }}>{statusError}</p>
+        </article>
+      )}
+
+      <article className="radio-card" style={{ display: 'grid', gap: '0.35rem' }}>
+        <strong>Status Rohdaten</strong>
+        <p className="text-muted" style={{ margin: 0 }}>configured: {String(configured)}</p>
+        <p className="text-muted" style={{ margin: 0 }}>sessionsCount: {sessionCount}</p>
+        <p className="text-muted" style={{ margin: 0 }}>watchlistCount: {watchlistCount}</p>
+        <p className="text-muted" style={{ margin: 0 }}>listenerActive: {String(listenerActive)}</p>
+        <p className="text-muted" style={{ margin: 0 }}>apiEndpoint: {apiEndpoint}</p>
+      </article>
 
       <div className="form-row">
         <label style={{ display: 'grid', gap: '0.35rem', flex: 1 }}>
@@ -457,7 +491,7 @@ function TelegramUserClientPanel({ onStatusChange, initialSessionName = 'default
             </p>
           </article>
         ))}
-        {!loadingStatus && !(statusData?.sessions || []).length && (
+        {!loadingStatus && !statusError && !(statusData?.sessions || []).length && (
           <article className="card" style={{ padding: '1rem' }}>
             <p className="text-muted" style={{ margin: 0 }}>Noch keine Telegram User Session vorhanden.</p>
           </article>

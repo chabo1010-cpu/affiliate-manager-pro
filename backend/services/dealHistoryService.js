@@ -4,6 +4,10 @@ import { DEFAULT_TELEGRAM_COPY_BUTTON_TEXT, getDb } from '../db.js';
 import { upsertDealStatusState } from './databaseService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 import { isActivePublishingQueueStatus } from './publishingQueueStateService.js';
+import {
+  classifySellerType as classifySellerTypeFromSignals,
+  normalizeSellerType as normalizeSellerTypeValue
+} from './sellerClassificationService.js';
 
 const db = getDb();
 const AMAZON_AFFILIATE_TAG = 'codeundcoup08-21';
@@ -448,24 +452,11 @@ export function buildAmazonAffiliateLinkRecord(value = '', options = {}) {
 }
 
 export function classifySellerType({ soldByAmazon, shippedByAmazon }) {
-  if (soldByAmazon && shippedByAmazon) {
-    return 'AMAZON';
-  }
-
-  if (!soldByAmazon && shippedByAmazon) {
-    return 'FBA';
-  }
-
-  return 'FBM';
+  return classifySellerTypeFromSignals({ soldByAmazon, shippedByAmazon });
 }
 
 export function normalizeSellerType(value) {
-  const normalized = cleanText(value).toUpperCase();
-  if (normalized === 'AMAZON' || normalized === 'FBA' || normalized === 'FBM') {
-    return normalized;
-  }
-
-  return 'FBM';
+  return normalizeSellerTypeValue(value);
 }
 
 export function getRepostSettingsRow() {

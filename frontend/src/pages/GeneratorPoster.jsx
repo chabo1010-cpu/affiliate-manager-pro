@@ -9,7 +9,8 @@ import {
   formatPrice,
   hasEffectivePostQualifier,
   generatePostText,
-  normalizeDealImageUrl
+  normalizeDealImageUrl,
+  resolveDealImageUrlFromScrape
 } from '../lib/postGenerator';
 import { Toast, useToast } from '../components/Toast';
 import './GeneratorPoster.css';
@@ -123,6 +124,9 @@ function buildInitialDealSnapshot(scrapeData = {}, fallbackUrl = '') {
     finalUrl: scrapeData.finalUrl || scrapeData.normalizedUrl || fallbackUrl,
     normalizedUrl: scrapeData.normalizedUrl || '',
     sellerType: scrapeData.sellerType || '',
+    sellerClass: scrapeData.sellerClass || '',
+    soldByAmazon: scrapeData.soldByAmazon ?? null,
+    shippedByAmazon: scrapeData.shippedByAmazon ?? null,
     lastPostedAt: '',
     minPrice: null,
     maxPrice: null,
@@ -145,6 +149,10 @@ function buildCheckedDealSnapshot(checkData = {}, scrapeData = {}, fallbackUrl =
     finalUrl: scrapeData.finalUrl || checkData.resolvedFinalUrl || scrapeData.normalizedUrl || fallbackUrl,
     normalizedUrl: scrapeData.normalizedUrl || checkData.normalizedUrl || '',
     sellerType: scrapeData.sellerType || checkData.sellerType || checkData.lastDeal?.sellerType || '',
+    sellerClass: scrapeData.sellerClass || checkData.sellerClass || checkData.generatorContext?.seller?.sellerClass || '',
+    soldByAmazon: scrapeData.soldByAmazon ?? checkData.soldByAmazon ?? checkData.generatorContext?.seller?.soldByAmazon ?? null,
+    shippedByAmazon:
+      scrapeData.shippedByAmazon ?? checkData.shippedByAmazon ?? checkData.generatorContext?.seller?.shippedByAmazon ?? null,
     lastPostedAt: checkData.lastPostedAt || checkData.lastDeal?.postedAt || '',
     minPrice: parseDealPriceValue(checkData.minPrice),
     maxPrice: parseDealPriceValue(checkData.maxPrice),
@@ -168,19 +176,6 @@ function getScrapeImageFieldMap(scrapeData = {}) {
     'images[0]': Array.isArray(scrapeData.images) ? scrapeData.images[0] || '' : '',
     'product.imageUrl': scrapeData.product?.imageUrl || ''
   };
-}
-
-function resolveScrapedImageUrl(scrapeData = {}) {
-  const imageCandidates = Object.values(getScrapeImageFieldMap(scrapeData));
-
-  for (const imageCandidate of imageCandidates) {
-    const normalizedImageUrl = normalizeDealImageUrl(imageCandidate || '');
-    if (normalizedImageUrl) {
-      return normalizedImageUrl;
-    }
-  }
-
-  return '';
 }
 
 function logGeneratorImageDebug(eventType, payload = {}) {
@@ -584,7 +579,7 @@ function GeneratorPosterPage() {
       }
 
       const scrapeImageFields = getScrapeImageFieldMap(data);
-      const normalizedDealImageUrl = resolveScrapedImageUrl(data);
+      const normalizedDealImageUrl = resolveDealImageUrlFromScrape(data);
       const nextSelectedImageSource = normalizedDealImageUrl ? 'standard' : 'fallback';
       const nextPreviewImageUrl = normalizedDealImageUrl || (data.title || data.asin ? GENERATOR_PREVIEW_FALLBACK_IMAGE : '');
       logGeneratorImageDebug('generator.scrape.image_resolution', {
@@ -632,6 +627,9 @@ function GeneratorPosterPage() {
         url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
         normalizedUrl: data.normalizedUrl || '',
         sellerType: data.sellerType || '',
+        sellerClass: data.sellerClass || '',
+        soldByAmazon: data.soldByAmazon ?? null,
+        shippedByAmazon: data.shippedByAmazon ?? null,
         currentPrice: data.price || '',
         title: data.title || '',
         imageUrl: normalizedDealImageUrl || '',
@@ -841,6 +839,12 @@ function GeneratorPosterPage() {
       formData.append('normalizedUrl', dealSnapshot?.normalizedUrl || '');
       formData.append('asin', dealSnapshot?.asin || '');
       formData.append('sellerType', dealSnapshot?.sellerType || 'FBM');
+      formData.append('sellerClass', dealSnapshot?.sellerClass || '');
+      formData.append('soldByAmazon', dealSnapshot?.soldByAmazon === null || dealSnapshot?.soldByAmazon === undefined ? '' : String(dealSnapshot.soldByAmazon));
+      formData.append(
+        'shippedByAmazon',
+        dealSnapshot?.shippedByAmazon === null || dealSnapshot?.shippedByAmazon === undefined ? '' : String(dealSnapshot.shippedByAmazon)
+      );
       formData.append('currentPrice', formattedCurrentPrice);
       formData.append('oldPrice', showOldPrice ? formattedOldPrice : '');
       formData.append('couponCode', rabattgutscheinAktiv ? rabattgutscheinCode.trim() : '');

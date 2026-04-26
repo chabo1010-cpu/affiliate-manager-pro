@@ -1,5 +1,6 @@
 import { getDb } from '../../db.js';
 import { clamp, nowIso, parseBool, parseInteger, parseNumber, round } from './shared.js';
+import { normalizeUnknownSellerMode } from '../sellerClassificationService.js';
 
 const db = getDb();
 
@@ -30,7 +31,20 @@ const DEFAULT_SETTINGS = {
     whatsappEnabled: true
   },
   ai: {
-    resolverEnabled: false
+    resolverEnabled: false,
+    amazonDirectEnabled: true,
+    onlyOnUncertainty: true,
+    alwaysInDebug: true
+  },
+  quality: {
+    marketCompareAmazonDirectEnabled: true,
+    marketCompareAmazonDirectOnly: true,
+    aiAmazonDirectOnly: true,
+    allowFbaThirdPartyMarketCompare: false,
+    allowFbaThirdPartyAi: false,
+    allowFbmMarketCompare: false,
+    allowFbmAi: false,
+    unknownSellerMode: 'review'
   }
 };
 
@@ -100,7 +114,29 @@ function mapSettingsRow(row = {}) {
       whatsappEnabled: parseBool(row.whatsapp_output_enabled, DEFAULT_SETTINGS.output.whatsappEnabled)
     },
     ai: {
-      resolverEnabled: parseBool(row.ai_resolver_enabled, DEFAULT_SETTINGS.ai.resolverEnabled)
+      resolverEnabled: parseBool(row.ai_resolver_enabled, DEFAULT_SETTINGS.ai.resolverEnabled),
+      amazonDirectEnabled: parseBool(row.ai_amazon_direct_enabled, DEFAULT_SETTINGS.ai.amazonDirectEnabled),
+      onlyOnUncertainty: parseBool(row.ai_only_on_uncertainty, DEFAULT_SETTINGS.ai.onlyOnUncertainty),
+      alwaysInDebug: parseBool(row.ai_always_in_debug, DEFAULT_SETTINGS.ai.alwaysInDebug)
+    },
+    quality: {
+      marketCompareAmazonDirectEnabled: parseBool(
+        row.market_compare_amazon_direct_enabled,
+        DEFAULT_SETTINGS.quality.marketCompareAmazonDirectEnabled
+      ),
+      marketCompareAmazonDirectOnly: parseBool(
+        row.market_compare_amazon_direct_only,
+        DEFAULT_SETTINGS.quality.marketCompareAmazonDirectOnly
+      ),
+      aiAmazonDirectOnly: parseBool(row.ai_amazon_direct_only, DEFAULT_SETTINGS.quality.aiAmazonDirectOnly),
+      allowFbaThirdPartyMarketCompare: parseBool(
+        row.allow_fba_market_compare,
+        DEFAULT_SETTINGS.quality.allowFbaThirdPartyMarketCompare
+      ),
+      allowFbaThirdPartyAi: parseBool(row.allow_fba_ai, DEFAULT_SETTINGS.quality.allowFbaThirdPartyAi),
+      allowFbmMarketCompare: parseBool(row.allow_fbm_market_compare, DEFAULT_SETTINGS.quality.allowFbmMarketCompare),
+      allowFbmAi: parseBool(row.allow_fbm_ai, DEFAULT_SETTINGS.quality.allowFbmAi),
+      unknownSellerMode: normalizeUnknownSellerMode(row.unknown_seller_mode || DEFAULT_SETTINGS.quality.unknownSellerMode)
     },
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null
@@ -193,7 +229,51 @@ export function saveDealEngineSettings(input = {}) {
     },
     ai: {
       resolverEnabled:
-        input?.ai?.resolverEnabled === undefined ? current.ai.resolverEnabled : parseBool(input.ai.resolverEnabled)
+        input?.ai?.resolverEnabled === undefined ? current.ai.resolverEnabled : parseBool(input.ai.resolverEnabled),
+      amazonDirectEnabled:
+        input?.ai?.amazonDirectEnabled === undefined
+          ? current.ai.amazonDirectEnabled
+          : parseBool(input.ai.amazonDirectEnabled),
+      onlyOnUncertainty:
+        input?.ai?.onlyOnUncertainty === undefined
+          ? current.ai.onlyOnUncertainty
+          : parseBool(input.ai.onlyOnUncertainty),
+      alwaysInDebug:
+        input?.ai?.alwaysInDebug === undefined ? current.ai.alwaysInDebug : parseBool(input.ai.alwaysInDebug)
+    },
+    quality: {
+      marketCompareAmazonDirectEnabled:
+        input?.quality?.marketCompareAmazonDirectEnabled === undefined
+          ? current.quality.marketCompareAmazonDirectEnabled
+          : parseBool(input.quality.marketCompareAmazonDirectEnabled),
+      marketCompareAmazonDirectOnly:
+        input?.quality?.marketCompareAmazonDirectOnly === undefined
+          ? current.quality.marketCompareAmazonDirectOnly
+          : parseBool(input.quality.marketCompareAmazonDirectOnly),
+      aiAmazonDirectOnly:
+        input?.quality?.aiAmazonDirectOnly === undefined
+          ? current.quality.aiAmazonDirectOnly
+          : parseBool(input.quality.aiAmazonDirectOnly),
+      allowFbaThirdPartyMarketCompare:
+        input?.quality?.allowFbaThirdPartyMarketCompare === undefined
+          ? current.quality.allowFbaThirdPartyMarketCompare
+          : parseBool(input.quality.allowFbaThirdPartyMarketCompare),
+      allowFbaThirdPartyAi:
+        input?.quality?.allowFbaThirdPartyAi === undefined
+          ? current.quality.allowFbaThirdPartyAi
+          : parseBool(input.quality.allowFbaThirdPartyAi),
+      allowFbmMarketCompare:
+        input?.quality?.allowFbmMarketCompare === undefined
+          ? current.quality.allowFbmMarketCompare
+          : parseBool(input.quality.allowFbmMarketCompare),
+      allowFbmAi:
+        input?.quality?.allowFbmAi === undefined
+          ? current.quality.allowFbmAi
+          : parseBool(input.quality.allowFbmAi),
+      unknownSellerMode:
+        input?.quality?.unknownSellerMode === undefined
+          ? current.quality.unknownSellerMode
+          : normalizeUnknownSellerMode(input.quality.unknownSellerMode)
     }
   };
   const timestamp = nowIso();
@@ -218,6 +298,17 @@ export function saveDealEngineSettings(input = {}) {
           telegram_output_enabled = @telegramOutputEnabled,
           whatsapp_output_enabled = @whatsappOutputEnabled,
           ai_resolver_enabled = @aiResolverEnabled,
+          ai_amazon_direct_enabled = @aiAmazonDirectEnabled,
+          ai_only_on_uncertainty = @aiOnlyOnUncertainty,
+          ai_always_in_debug = @aiAlwaysInDebug,
+          market_compare_amazon_direct_enabled = @marketCompareAmazonDirectEnabled,
+          market_compare_amazon_direct_only = @marketCompareAmazonDirectOnly,
+          ai_amazon_direct_only = @aiAmazonDirectOnly,
+          allow_fba_market_compare = @allowFbaMarketCompare,
+          allow_fba_ai = @allowFbaAi,
+          allow_fbm_market_compare = @allowFbmMarketCompare,
+          allow_fbm_ai = @allowFbmAi,
+          unknown_seller_mode = @unknownSellerMode,
           updated_at = @updatedAt
       WHERE id = 1
     `
@@ -239,6 +330,17 @@ export function saveDealEngineSettings(input = {}) {
     telegramOutputEnabled: next.output.telegramEnabled ? 1 : 0,
     whatsappOutputEnabled: next.output.whatsappEnabled ? 1 : 0,
     aiResolverEnabled: next.ai.resolverEnabled ? 1 : 0,
+    aiAmazonDirectEnabled: next.ai.amazonDirectEnabled ? 1 : 0,
+    aiOnlyOnUncertainty: next.ai.onlyOnUncertainty ? 1 : 0,
+    aiAlwaysInDebug: next.ai.alwaysInDebug ? 1 : 0,
+    marketCompareAmazonDirectEnabled: next.quality.marketCompareAmazonDirectEnabled ? 1 : 0,
+    marketCompareAmazonDirectOnly: next.quality.marketCompareAmazonDirectOnly ? 1 : 0,
+    aiAmazonDirectOnly: next.quality.aiAmazonDirectOnly ? 1 : 0,
+    allowFbaMarketCompare: next.quality.allowFbaThirdPartyMarketCompare ? 1 : 0,
+    allowFbaAi: next.quality.allowFbaThirdPartyAi ? 1 : 0,
+    allowFbmMarketCompare: next.quality.allowFbmMarketCompare ? 1 : 0,
+    allowFbmAi: next.quality.allowFbmAi ? 1 : 0,
+    unknownSellerMode: next.quality.unknownSellerMode,
     updatedAt: timestamp
   });
 
@@ -274,4 +376,3 @@ export function getRequiredMarketAdvantagePct(settings, sellerArea, dayPart) {
 }
 
 export { DEFAULT_SETTINGS as DEAL_ENGINE_DEFAULT_SETTINGS };
-

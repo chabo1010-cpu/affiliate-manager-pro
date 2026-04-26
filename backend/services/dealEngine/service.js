@@ -1,4 +1,6 @@
 import { extractKeepaFallbackMetrics } from '../keepaFakeDropService.js';
+import { logGeneratorDebug } from '../generatorFlowService.js';
+import { evaluateSellerDecisionPolicy, resolveSellerIdentity } from '../sellerClassificationService.js';
 import { getDealEngineSettings, getRequiredMarketAdvantagePct, resolveDealEngineDayPart } from './configService.js';
 import { resolveAiAssistance } from './aiResolverService.js';
 import { evaluateFakePatterns } from './fakePatternService.js';
@@ -70,6 +72,8 @@ function mapReasonMessages(reasonDetails = []) {
 function buildMarketComparisonAlias(marketResult = {}) {
   return {
     available: marketResult.available === true,
+    blocked: marketResult.blocked === true,
+    blockedReason: cleanText(marketResult.blockedReason),
     validOfferCount: Number(marketResult.validOfferCount || 0),
     invalidOfferCount: Number(marketResult.invalidOfferCount || 0),
     lowestPrice: marketResult.marketPrice ?? null,
@@ -77,6 +81,37 @@ function buildMarketComparisonAlias(marketResult = {}) {
     marketAdvantagePct: marketResult.marketAdvantagePct ?? null,
     cheapestOffer: marketResult.cheapestOffer || null,
     contradictoryPrices: marketResult.contradictoryPrices === true
+  };
+}
+
+function logDecisionFlow(tag, payload = {}) {
+  try {
+    console.info(`[${tag}]`, payload);
+  } catch {
+    console.info(`[${tag}]`);
+  }
+
+  logGeneratorDebug(tag, payload);
+}
+
+function buildSellerAnalysis(policy = {}) {
+  const seller = policy.seller || {};
+
+  return {
+    sellerClass: seller.sellerClass || 'UNKNOWN',
+    sellerType: seller.sellerType || 'UNKNOWN',
+    soldByAmazon: seller.soldByAmazon ?? null,
+    shippedByAmazon: seller.shippedByAmazon ?? null,
+    soldByAmazonLabel: seller.details?.soldByAmazonLabel || 'unbekannt',
+    shippedByAmazonLabel: seller.details?.shippedByAmazonLabel || 'unbekannt',
+    detectionSource: seller.details?.detectionSource || 'unknown',
+    detectionSources: seller.details?.detectionSources || [],
+    marketCompareAllowed: policy.marketComparison?.allowed === true,
+    marketCompareBlockedReason: policy.marketComparison?.allowed === true ? '' : cleanText(policy.marketComparison?.reason),
+    aiAllowed: policy.ai?.allowed === true,
+    aiBlockedReason: policy.ai?.allowed === true ? '' : cleanText(policy.ai?.reason),
+    unknownSellerMode: cleanText(policy.unknownSellerMode) || 'review',
+    unknownSellerAction: cleanText(policy.unknownSellerAction) || 'pass'
   };
 }
 
@@ -104,7 +139,13 @@ function normalizeDealEngineInput(input = {}) {
   const ai = typeof input.ai === 'object' && input.ai ? input.ai : {};
   const amazonPrice = parseNumber(deal.amazonPrice ?? deal.price, null);
   const referencePrice = parseNumber(deal.referencePrice, null);
-  const normalizedSellerArea = normalizeSellerArea(deal.sellerType || deal.sellerArea);
+  const sellerIdentity = resolveSellerIdentity({
+    sellerType: deal.sellerType || deal.sellerArea,
+    sellerClass: deal.sellerClass,
+    soldByAmazon: deal.soldByAmazon,
+    shippedByAmazon: deal.shippedByAmazon
+  });
+  const normalizedSellerArea = normalizeSellerArea(sellerIdentity.sellerType || deal.sellerArea);
   const keepaPayload =
     keepa.payload && typeof keepa.payload === 'object'
       ? keepa.payload
@@ -130,6 +171,10 @@ function normalizeDealEngineInput(input = {}) {
       amazonUrl: cleanText(deal.amazonUrl || deal.url),
       amazonPrice,
       sellerArea: normalizedSellerArea,
+      sellerType: sellerIdentity.sellerType,
+      sellerClass: sellerIdentity.sellerClass,
+      soldByAmazon: sellerIdentity.soldByAmazon,
+      shippedByAmazon: sellerIdentity.shippedByAmazon,
       brand: cleanText(deal.brand),
       category: cleanText(deal.category),
       variantKey: cleanText(deal.variantKey || deal.variant),
@@ -180,7 +225,16 @@ function normalizeDealEngineInput(input = {}) {
   };
 }
 
-function buildRejectAnalysis(normalized, settings, dayPart, reasons, decisionSource = 'validation', aiResolution = null, marketResult = {}) {
+function buildRejectAnalysis(
+  normalized,
+  settings,
+  dayPart,
+  reasons,
+  decisionSource = 'validation',
+  aiResolution = null,
+  marketResult = {},
+  sellerPolicy = null
+) {
   const reasonDetails = normalizeReasonDetails(reasons, 'validation_reject', 'high');
 
   return attachAnalysisAliases(
@@ -204,6 +258,7 @@ function buildRejectAnalysis(normalized, settings, dayPart, reasons, decisionSou
       fallbackUsed: false,
       aiStatus: aiResolution?.status || 'not_needed',
       fakePatternStatus: decisionSource === 'fake_pattern' ? 'reject' : 'clear',
+      seller: buildSellerAnalysis(sellerPolicy || evaluateSellerDecisionPolicy(settings, normalized.deal)),
       reasonDetails,
       flow: ['Deal kommt rein', 'Amazon-Link pruefen', 'Reject'],
       output: {
@@ -256,7 +311,78 @@ function applyFakePatternDecision({ decision, settings, fakePatterns = {}, reaso
   };
 }
 
-function finalizeMarketDecision({ normalized, settings, dayPart, marketResult, fakePatterns, aiResolution }) {
+function applyUnknownSellerPolicy({ analysis, settings, sellerPolicy }) {
+  if (!analysis || sellerPolicy?.seller?.isUnknown !== true) {
+    return analysis;
+  }
+
+  if (sellerPolicy.unknownSellerAction === 'block') {
+    const reasonDetails = mergeReasonDetails(analysis.reasonDetails, [
+      createReasonDetail('seller_unknown_block', 'Unbekannter Verkaeufer erzwingt REJECT.', 'critical')
+    ]);
+    logDecisionFlow('SELLER_UNKNOWN_REVIEW', {
+      sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+      action: 'block'
+    });
+
+    return attachAnalysisAliases(
+      {
+        ...analysis,
+        decision: 'REJECT',
+        decisionOverrideSource: 'seller_policy',
+        reasonDetails
+      },
+      analysis.market || {},
+      {
+        needed: analysis.aiNeeded === true,
+        used: analysis.aiUsed === true,
+        status: analysis.aiStatus || 'not_needed'
+      }
+    );
+  }
+
+  if (analysis.decision === 'APPROVE') {
+    const reasonDetails = mergeReasonDetails(analysis.reasonDetails, [
+      createReasonDetail(
+        'seller_unknown_review',
+        settings.global.queueEnabled
+          ? 'Unbekannter Verkaeufer zwingt den Deal in REVIEW/QUEUE.'
+          : 'Unbekannter Verkaeufer verhindert APPROVE ohne aktive Queue.',
+        'warning'
+      )
+    ]);
+    const downgradedDecision = settings.global.queueEnabled ? 'QUEUE' : 'REJECT';
+
+    logDecisionFlow('SELLER_UNKNOWN_REVIEW', {
+      sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+      downgradedDecision
+    });
+
+    return attachAnalysisAliases(
+      {
+        ...analysis,
+        decision: downgradedDecision,
+        decisionOverrideSource: 'seller_policy',
+        reasonDetails
+      },
+      analysis.market || {},
+      {
+        needed: analysis.aiNeeded === true,
+        used: analysis.aiUsed === true,
+        status: analysis.aiStatus || 'not_needed'
+      }
+    );
+  }
+
+  logDecisionFlow('SELLER_UNKNOWN_REVIEW', {
+    sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+    decision: analysis.decision
+  });
+
+  return analysis;
+}
+
+function finalizeMarketDecision({ normalized, settings, dayPart, marketResult, fakePatterns, aiResolution, sellerPolicy }) {
   const thresholdPct = getRequiredMarketAdvantagePct(settings, normalized.deal.sellerArea, dayPart);
   const reasonDetails = [
     createReasonDetail(
@@ -334,6 +460,7 @@ function finalizeMarketDecision({ normalized, settings, dayPart, marketResult, f
       fallbackUsed: false,
       aiStatus: aiResolution.status,
       fakePatternStatus: fakePatterns.status,
+      seller: buildSellerAnalysis(sellerPolicy),
       reasonDetails: fakeDecision.reasonDetails,
       market: marketResult,
       fakePatterns,
@@ -352,9 +479,20 @@ function finalizeMarketDecision({ normalized, settings, dayPart, marketResult, f
   );
 }
 
-function finalizeKeepaDecision({ normalized, settings, dayPart, marketResult, fakePatterns, aiResolution, keepaResult }) {
+function finalizeKeepaDecision({ normalized, settings, dayPart, marketResult, fakePatterns, aiResolution, keepaResult, sellerPolicy }) {
   const reasonDetails = mergeReasonDetails(
-    [createReasonDetail('keepa_fallback', 'Kein brauchbarer Marktpreis vorhanden. Keepa Fallback greift.', 'warning')],
+    [
+      createReasonDetail(
+        'keepa_fallback',
+        marketResult.blocked === true
+          ? 'Marktvergleich ist fuer diesen Seller blockiert. Keepa Fallback greift.'
+          : 'Kein brauchbarer Marktpreis vorhanden. Keepa Fallback greift.',
+        'warning'
+      ),
+      marketResult.blocked === true && marketResult.blockedReason
+        ? createReasonDetail('market_compare_blocked', marketResult.blockedReason, 'warning')
+        : null
+    ],
     keepaResult.reasons.map((message) => createReasonDetail('keepa_reason', message, 'info'))
   );
   const fakeDecision = applyFakePatternDecision({
@@ -386,6 +524,7 @@ function finalizeKeepaDecision({ normalized, settings, dayPart, marketResult, fa
       fallbackUsed: true,
       aiStatus: aiResolution.status,
       fakePatternStatus: fakePatterns.status,
+      seller: buildSellerAnalysis(sellerPolicy),
       reasonDetails: fakeDecision.reasonDetails,
       market: marketResult,
       keepa: keepaResult,
@@ -418,6 +557,9 @@ export function getDealEngineSamplePayload() {
       amazonUrl: 'https://www.amazon.de/dp/B0DDKZBYK6',
       amazonPrice: 79.99,
       sellerType: 'AMAZON',
+      sellerClass: 'AMAZON_DIRECT',
+      soldByAmazon: true,
+      shippedByAmazon: true,
       brand: 'Bosch Professional',
       category: 'Werkzeug',
       variantKey: '18v solo',
@@ -481,6 +623,7 @@ export async function analyzeDealWithEngine(input = {}) {
   const settings = getDealEngineSettings();
   const normalized = normalizeDealEngineInput(input);
   const dayPart = resolveDealEngineDayPart(settings, normalized.meta.overrideDayPart);
+  const sellerPolicy = evaluateSellerDecisionPolicy(settings, normalized.deal);
   let analysis;
   let aiResolution = {
     needed: false,
@@ -495,33 +638,155 @@ export async function analyzeDealWithEngine(input = {}) {
     marketAdvantagePct: null
   };
 
+  logDecisionFlow('DECISION_FLOW_START', {
+    title: normalized.deal.title || null,
+    asin: extractAsinFromAmazonUrl(normalized.deal.amazonUrl),
+    sellerType: sellerPolicy.seller?.sellerType || 'UNKNOWN',
+    sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN'
+  });
+  logDecisionFlow('SELLER_DETAILS', {
+    sellerType: sellerPolicy.seller?.sellerType || 'UNKNOWN',
+    sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+    soldByAmazon: sellerPolicy.seller?.soldByAmazon,
+    shippedByAmazon: sellerPolicy.seller?.shippedByAmazon,
+    soldByAmazonLabel: sellerPolicy.seller?.details?.soldByAmazonLabel || 'unbekannt',
+    shippedByAmazonLabel: sellerPolicy.seller?.details?.shippedByAmazonLabel || 'unbekannt',
+    detectionSource: sellerPolicy.seller?.details?.detectionSource || 'unknown'
+  });
+  logDecisionFlow('SELLER_TYPE_DETECTED', {
+    sellerType: sellerPolicy.seller?.sellerType || 'UNKNOWN'
+  });
+  logDecisionFlow('SELLER_CLASS_DETECTED', {
+    sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN'
+  });
+
+  if (sellerPolicy.seller?.isAmazonDirect === true) {
+    logDecisionFlow('AMAZON_DIRECT_CONFIRMED', {
+      sellerClass: sellerPolicy.seller?.sellerClass || 'AMAZON_DIRECT'
+    });
+  }
+
   if (!normalized.deal.amazonUrl || !isAmazonLink(normalized.deal.amazonUrl)) {
     analysis = buildRejectAnalysis(
       normalized,
       settings,
       dayPart,
-      [createReasonDetail('invalid_amazon_link', 'Kein gueltiger Amazon-Link vorhanden.', 'critical')]
+      [createReasonDetail('invalid_amazon_link', 'Kein gueltiger Amazon-Link vorhanden.', 'critical')],
+      'validation',
+      aiResolution,
+      marketResult,
+      sellerPolicy
     );
   } else if (normalized.deal.amazonPrice === null || normalized.deal.amazonPrice <= 0) {
     analysis = buildRejectAnalysis(
       normalized,
       settings,
       dayPart,
-      [createReasonDetail('invalid_amazon_price', 'Amazonpreis fehlt oder ist ungueltig.', 'critical')]
+      [createReasonDetail('invalid_amazon_price', 'Amazonpreis fehlt oder ist ungueltig.', 'critical')],
+      'validation',
+      aiResolution,
+      marketResult,
+      sellerPolicy
     );
   } else {
-    const preliminaryMarketResult = evaluateMarketComparison({
-      deal: normalized.deal,
-      market: normalized.market,
-      aiResolution: { resolvedOfferIds: [] }
+    const marketComparisonAllowed = sellerPolicy.marketComparison?.allowed === true;
+    let preliminaryMarketResult = {
+      status: 'market_missing',
+      available: false,
+      blocked: false,
+      blockedReason: '',
+      validOfferCount: 0,
+      invalidOfferCount: 0,
+      marketPrice: null,
+      marketAdvantagePct: null
+    };
+
+    logDecisionFlow('MARKET_COMPARE_TRIGGER', {
+      sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+      allowed: marketComparisonAllowed,
+      reason: sellerPolicy.marketComparison?.reason || ''
     });
-    aiResolution = resolveAiAssistance({
-      ai: normalized.ai,
-      market: preliminaryMarketResult,
-      settings
+
+    if (marketComparisonAllowed) {
+      logDecisionFlow('MARKET_COMPARE_ALLOWED', {
+        sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+        reason: sellerPolicy.marketComparison?.reason || ''
+      });
+      preliminaryMarketResult = evaluateMarketComparison({
+        deal: normalized.deal,
+        market: normalized.market,
+        aiResolution: { resolvedOfferIds: [] }
+      });
+    } else {
+      marketResult = {
+        status: 'blocked_by_seller_policy',
+        available: false,
+        blocked: true,
+        blockedReason: sellerPolicy.marketComparison?.reason || 'Marktvergleich blockiert.',
+        validOfferCount: 0,
+        invalidOfferCount: 0,
+        marketPrice: null,
+        marketAdvantagePct: null,
+        contradictoryPrices: false,
+        uncertaintyHints: {
+          multipleSimilarHits: false,
+          contradictoryPrices: false,
+          invalidVariantCount: 0
+        }
+      };
+      preliminaryMarketResult = marketResult;
+      logDecisionFlow('MARKET_COMPARE_BLOCKED', {
+        sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+        reason: sellerPolicy.marketComparison?.reason || ''
+      });
+    }
+
+    if (marketComparisonAllowed) {
+      if (sellerPolicy.ai?.allowed === true) {
+        logDecisionFlow('AI_ALLOWED', {
+          sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+          reason: sellerPolicy.ai?.reason || ''
+        });
+        aiResolution = resolveAiAssistance({
+          ai: normalized.ai,
+          market: preliminaryMarketResult,
+          settings
+        });
+      } else {
+        aiResolution = {
+          needed: false,
+          used: false,
+          status: 'blocked_by_seller_policy',
+          reason: sellerPolicy.ai?.reason || 'KI blockiert.'
+        };
+        logDecisionFlow('AI_BLOCKED', {
+          sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+          reason: sellerPolicy.ai?.reason || ''
+        });
+      }
+    } else {
+      aiResolution = {
+        needed: false,
+        used: false,
+        status: 'blocked_by_seller_policy',
+        reason: 'KI blockiert, weil Marktvergleich fuer diesen Seller nicht laufen darf.'
+      };
+      logDecisionFlow('AI_BLOCKED', {
+        sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+        reason: aiResolution.reason
+      });
+    }
+
+    logDecisionFlow('AI_TRIGGER_REASON', {
+      sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+      needed: aiResolution.needed === true,
+      used: aiResolution.used === true,
+      status: aiResolution.status,
+      reason: aiResolution.reason || ''
     });
+
     marketResult =
-      aiResolution.used || aiResolution.needed
+      marketComparisonAllowed && (aiResolution.used || aiResolution.needed)
         ? evaluateMarketComparison({
             deal: normalized.deal,
             market: normalized.market,
@@ -541,13 +806,15 @@ export async function analyzeDealWithEngine(input = {}) {
         dayPart,
         marketResult,
         fakePatterns,
-        aiResolution
+        aiResolution,
+        sellerPolicy
       });
     } else {
       const strictMarketRequired =
-        (settings.global.requireMarketForCheapProducts &&
+        marketComparisonAllowed &&
+        ((settings.global.requireMarketForCheapProducts &&
           normalized.deal.amazonPrice < settings.global.cheapProductLimit) ||
-        (settings.global.requireMarketForNoNameProducts && (normalized.deal.isNoName || normalized.deal.isChinaProduct));
+          (settings.global.requireMarketForNoNameProducts && (normalized.deal.isNoName || normalized.deal.isChinaProduct)));
 
       if (strictMarketRequired) {
         const baseReason =
@@ -562,13 +829,20 @@ export async function analyzeDealWithEngine(input = {}) {
                 'No-Name- oder China-Produkte benoetigen zwingend einen brauchbaren Internetvergleich.',
                 'critical'
               );
-        analysis = buildRejectAnalysis(normalized, settings, dayPart, [baseReason], 'validation', aiResolution, marketResult);
+        analysis = buildRejectAnalysis(normalized, settings, dayPart, [baseReason], 'validation', aiResolution, marketResult, sellerPolicy);
         analysis.fakePatternStatus = fakePatterns.status;
         analysis.market = marketResult;
         analysis.fakePatterns = fakePatterns;
         analysis.reasonDetails = mergeReasonDetails(analysis.reasonDetails, fakePatterns.reasonDetails || []);
         analysis = attachAnalysisAliases(analysis, marketResult, aiResolution);
       } else {
+        logDecisionFlow('KEEPA_FALLBACK_TRIGGER', {
+          sellerClass: sellerPolicy.seller?.sellerClass || 'UNKNOWN',
+          reason:
+            marketResult.blocked === true
+              ? marketResult.blockedReason || 'Marktvergleich blockiert.'
+              : 'Kein brauchbarer Marktpreis vorhanden.'
+        });
         const keepaResult = evaluateKeepaFallback({
           deal: normalized.deal,
           keepa: normalized.keepa,
@@ -583,11 +857,18 @@ export async function analyzeDealWithEngine(input = {}) {
           marketResult,
           fakePatterns,
           aiResolution,
-          keepaResult
+          keepaResult,
+          sellerPolicy
         });
       }
     }
   }
+
+  analysis = applyUnknownSellerPolicy({
+    analysis,
+    settings,
+    sellerPolicy
+  });
 
   let output;
   try {

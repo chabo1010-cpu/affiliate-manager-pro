@@ -167,6 +167,12 @@
   gap: 0.35rem;
 }
 
+.engine-settings-section {
+  display: grid;
+  gap: 0.2rem;
+  padding-top: 0.4rem;
+}
+
 .engine-settings-grid label span,
 .engine-form-grid label span {
   color: #9db0c7;
@@ -275,4 +281,3 @@
     width: 100%;
   }
 }
-

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { getAmazonAffiliateStatus, loadAmazonAffiliateContext, runAmazonAffiliateApiTest } from '../services/amazonAffiliateService.js';
 import { classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
 import { logGeneratorDebug } from '../services/generatorFlowService.js';
+import { extractSellerSignalsFromText, resolveSellerIdentity } from '../services/sellerClassificationService.js';
 
 const router = Router();
 const AMAZON_FETCH_HEADERS = {
@@ -337,6 +338,17 @@ function normalizeDealImageUrl(imageUrl) {
   return imageUrl;
 }
 
+function normalizeAnalysisText(value = '') {
+  const normalized = decodeHtml(String(value || ''))
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return normalized;
+}
+
 function extractAmazonTitle(html) {
   return extractFirstMatch(html, [
     /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
@@ -453,6 +465,181 @@ function stripHtml(value) {
   return decodeHtml(value.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' '))
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+const SELLER_SOURCE_CONFIGS = [
+  {
+    id: 'merchantInfo_feature_div',
+    source: 'merchant-info',
+    windowSize: 2600
+  },
+  {
+    id: 'merchant-info',
+    source: 'merchant-info',
+    windowSize: 2600
+  },
+  {
+    id: 'desktop_merchantInfo_feature_div',
+    source: 'merchant-info',
+    windowSize: 2600
+  },
+  {
+    id: 'sellerProfileTriggerId',
+    source: 'seller-profile',
+    windowSize: 1200
+  },
+  {
+    id: 'shipsFromSoldByInsideBuyBox_feature_div',
+    source: 'buybox',
+    windowSize: 3200
+  },
+  {
+    id: 'shipsFromSoldBy_feature_div',
+    source: 'buybox',
+    windowSize: 2600
+  },
+  {
+    id: 'tabular-buybox',
+    source: 'tabular-buybox',
+    windowSize: 3200
+  },
+  {
+    id: 'offerDisplayFeature_feature_div',
+    source: 'offer-display',
+    windowSize: 3600
+  },
+  {
+    id: 'buybox',
+    source: 'buybox',
+    windowSize: 4200
+  },
+  {
+    id: 'desktop_buybox',
+    source: 'desktop-buybox',
+    windowSize: 4200
+  }
+];
+const SELLER_FALLBACK_TEXT_PATTERN =
+  /verkauf(?:t)? und versand(?:et)? durch amazon|verkauf(?:t)? durch amazon|verkauft von amazon|verk(?:ä|ae)ufer\s*:?\s*amazon|versand durch amazon|versendet von amazon|ships from amazon|sold by amazon|dispatched from amazon|dispatches from amazon|fulfilled by amazon|amazon\.de/gi;
+const SELLER_LOG_TEXT_LIMIT = 700;
+
+function escapeRegex(value = '') {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function uniqueStrings(values = []) {
+  return values
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean)
+    .filter((value, index, allValues) => allValues.indexOf(value) === index);
+}
+
+function extractHtmlWindowsById(html = '', id = '', { windowSize = 3200, limit = 2 } = {}) {
+  if (!html || !id) {
+    return [];
+  }
+
+  const pattern = new RegExp(`<[^>]+id=["']${escapeRegex(id)}["'][^>]*>`, 'gi');
+  const snippets = [];
+  let match = pattern.exec(html);
+
+  while (match && snippets.length < limit) {
+    const startIndex = Math.max(0, match.index);
+    const endIndex = Math.min(html.length, startIndex + match[0].length + windowSize);
+    snippets.push(html.slice(startIndex, endIndex));
+    match = pattern.exec(html);
+  }
+
+  return snippets;
+}
+
+function extractFallbackSellerTextCandidates(text = '') {
+  if (!text) {
+    return [];
+  }
+
+  const windows = [];
+  SELLER_FALLBACK_TEXT_PATTERN.lastIndex = 0;
+  let match = SELLER_FALLBACK_TEXT_PATTERN.exec(text);
+
+  while (match) {
+    const startIndex = Math.max(0, match.index - 120);
+    const endIndex = Math.min(text.length, match.index + String(match[0] || '').length + 180);
+    windows.push(text.slice(startIndex, endIndex).trim());
+    match = SELLER_FALLBACK_TEXT_PATTERN.exec(text);
+  }
+
+  return uniqueStrings(windows).slice(0, 6);
+}
+
+function scoreSellerCandidateAnalysis(analysis = {}) {
+  const signals = analysis.signals || {};
+  let score = 0;
+
+  if (signals.hasAmazonDirectPhrase === true) {
+    score += 12;
+  }
+
+  if (signals.soldByAmazon !== null) {
+    score += 4;
+  }
+
+  if (signals.shippedByAmazon !== null) {
+    score += 4;
+  }
+
+  score += Math.min(6, Array.isArray(signals.matchedPatterns) ? signals.matchedPatterns.length : 0);
+
+  if (analysis.source === 'merchant-info') {
+    score += 4;
+  } else if (analysis.source === 'buybox' || analysis.source === 'tabular-buybox') {
+    score += 3;
+  } else if (analysis.source === 'offer-display' || analysis.source === 'desktop-buybox') {
+    score += 2;
+  } else if (analysis.source === 'seller-profile') {
+    score += 1;
+  }
+
+  return score;
+}
+
+function collectSellerDetectionCandidates(html = '') {
+  const candidates = [];
+  const strippedHtml = stripHtml(html);
+
+  for (const config of SELLER_SOURCE_CONFIGS) {
+    const snippets = extractHtmlWindowsById(html, config.id, {
+      windowSize: config.windowSize,
+      limit: 2
+    });
+
+    for (const snippet of snippets) {
+      const text = stripHtml(snippet).slice(0, 1200).trim();
+      if (!text) {
+        continue;
+      }
+
+      candidates.push({
+        source: config.source,
+        sourceId: config.id,
+        text
+      });
+    }
+  }
+
+  for (const text of extractFallbackSellerTextCandidates(strippedHtml)) {
+    candidates.push({
+      source: 'fallback-text',
+      sourceId: 'fallback-text',
+      text
+    });
+  }
+
+  return candidates.filter((candidate, index, allCandidates) => {
+    return (
+      allCandidates.findIndex((entry) => entry.source === candidate.source && entry.text === candidate.text) === index
+    );
+  });
 }
 
 function extractCouponDetails(html) {
@@ -627,25 +814,317 @@ function extractAmazonBulletPoints(html) {
     .slice(0, 6);
 }
 
-function extractSellerInfo(html) {
-  const merchantChunk = extractFirstMatch(html, [
-    /<div[^>]+id=["']merchantInfo_feature_div["'][^>]*>([\s\S]*?)<\/div>/i,
-    /<div[^>]+id=["']merchant-info["'][^>]*>([\s\S]*?)<\/div>/i
-  ]);
+export function extractSellerInfoFromAmazonHtml(html = '') {
+  const candidateAnalyses = collectSellerDetectionCandidates(html)
+    .map((candidate) => {
+      const signals = extractSellerSignalsFromText(candidate.text, {
+        detectionSource: candidate.source
+      });
 
-  const merchantText = stripHtml(merchantChunk || html);
+      return {
+        ...candidate,
+        signals,
+        score: 0
+      };
+    })
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreSellerCandidateAnalysis(candidate)
+    }));
+
+  const bestCandidate = [...candidateAnalyses].sort((left, right) => right.score - left.score)[0] || null;
+  const matchedCandidates = candidateAnalyses.filter((candidate) => {
+    return (
+      candidate.signals.hasAmazonDirectPhrase === true ||
+      candidate.signals.soldByAmazon !== null ||
+      candidate.signals.shippedByAmazon !== null ||
+      (candidate.signals.matchedPatterns || []).length > 0
+    );
+  });
+  const combinedAmazonMatchedCandidates = matchedCandidates.filter((candidate) => candidate.signals.hasCombinedAmazonMatch === true);
   const soldByAmazon =
-    /verkauf und versand durch amazon/i.test(merchantText) ||
-    /sold by amazon/i.test(merchantText);
+    matchedCandidates.some((candidate) => candidate.signals.hasAmazonDirectPhrase === true || candidate.signals.soldByAmazon === true)
+      ? true
+      : matchedCandidates.some((candidate) => candidate.signals.soldByAmazon === false)
+        ? false
+        : null;
   const shippedByAmazon =
-    soldByAmazon ||
-    /versand durch amazon/i.test(merchantText) ||
-    /fulfilled by amazon/i.test(merchantText) ||
-    /ships from amazon/i.test(merchantText);
+    matchedCandidates.some(
+      (candidate) => candidate.signals.hasAmazonDirectPhrase === true || candidate.signals.shippedByAmazon === true
+    )
+      ? true
+      : matchedCandidates.some((candidate) => candidate.signals.shippedByAmazon === false)
+        ? false
+        : null;
+  const matchedPatterns = uniqueStrings(matchedCandidates.flatMap((candidate) => candidate.signals.matchedPatterns || []));
+  const matchedCombinedAmazonPatterns = uniqueStrings(
+    combinedAmazonMatchedCandidates.flatMap((candidate) => candidate.signals.matchedDirectAmazonPatterns || [])
+  );
+  const contributingSources = uniqueStrings(
+    matchedCandidates
+      .filter((candidate) => {
+        if (candidate.signals.hasAmazonDirectPhrase === true) {
+          return true;
+        }
+
+        if (soldByAmazon === true && candidate.signals.soldByAmazon === true) {
+          return true;
+        }
+
+        if (soldByAmazon === false && candidate.signals.soldByAmazon === false) {
+          return true;
+        }
+
+        if (shippedByAmazon === true && candidate.signals.shippedByAmazon === true) {
+          return true;
+        }
+
+        if (shippedByAmazon === false && candidate.signals.shippedByAmazon === false) {
+          return true;
+        }
+
+        return false;
+      })
+      .map((candidate) => candidate.source)
+  );
+  const rawDetectionSources = contributingSources.length ? contributingSources : bestCandidate?.source ? [bestCandidate.source] : [];
+  const detectionSources =
+    rawDetectionSources.some((source) => source !== 'fallback-text')
+      ? rawDetectionSources.filter((source) => source !== 'fallback-text')
+      : rawDetectionSources;
+  const hasCombinedAmazonMatch = combinedAmazonMatchedCandidates.length > 0;
+  const sellerDetectionSource = hasCombinedAmazonMatch
+    ? 'combined-seller-shipping-text'
+    : detectionSources.join(' + ') || 'unknown';
+  const sellerIdentity = resolveSellerIdentity({
+    soldByAmazon,
+    shippedByAmazon,
+    sellerDetectionSource,
+    detectionSources,
+    matchedPatterns,
+    sellerDetails: {
+      merchantText: bestCandidate?.signals?.merchantText || '',
+      detectionSource: sellerDetectionSource,
+      detectionSources,
+      matchedPatterns,
+      matchedDirectAmazonPatterns: matchedCombinedAmazonPatterns,
+      hasCombinedAmazonMatch
+    }
+  });
 
   return {
-    sellerType: classifySellerType({ soldByAmazon, shippedByAmazon })
+    sellerType: classifySellerType({
+      soldByAmazon,
+      shippedByAmazon
+    }),
+    sellerClass: sellerIdentity.sellerClass,
+    soldByAmazon: sellerIdentity.soldByAmazon,
+    shippedByAmazon: sellerIdentity.shippedByAmazon,
+    sellerDetails: {
+      ...sellerIdentity.details,
+      merchantText: bestCandidate?.signals?.merchantText || '',
+      detectionSource: sellerDetectionSource,
+      detectionSources,
+      matchedPatterns,
+      matchedDirectAmazonPatterns: matchedCombinedAmazonPatterns,
+      hasCombinedAmazonMatch
+    },
+    sellerDebug: {
+      rawText: bestCandidate?.signals?.merchantText || '',
+      rawTextPreview: (bestCandidate?.signals?.merchantText || '').slice(0, SELLER_LOG_TEXT_LIMIT),
+      matchedPatterns,
+      matchedCombinedAmazonPatterns,
+      hasCombinedAmazonMatch,
+      detectionSources,
+      candidateCount: candidateAnalyses.length,
+      matchedCandidates: matchedCandidates.map((candidate) => ({
+        source: candidate.source,
+        sourceId: candidate.sourceId,
+        score: candidate.score,
+        soldByAmazon: candidate.signals.soldByAmazon,
+        shippedByAmazon: candidate.signals.shippedByAmazon,
+        matchedPatterns: candidate.signals.matchedPatterns || [],
+        textPreview: (candidate.signals.merchantText || '').slice(0, SELLER_LOG_TEXT_LIMIT)
+      }))
+    }
   };
+}
+
+function extractSellerProfileUrl(html = '', baseUrl = '') {
+  const directMatch = extractFirstMatch(html, [
+    /<a[^>]+id=["']sellerProfileTriggerId["'][^>]+href=["']([^"']+)["']/i,
+    /<a[^>]+href=["']([^"']*(?:\/sp\?|seller=|\/gp\/help\/seller\/)[^"']*)["'][^>]*id=["']sellerProfileTriggerId["'][^>]*>/i,
+    /<a[^>]+href=["']([^"']*(?:\/sp\?|seller=|\/gp\/help\/seller\/)[^"']*)["'][^>]*>/i
+  ]);
+
+  return resolveUrlCandidate(directMatch, baseUrl);
+}
+
+function convertSellerPeriodToMonths(rawAmount = '', rawUnit = '') {
+  const amount = Number.parseInt(String(rawAmount || '').trim(), 10);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+
+  const normalizedUnit = normalizeAnalysisText(rawUnit);
+  if (normalizedUnit.startsWith('jahr')) {
+    return amount * 12;
+  }
+
+  if (normalizedUnit.startsWith('monat')) {
+    return amount;
+  }
+
+  return null;
+}
+
+export function extractFbmSellerProfileFromHtml(html = '') {
+  const sellerName = stripHtml(
+    extractFirstMatch(html, [
+      /<span[^>]+id=["']sellerName["'][^>]*>([\s\S]*?)<\/span>/i,
+      /<h1[^>]*>([\s\S]*?)<\/h1>/i,
+      /<title>\s*([^<]+?)\s*<\/title>/i
+    ])
+  );
+  const strippedText = stripHtml(html);
+  const normalizedText = normalizeAnalysisText(strippedText);
+  const percentMatch =
+    normalizedText.match(/(\d{1,3})\s*%\s*positive bewertungen/) ||
+    normalizedText.match(/(\d{1,3})\s*%\s*positive ratings/);
+  const periodMatch =
+    normalizedText.match(/letzten\s+(\d{1,2})\s+(monat|monaten|jahr|jahren)/) ||
+    normalizedText.match(/last\s+(\d{1,2})\s+(month|months|year|years)/);
+  const positivePercent = percentMatch ? Number.parseInt(percentMatch[1], 10) : null;
+  const periodMonths = periodMatch ? convertSellerPeriodToMonths(periodMatch[1], periodMatch[2]) : null;
+  const periodLabel = periodMonths !== null ? `${periodMonths} Monate` : '';
+  const profileOk = positivePercent !== null && periodMonths !== null && positivePercent >= 80 && periodMonths >= 12;
+  const hasProfileData = positivePercent !== null || periodMonths !== null;
+  const reason = profileOk
+    ? 'FBM-Haendlerprofil erfuellt mindestens 80% positive Bewertungen und 12 Monate Historie.'
+    : positivePercent === null && periodMonths === null
+      ? 'Keine verwertbaren FBM-Haendlerprofil-Daten gefunden.'
+      : positivePercent !== null && positivePercent < 80
+        ? `FBM-Haendlerprofil blockiert: nur ${positivePercent}% positive Bewertungen.`
+        : periodMonths !== null && periodMonths < 12
+          ? `FBM-Haendlerprofil blockiert: nur ${periodMonths} Monate Historie.`
+          : 'FBM-Haendlerprofil unvollstaendig.';
+
+  return {
+    required: true,
+    checked: true,
+    status: profileOk ? 'ok' : hasProfileData ? 'blocked' : 'missing',
+    sellerName,
+    positivePercent,
+    periodMonths,
+    periodLabel,
+    profileOk,
+    fbmAllowed: profileOk,
+    hasProfileData,
+    reason
+  };
+}
+
+async function loadFbmSellerProfileContext({ html = '', baseUrl = '', asin = '' } = {}) {
+  const sellerProfileUrl = extractSellerProfileUrl(html, baseUrl);
+
+  if (!sellerProfileUrl) {
+    console.info('[FBM_SELLER_PROFILE_BLOCKED]', {
+      asin,
+      reason: 'Kein Haendlerprofil-Link auf der Amazon-Seite gefunden.'
+    });
+    return {
+      required: true,
+      checked: false,
+      status: 'missing',
+      sellerName: '',
+      positivePercent: null,
+      periodMonths: null,
+      periodLabel: '',
+      profileOk: false,
+      fbmAllowed: false,
+      hasProfileData: false,
+      profileUrl: '',
+      reason: 'Kein Haendlerprofil-Link gefunden.'
+    };
+  }
+
+  console.info('[FBM_SELLER_PROFILE_CHECK_START]', {
+    asin,
+    sellerProfileUrl
+  });
+
+  try {
+    const response = await fetch(sellerProfileUrl, {
+      headers: AMAZON_FETCH_HEADERS
+    });
+    const profileHtml = await response.text();
+
+    if (response.status === 403 || /captcha|robot check|sorry/i.test(profileHtml)) {
+      throw new Error('Amazon blockiert das FBM-Haendlerprofil.');
+    }
+
+    if (!response.ok) {
+      throw new Error(`FBM-Haendlerprofil konnte nicht geladen werden (${response.status}).`);
+    }
+
+    const sellerProfile = extractFbmSellerProfileFromHtml(profileHtml);
+    if (sellerProfile.positivePercent !== null) {
+      console.info('[FBM_SELLER_RATING_FOUND]', {
+        asin,
+        sellerProfileUrl,
+        positivePercent: sellerProfile.positivePercent
+      });
+    }
+    if (sellerProfile.periodMonths !== null) {
+      console.info('[FBM_SELLER_PERIOD_FOUND]', {
+        asin,
+        sellerProfileUrl,
+        periodMonths: sellerProfile.periodMonths
+      });
+    }
+    if (sellerProfile.profileOk === true) {
+      console.info('[FBM_SELLER_PROFILE_OK]', {
+        asin,
+        sellerProfileUrl,
+        positivePercent: sellerProfile.positivePercent,
+        periodMonths: sellerProfile.periodMonths
+      });
+    } else {
+      console.info('[FBM_SELLER_PROFILE_BLOCKED]', {
+        asin,
+        sellerProfileUrl,
+        positivePercent: sellerProfile.positivePercent,
+        periodMonths: sellerProfile.periodMonths,
+        reason: sellerProfile.reason
+      });
+    }
+
+    return {
+      ...sellerProfile,
+      profileUrl: sellerProfileUrl
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'FBM-Haendlerprofil konnte nicht geprueft werden.';
+    console.info('[FBM_SELLER_PROFILE_BLOCKED]', {
+      asin,
+      sellerProfileUrl,
+      reason
+    });
+    return {
+      required: true,
+      checked: false,
+      status: 'error',
+      sellerName: '',
+      positivePercent: null,
+      periodMonths: null,
+      periodLabel: '',
+      profileOk: false,
+      fbmAllowed: false,
+      hasProfileData: false,
+      profileUrl: sellerProfileUrl,
+      reason
+    };
+  }
 }
 
 export async function scrapeAmazonProduct(inputUrl = '') {
@@ -707,7 +1186,28 @@ export async function scrapeAmazonProduct(inputUrl = '') {
   const finalUrl = canonicalUrl || resolvedUrl || trimmedUrl;
   const asin = extractAsin(canonicalUrl) || extractAsin(resolvedUrl) || extractAsin(trimmedUrl) || '';
   const normalizedUrl = normalizeAmazonLink(finalUrl);
-  const sellerInfo = extractSellerInfo(html);
+  const sellerInfo = extractSellerInfoFromAmazonHtml(html);
+  const sellerProfile =
+    sellerInfo.sellerClass === 'FBM_THIRDPARTY'
+      ? await loadFbmSellerProfileContext({
+          html,
+          baseUrl: finalUrl,
+          asin
+        })
+      : {
+          required: false,
+          checked: false,
+          status: 'not_needed',
+          sellerName: '',
+          positivePercent: null,
+          periodMonths: null,
+          periodLabel: '',
+          profileOk: false,
+          fbmAllowed: false,
+          hasProfileData: false,
+          profileUrl: '',
+          reason: 'Haendlerprofil fuer diesen Seller-Typ nicht noetig.'
+        };
   const paapiContext = asin ? await loadAmazonAffiliateContext({ asin }) : null;
   const paapiImage = paapiContext?.available ? paapiContext.result?.imageUrl || '' : '';
   const imageResolution = resolveAmazonImage(html, {
@@ -752,12 +1252,63 @@ export async function scrapeAmazonProduct(inputUrl = '') {
     resolvedUrl,
     asin,
     sellerType: sellerInfo.sellerType,
+    sellerClass: sellerInfo.sellerClass,
+    soldByAmazon: sellerInfo.soldByAmazon,
+    shippedByAmazon: sellerInfo.shippedByAmazon,
     hasImage: Boolean(finalImageUrl),
     normalizedUrl,
     finalImageUrl,
     selectedImageSource: imageResolution.selectedSource,
     reasonIfMissing: imageResolution.reasonIfMissing
   });
+  console.info('[SELLER_DETAILS]', {
+    asin,
+    sellerType: sellerInfo.sellerType,
+    sellerClass: sellerInfo.sellerClass,
+    soldByAmazon: sellerInfo.soldByAmazon,
+    shippedByAmazon: sellerInfo.shippedByAmazon,
+    merchantText: sellerInfo.sellerDetails?.merchantText || '',
+    detectionSource: sellerInfo.sellerDetails?.detectionSource || 'unknown'
+  });
+  console.info('[SELLER_RAW_TEXT]', {
+    asin,
+    detectionSource: sellerInfo.sellerDetails?.detectionSource || 'unknown',
+    rawText: sellerInfo.sellerDebug?.rawTextPreview || ''
+  });
+  if (sellerInfo.sellerDebug?.hasCombinedAmazonMatch === true) {
+    console.info('[SELLER_COMBINED_AMAZON_MATCH]', {
+      asin,
+      detectionSource: sellerInfo.sellerDetails?.detectionSource || 'unknown',
+      matchedCombinedAmazonPatterns: sellerInfo.sellerDebug?.matchedCombinedAmazonPatterns || [],
+      rawText: sellerInfo.sellerDebug?.rawTextPreview || ''
+    });
+  }
+  console.info('[SELLER_TEXT_MATCHED]', {
+    asin,
+    sellerClass: sellerInfo.sellerClass,
+    matchedPatterns: sellerInfo.sellerDetails?.matchedPatterns || [],
+    matchedCandidates: sellerInfo.sellerDebug?.matchedCandidates || []
+  });
+  console.info('[SELLER_TYPE_DETECTED]', {
+    asin,
+    sellerType: sellerInfo.sellerType
+  });
+  console.info('[SELLER_CLASS_DETECTED]', {
+    asin,
+    sellerClass: sellerInfo.sellerClass
+  });
+  console.info('[SELLER_DETECTION_SOURCE]', {
+    asin,
+    detectionSource: sellerInfo.sellerDetails?.detectionSource || 'unknown',
+    detectionSources: sellerInfo.sellerDetails?.detectionSources || []
+  });
+  if (sellerInfo.sellerClass === 'AMAZON_DIRECT') {
+    console.info('[AMAZON_DIRECT_CONFIRMED]', {
+      asin,
+      sellerClass: sellerInfo.sellerClass,
+      detectionSource: sellerInfo.sellerDetails?.detectionSource || 'unknown'
+    });
+  }
 
   return {
     success: true,
@@ -789,6 +1340,14 @@ export async function scrapeAmazonProduct(inputUrl = '') {
     originalUrl: trimmedUrl,
     normalizedUrl,
     sellerType: sellerInfo.sellerType,
+    sellerClass: sellerInfo.sellerClass,
+    soldByAmazon: sellerInfo.soldByAmazon,
+    shippedByAmazon: sellerInfo.shippedByAmazon,
+    sellerDetails: {
+      ...(sellerInfo.sellerDetails || {}),
+      sellerProfile
+    },
+    sellerProfile,
     imageDebug
   };
 }

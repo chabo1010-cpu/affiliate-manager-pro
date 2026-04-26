@@ -111,6 +111,9 @@ router.post('/check', async (req, res) => {
     asin = '',
     normalizedUrl = '',
     sellerType = '',
+    sellerClass = '',
+    soldByAmazon = null,
+    shippedByAmazon = null,
     currentPrice = '',
     title = '',
     imageUrl = '',
@@ -121,6 +124,9 @@ router.post('/check', async (req, res) => {
     asin: typeof asin === 'string' ? asin.trim() : '',
     normalizedUrl: typeof normalizedUrl === 'string' ? normalizedUrl.trim() : '',
     sellerType: typeof sellerType === 'string' ? sellerType.trim() : '',
+    sellerClass: typeof sellerClass === 'string' ? sellerClass.trim() : '',
+    soldByAmazon,
+    shippedByAmazon,
     currentPrice,
     title: typeof title === 'string' ? title.trim() : '',
     imageUrl: typeof imageUrl === 'string' ? imageUrl.trim() : '',
@@ -173,13 +179,16 @@ router.post('/check', async (req, res) => {
     lastPostedAt: result.lastDeal?.postedAt || null,
     minPrice: result.minPrice ?? null,
     maxPrice: result.maxPrice ?? null,
-    sellerType: result.lastDeal?.sellerType || null,
+    sellerType: requestPayload.sellerType || result.lastDeal?.sellerType || null,
     remainingSeconds: Number.isFinite(result.remainingSeconds) ? result.remainingSeconds : 0,
     postingCount: result.postingCount ?? 0,
     asin: result.asin || null,
     dealHash: result.dealHash || null,
     normalizedUrl: result.normalizedUrl || null,
     resolvedFinalUrl: identity.resolvedFinalUrl || null,
+    sellerClass: requestPayload.sellerClass || null,
+    soldByAmazon: requestPayload.soldByAmazon,
+    shippedByAmazon: requestPayload.shippedByAmazon,
     lastDeal: result.lastDeal || null,
     activeRegistryLock: result.activeRegistryLock || null,
     generatorContext: null,
@@ -191,6 +200,9 @@ router.post('/check', async (req, res) => {
       responsePayload.generatorContext = await buildGeneratorDealContext({
         asin: responsePayload.asin || identity.asin || '',
         sellerType: requestPayload.sellerType || responsePayload.sellerType || 'FBM',
+        sellerClass: requestPayload.sellerClass || '',
+        soldByAmazon: requestPayload.soldByAmazon,
+        shippedByAmazon: requestPayload.shippedByAmazon,
         currentPrice: requestPayload.currentPrice || result.lastDeal?.currentPrice || '',
         title: requestPayload.title || result.lastDeal?.title || '',
         productUrl: responsePayload.resolvedFinalUrl || responsePayload.normalizedUrl || requestPayload.url,
@@ -198,10 +210,20 @@ router.post('/check', async (req, res) => {
         source: 'generator_check'
       });
       responsePayload.generatorContextPending = false;
+      responsePayload.sellerClass = responsePayload.generatorContext?.seller?.sellerClass || responsePayload.sellerClass;
+      responsePayload.soldByAmazon =
+        responsePayload.generatorContext?.seller?.soldByAmazon ?? responsePayload.soldByAmazon ?? null;
+      responsePayload.shippedByAmazon =
+        responsePayload.generatorContext?.seller?.shippedByAmazon ?? responsePayload.shippedByAmazon ?? null;
     } catch (error) {
       responsePayload.generatorContext = {
         asin: responsePayload.asin || identity.asin || '',
         sellerType: responsePayload.sellerType || 'FBM',
+        seller: {
+          sellerClass: responsePayload.sellerClass || 'UNKNOWN',
+          soldByAmazon: responsePayload.soldByAmazon ?? null,
+          shippedByAmazon: responsePayload.shippedByAmazon ?? null
+        },
         keepa: {
           available: false,
           status: 'error',

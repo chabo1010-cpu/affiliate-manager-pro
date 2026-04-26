@@ -1,7 +1,7 @@
 import './env.js';
 import express from 'express';
 import cors from 'cors';
-import { getApiPort } from './env.js';
+import { getApiPort, getReaderRuntimeConfig, getTelegramTestGroupConfig, getTelegramUserReaderConfig } from './env.js';
 import authRoutes from './routes/auth.js';
 import botRoutes from './routes/bot.js';
 import copybotRoutes from './routes/copybot.js';
@@ -32,6 +32,22 @@ console.info('[BOOT_START]', {
 
 const app = express();
 const port = getApiPort();
+const readerRuntimeConfig = getReaderRuntimeConfig();
+const telegramUserReaderConfig = getTelegramUserReaderConfig();
+const telegramTestGroupConfig = getTelegramTestGroupConfig();
+
+console.info('[BOOT_ENV_FLAGS]', {
+  port,
+  readerTestMode: readerRuntimeConfig.readerTestMode === true,
+  readerDebugMode: readerRuntimeConfig.readerDebugMode === true,
+  allowRawReaderFallback: readerRuntimeConfig.allowRawReaderFallback === true,
+  dealLockBypass: readerRuntimeConfig.dealLockBypass === true,
+  telegramUserReaderEnabled: telegramUserReaderConfig.enabled === true,
+  telegramUserApiConfigured: Boolean(telegramUserReaderConfig.apiId && telegramUserReaderConfig.apiHash),
+  telegramSessionDirConfigured: Boolean(telegramUserReaderConfig.sessionDir),
+  telegramTestChatConfigured: Boolean(telegramTestGroupConfig.chatId),
+  telegramBotTokenConfigured: Boolean(telegramTestGroupConfig.token)
+});
 
 const allowedOrigins = new Set([
   'http://localhost:5173',
@@ -106,6 +122,10 @@ startKeepaScheduler();
 startPublishingWorkerLoop();
 startAdvertisingScheduler();
 void startTelegramUserReaderRuntime().catch((error) => {
+  console.warn('[NO_POST_REASON]', {
+    reason: 'Reader nicht aktiv',
+    detail: error instanceof Error ? error.message : 'Telegram runtime bootstrap failed.'
+  });
   console.error('Telegram runtime bootstrap failed', error);
 });
 
@@ -131,6 +151,10 @@ const server = app.listen(port, () => {
 });
 
 server.on('error', (error) => {
+  console.warn('[NO_POST_REASON]', {
+    reason: 'Backend läuft nicht',
+    detail: error instanceof Error ? error.message : 'Backend konnte den Port nicht binden.'
+  });
   console.error('[BOOT_FATAL_ERROR]', {
     port,
     reason: error instanceof Error ? error.message : 'Backend konnte den Port nicht binden.'

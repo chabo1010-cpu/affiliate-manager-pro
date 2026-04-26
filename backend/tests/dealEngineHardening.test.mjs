@@ -102,7 +102,18 @@ function resetState() {
       UPDATE deal_engine_settings
       SET telegram_output_enabled = 0,
           whatsapp_output_enabled = 0,
-          ai_resolver_enabled = 0
+          ai_resolver_enabled = 0,
+          ai_amazon_direct_enabled = 1,
+          ai_only_on_uncertainty = 1,
+          ai_always_in_debug = 1,
+          market_compare_amazon_direct_enabled = 1,
+          market_compare_amazon_direct_only = 1,
+          ai_amazon_direct_only = 1,
+          allow_fba_market_compare = 0,
+          allow_fba_ai = 0,
+          allow_fbm_market_compare = 0,
+          allow_fbm_ai = 0,
+          unknown_seller_mode = 'review'
       WHERE id = 1
     `
   ).run();
@@ -257,7 +268,130 @@ results.push(
 );
 
 results.push(
+  await run('FBA Drittanbieter blockiert Marktvergleich und nutzt stattdessen Keepa', async () => {
+    const result = await analyzeDealWithEngine({
+      deal: {
+        title: 'FBA Test Deal',
+        amazonUrl: 'https://www.amazon.de/dp/B0TESTFBA1',
+        amazonPrice: 69.99,
+        sellerType: 'FBA',
+        sellerClass: 'FBA_THIRDPARTY',
+        soldByAmazon: false,
+        shippedByAmazon: true,
+        referencePrice: 109.99,
+        variantKey: 'solo',
+        quantityKey: '1'
+      },
+      market: {
+        offers: [{ id: 'valid-1', shopName: 'ToolCenter', price: 99.99, shippingPrice: 0, variantKey: 'solo', quantityKey: '1', isRealShop: true }]
+      },
+      keepa: {
+        payload: buildStableKeepaPayload([110, 101, 93, 85, 78, 69.99]),
+        avg90: 108.99,
+        avg180: 118.99,
+        min90: 69.99,
+        isLowest90: true,
+        nearLow: true
+      },
+      meta: {
+        overrideDayPart: 'day'
+      }
+    });
+
+    const item = result.item;
+    assert.equal(item.analysis.decisionSource, 'keepa');
+    assert.equal(item.analysis.keepaFallbackUsed, true);
+    assert.equal(item.analysis.marketComparison.available, false);
+    assert.equal(item.analysis.marketComparison.blocked, true);
+    assert.equal(item.analysis.seller?.sellerClass, 'FBA_THIRDPARTY');
+    assert.equal(item.analysis.seller?.marketCompareAllowed, false);
+  })
+);
+
+results.push(
+  await run('AI Resolver bleibt fuer FBA trotz Unsicherheit blockiert', async () => {
+    db.prepare(`UPDATE deal_engine_settings SET ai_resolver_enabled = 1 WHERE id = 1`).run();
+
+    const result = await analyzeDealWithEngine({
+      deal: {
+        title: 'FBA AI Block Deal',
+        amazonUrl: 'https://www.amazon.de/dp/B0TESTFBA2',
+        amazonPrice: 74.99,
+        sellerType: 'FBA',
+        sellerClass: 'FBA_THIRDPARTY',
+        soldByAmazon: false,
+        shippedByAmazon: true,
+        referencePrice: 119.99,
+        variantKey: 'solo',
+        quantityKey: '1'
+      },
+      market: {
+        offers: [{ id: 'valid-1', shopName: 'ToolCenter', price: 99.99, shippingPrice: 0, variantKey: 'solo', quantityKey: '1', isRealShop: true }]
+      },
+      keepa: {
+        payload: buildStableKeepaPayload([118, 112, 104, 96, 89, 74.99]),
+        avg90: 109.99,
+        avg180: 119.99,
+        min90: 74.99,
+        isLowest90: true,
+        nearLow: true
+      },
+      ai: {
+        variantUnclear: true,
+        conflictingPrices: true,
+        resolvedOfferIds: ['valid-1']
+      },
+      meta: {
+        overrideDayPart: 'day'
+      }
+    });
+
+    const item = result.item;
+    assert.equal(item.analysis.aiStatus, 'blocked_by_seller_policy');
+    assert.equal(item.analysis.aiUsed, false);
+    assert.equal(item.analysis.seller?.aiAllowed, false);
+  })
+);
+
+results.push(
+  await run('Unknown Seller geht standardmaessig in Review statt Auto-Approve', async () => {
+    const result = await analyzeDealWithEngine({
+      deal: {
+        title: 'Unknown Seller Deal',
+        amazonUrl: 'https://www.amazon.de/dp/B0TESTUNK1',
+        amazonPrice: 59.99,
+        sellerType: 'UNKNOWN',
+        sellerClass: 'UNKNOWN',
+        soldByAmazon: null,
+        shippedByAmazon: null,
+        referencePrice: 99.99,
+        variantKey: 'solo',
+        quantityKey: '1'
+      },
+      keepa: {
+        payload: buildStableKeepaPayload([102, 96, 89, 82, 74, 59.99]),
+        avg90: 98.99,
+        avg180: 109.99,
+        min90: 59.99,
+        isLowest90: true,
+        nearLow: true
+      },
+      meta: {
+        overrideDayPart: 'day'
+      }
+    });
+
+    const item = result.item;
+    assert.equal(item.analysis.seller?.sellerClass, 'UNKNOWN');
+    assert.equal(item.analysis.seller?.marketCompareAllowed, false);
+    assert.equal(item.decision, 'QUEUE');
+  })
+);
+
+results.push(
   await run('Autonome Fake-Pattern-Heuristik sitzt im Hauptpfad und kann APPROVE zu REJECT drehen', async () => {
+    db.prepare(`UPDATE deal_engine_settings SET allow_fbm_market_compare = 1 WHERE id = 1`).run();
+
     const result = await analyzeDealWithEngine({
       deal: {
         title: 'Gaming Headset',
@@ -472,7 +606,7 @@ results.push(
 
 results.push(
   await run('Kurzer SQLITE_BUSY Lock fuehrt nicht zu Datenverlust bei Queue-Erzeugung', async () => {
-    const helperScript = path.join(process.cwd(), 'tests', 'helpers', 'holdSqliteWriteLock.mjs');
+    const helperScript = path.join(process.cwd(), 'backend', 'tests', 'helpers', 'holdSqliteWriteLock.mjs');
     const lockWorker = new Worker(helperScript, {
       workerData: {
         dbPath,
