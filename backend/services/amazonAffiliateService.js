@@ -1,26 +1,26 @@
 import crypto from 'crypto';
 import { getDb } from '../db.js';
-import { getAmazonAffiliateConfig } from '../env.js';
+import { getAmazonAffiliateConfig, getStorageConfig } from '../env.js';
 import { buildAmazonAffiliateLinkRecord, cleanText } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 
 const db = getDb();
 const AMAZON_DEPRECATION_DATE = '2026-04-30';
 const AMAZON_TEST_ASIN = 'B0DDKZBYK6';
-const AMAZON_SERVICE_NAME = 'ProductAdvertisingAPIv1';
+const AMAZON_SERVICE_NAME = 'ProductAdvertisingAPI';
 const AMAZON_API_PATH = '/paapi5/getitems';
 const AMAZON_TARGET = 'com.amazon.paapi5.v1.ProductAdvertisingAPIv1.GetItems';
 const AMAZON_DEFAULT_RESOURCES = [
+  'ItemInfo.Title',
   'Images.Primary.Large',
   'Images.Primary.Medium',
-  'ItemInfo.ByLineInfo',
-  'ItemInfo.Classifications',
-  'ItemInfo.Features',
-  'ItemInfo.ProductInfo',
-  'ItemInfo.Title',
-  'Offers.Listings.Availability.Message',
-  'Offers.Listings.Price'
+  'Offers.Listings.Price',
+  'Offers.Listings.Availability.Message'
 ];
+const AMAZON_PAAPI_MARKETPLACE_DE = 'www.amazon.de';
+const AMAZON_PAAPI_CONDITION = 'New';
+const AMAZON_PAAPI_MERCHANT = 'All';
+const AMAZON_PAAPI_OFFER_COUNT = 1;
 
 let amazonConfigLogWritten = false;
 
@@ -71,6 +71,43 @@ function ensureAmazonConfigLog(config = {}) {
   }
 
   amazonConfigLogWritten = true;
+  const storageConfig = getStorageConfig();
+  const accessKeyMasked = maskSecret(config.accessKey, 4, 4);
+  const secretLength = cleanText(config.secretKey).length;
+
+  console.info('[PAAPI_ENV_LOADED]', {
+    envPath: storageConfig.envPath,
+    loadedKeys: [
+      'AMAZON_PAAPI_ACCESS_KEY',
+      'AMAZON_PAAPI_SECRET_KEY',
+      'AMAZON_PAAPI_PARTNER_TAG',
+      'AMAZON_PAAPI_HOST',
+      'AMAZON_PAAPI_REGION',
+      'AMAZON_PAAPI_MARKETPLACE',
+      'AMAZON_PAAPI_LANGUAGE',
+      'AMAZON_PAAPI_ENABLED',
+      'AMAZON_PAAPI_TIMEOUT_MS'
+    ],
+    accessKeyLoaded: Boolean(config.accessKey),
+    secretKeyLoaded: Boolean(config.secretKey),
+    partnerTagLoaded: Boolean(config.partnerTag)
+  });
+  console.info('[PAAPI_ACCESS_KEY_MASKED]', {
+    accessKeyMasked
+  });
+  console.info('[PAAPI_SECRET_LENGTH]', {
+    secretLength
+  });
+  console.info('[PAAPI_PARTNER_TAG]', {
+    partnerTag: config.partnerTag || ''
+  });
+  console.info('[PAAPI_HOST_REGION_MARKETPLACE]', {
+    host: config.host || '',
+    region: config.region || '',
+    marketplace: config.marketplace || '',
+    language: config.language || '',
+    enabled: config.enabled === true
+  });
   logGeneratorDebug('AMAZON API CONFIG LOADED', {
     enabled: config.enabled === true,
     configured: hasAmazonAffiliateCredentials(config),
@@ -182,18 +219,49 @@ function buildCanonicalRequest(payload, host, amzDate) {
 function buildAuthorizationHeader(config, payload, date = new Date()) {
   const amzDate = buildAmzDate(date);
   const dateStamp = buildDateStamp(date);
+  console.info('[PAAPI_SIGNING_START]', {
+    host: config.host,
+    region: config.region,
+    service: AMAZON_SERVICE_NAME,
+    target: AMAZON_TARGET,
+    path: AMAZON_API_PATH,
+    marketplace: config.marketplace,
+    amzDate
+  });
   const { canonicalRequest, signedHeaders, headers } = buildCanonicalRequest(payload, config.host, amzDate);
   const credentialScope = `${dateStamp}/${config.region}/${AMAZON_SERVICE_NAME}/aws4_request`;
   const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope, hashSha256Hex(canonicalRequest)].join('\n');
   const signingKey = buildSigningKey(config.secretKey, dateStamp, config.region, AMAZON_SERVICE_NAME);
   const signature = hmacSha256(signingKey, stringToSign, 'hex');
+  const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${config.accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  console.info('[PAAPI_CANONICAL_REQUEST]', {
+    canonicalRequest
+  });
+  console.info('[PAAPI_STRING_TO_SIGN]', {
+    stringToSign
+  });
+  console.info('[PAAPI_AUTH_HEADER_CREATED]', {
+    credentialScope,
+    signedHeaders,
+    accessKeyPrefix: getAccessKeyPrefix(config.accessKey),
+    authHeaderPreview: `${authorizationHeader.slice(0, 96)}...`
+  });
+  console.info('[PAAPI_INVALID_SIGNATURE_FIXED]', {
+    signingService: AMAZON_SERVICE_NAME,
+    target: AMAZON_TARGET,
+    note: 'AWS SigV4 uses ProductAdvertisingAPI while x-amz-target stays ProductAdvertisingAPIv1.*'
+  });
 
   return {
     headers: {
       ...headers,
-      Authorization: `AWS4-HMAC-SHA256 Credential=${config.accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+      Authorization: authorizationHeader
     },
-    amzDate
+    amzDate,
+    canonicalRequest,
+    stringToSign,
+    credentialScope
   };
 }
 
@@ -312,6 +380,11 @@ async function requestAmazonProductAdvertisingApi(payload, context = {}) {
     const responseText = await response.text();
     const responseJson = parseJson(responseText, null);
     const apiErrors = Array.isArray(responseJson?.Errors) ? responseJson.Errors : [];
+    console.info('[PAAPI_HTTP_STATUS]', {
+      asin: cleanText(context.asin).toUpperCase() || null,
+      httpStatus: response.status,
+      ok: response.ok
+    });
     const requestId =
       cleanText(response.headers.get('x-amzn-requestid')) ||
       cleanText(response.headers.get('x-amzn-RequestId')) ||
@@ -495,12 +568,23 @@ export async function loadAmazonAffiliateContext(input = {}) {
     const payload = {
       ItemIds: [asin],
       ItemIdType: 'ASIN',
-      Marketplace: config.marketplace,
+      Marketplace: AMAZON_PAAPI_MARKETPLACE_DE,
       LanguagesOfPreference: [config.language],
+      Condition: AMAZON_PAAPI_CONDITION,
+      Merchant: AMAZON_PAAPI_MERCHANT,
+      OfferCount: AMAZON_PAAPI_OFFER_COUNT,
       PartnerTag: config.partnerTag,
       PartnerType: 'Associates',
       Resources: AMAZON_DEFAULT_RESOURCES
     };
+    console.info('[PAAPI_REQUEST_RESOURCES]', {
+      asin,
+      marketplace: payload.Marketplace,
+      condition: payload.Condition,
+      merchant: payload.Merchant,
+      offerCount: payload.OfferCount,
+      resources: payload.Resources
+    });
     const response = await requestAmazonProductAdvertisingApi(payload, { asin });
     const items = Array.isArray(response?.ItemsResult?.Items) ? response.ItemsResult.Items : [];
     const item = items.find((entry) => cleanText(entry?.ASIN).toUpperCase() === asin) || items[0] || null;
@@ -525,6 +609,24 @@ export async function loadAmazonAffiliateContext(input = {}) {
         requestedAt,
         reason: notFoundError.message
       };
+    }
+
+    const offersCount = Array.isArray(item?.Offers?.Listings)
+      ? item.Offers.Listings.length
+      : Array.isArray(item?.OffersV2?.Listings)
+        ? item.OffersV2.Listings.length
+        : 0;
+    if (offersCount > 0) {
+      console.info('[PAAPI_RESPONSE_HAS_OFFERS]', {
+        asin,
+        offersCount
+      });
+    } else {
+      console.warn('[PAAPI_RESPONSE_NO_OFFERS]', {
+        asin,
+        offersCount,
+        hasOffersObject: Boolean(item?.Offers || item?.OffersV2)
+      });
     }
 
     const mappedItem = mapAmazonItem(item, asin);

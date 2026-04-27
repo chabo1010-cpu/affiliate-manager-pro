@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { getAmazonAffiliateStatus, loadAmazonAffiliateContext, runAmazonAffiliateApiTest } from '../services/amazonAffiliateService.js';
-import { classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
+import { buildAmazonAffiliateLinkRecord, classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
 import { logGeneratorDebug } from '../services/generatorFlowService.js';
 import { extractSellerSignalsFromText, resolveSellerIdentity } from '../services/sellerClassificationService.js';
 
@@ -10,7 +10,7 @@ const AMAZON_FETCH_HEADERS = {
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
 };
-const AMAZON_SHORT_HOSTS = new Set(['amzn.to']);
+const AMAZON_SHORT_HOSTS = new Set(['amzn.to', 'amazon.to']);
 const AMAZON_REDIRECT_LIMIT = 6;
 
 function safeUrl(value) {
@@ -26,8 +26,25 @@ function isAmazonShortLink(value = '') {
   return AMAZON_SHORT_HOSTS.has(hostname);
 }
 
+function isAmazonHostname(value = '') {
+  return /(^|\.)amazon\./i.test(String(value || '').toLowerCase());
+}
+
+function isAmazonDirectLink(value = '') {
+  const parsed = safeUrl(value);
+  const hostname = parsed?.hostname?.toLowerCase().replace(/^www\./, '') || '';
+  return Boolean(hostname && isAmazonHostname(hostname) && extractAsin(value));
+}
+
 function isRedirectStatus(status) {
   return Number(status) >= 300 && Number(status) < 400;
+}
+
+function buildManualGeneratorInputError(message, code, statusCode = 400) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = statusCode;
+  return error;
 }
 
 function decodeHtml(value) {
@@ -338,6 +355,379 @@ function normalizeDealImageUrl(imageUrl) {
   return imageUrl;
 }
 
+function cleanPaapiText(value) {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return '';
+}
+
+function formatPaapiAmount(amount, currency = 'EUR') {
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount)) {
+    return '';
+  }
+
+  try {
+    return new Intl.NumberFormat('de-DE', {
+      style: 'currency',
+      currency: cleanPaapiText(currency) || 'EUR'
+    })
+      .format(numericAmount)
+      .replace(/\s/g, '');
+  } catch {
+    return `${numericAmount}`;
+  }
+}
+
+function extractPaapiMappedFields(paapiContext = {}) {
+  const result = paapiContext?.result || {};
+  const rawItem = result?.rawItem && typeof result.rawItem === 'object' ? result.rawItem : {};
+  const listing = rawItem?.Offers?.Listings?.[0] || rawItem?.OffersV2?.Listings?.[0] || null;
+  const offersCount = Array.isArray(rawItem?.Offers?.Listings)
+    ? rawItem.Offers.Listings.length
+    : Array.isArray(rawItem?.OffersV2?.Listings)
+      ? rawItem.OffersV2.Listings.length
+      : 0;
+  const imageUrl =
+    cleanPaapiText(rawItem?.Images?.Primary?.Large?.URL) ||
+    cleanPaapiText(rawItem?.Images?.Primary?.Medium?.URL) ||
+    cleanPaapiText(rawItem?.Images?.Primary?.Small?.URL) ||
+    cleanPaapiText(result?.imageUrl);
+  const displayAmount =
+    cleanPaapiText(listing?.Price?.DisplayAmount) ||
+    cleanPaapiText(rawItem?.Offers?.Summaries?.[0]?.LowestPrice?.DisplayAmount) ||
+    cleanPaapiText(rawItem?.OffersV2?.Summaries?.[0]?.LowestPrice?.DisplayAmount);
+  const amount =
+    Number.isFinite(Number(listing?.Price?.Amount))
+      ? Number(listing.Price.Amount)
+      : Number.isFinite(Number(rawItem?.OffersV2?.Summaries?.[0]?.LowestPrice?.Amount))
+        ? Number(rawItem.OffersV2.Summaries[0].LowestPrice.Amount)
+        : null;
+  const currency =
+    cleanPaapiText(listing?.Price?.Currency) ||
+    cleanPaapiText(rawItem?.OffersV2?.Summaries?.[0]?.LowestPrice?.Currency) ||
+    'EUR';
+  const priceDisplay = displayAmount || (amount !== null ? formatPaapiAmount(amount, currency) : '') || cleanPaapiText(result?.priceDisplay);
+  const title = cleanPaapiText(rawItem?.ItemInfo?.Title?.DisplayValue) || cleanPaapiText(result?.title);
+  const availability =
+    cleanPaapiText(listing?.Availability?.Message) ||
+    cleanPaapiText(rawItem?.OffersV2?.Summaries?.[0]?.Condition?.DisplayValue) ||
+    cleanPaapiText(result?.availability);
+  const merchant =
+    cleanPaapiText(listing?.MerchantInfo?.Name) ||
+    cleanPaapiText(listing?.MerchantInfo?.DisplayName) ||
+    cleanPaapiText(listing?.MerchantInfo?.FeedbackRating?.SellerName) ||
+    cleanPaapiText(rawItem?.OffersV2?.Listings?.[0]?.MerchantInfo?.Name);
+
+  return {
+    asin: cleanPaapiText(rawItem?.ASIN || result?.asin).toUpperCase(),
+    title,
+    imageUrl,
+    priceDisplay,
+    availability,
+    merchant,
+    offersCount,
+    rawItem,
+    rawKeys: rawItem && typeof rawItem === 'object' ? Object.keys(rawItem) : []
+  };
+}
+
+function hasCompletePaapiProductData(result = {}) {
+  const mapped = extractPaapiMappedFields({ result });
+  return Boolean(mapped.title && mapped.priceDisplay && mapped.imageUrl);
+}
+
+function mapPaapiContextToScrapeResponse({
+  inputUrl = '',
+  asin = '',
+  normalizedUrl = '',
+  affiliateUrl = '',
+  resolvedUrl = '',
+  paapiContext = {}
+} = {}) {
+  const result = paapiContext?.result || {};
+  const mappedFields = extractPaapiMappedFields(paapiContext);
+  const finalImageUrl = normalizeDealImageUrl(mappedFields.imageUrl || result.imageUrl || '');
+  const finalNormalizedUrl = normalizeAmazonLink(normalizedUrl || result.normalizedUrl || result.detailPageUrl || '');
+  const finalAffiliateUrl = affiliateUrl || result.affiliateUrl || finalNormalizedUrl;
+  const rawFeatures = Array.isArray(result?.rawItem?.ItemInfo?.Features?.DisplayValues)
+    ? result.rawItem.ItemInfo.Features.DisplayValues.filter((value) => cleanPaapiText(value))
+    : [];
+  const features = Array.isArray(result.features) && result.features.length ? result.features : rawFeatures;
+
+  return {
+    success: true,
+    title: mappedFields.title || result.title || '',
+    productTitle: mappedFields.title || result.title || '',
+    productDescription: features.join(' | '),
+    bulletPoints: features,
+    imageUrl: finalImageUrl,
+    image: finalImageUrl,
+    productImage: finalImageUrl,
+    previewImage: finalImageUrl,
+    thumbnail: finalImageUrl,
+    images: finalImageUrl ? [finalImageUrl] : [],
+    product: {
+      imageUrl: finalImageUrl
+    },
+    basePrice: mappedFields.priceDisplay || result.priceDisplay || '',
+    price: mappedFields.priceDisplay || result.priceDisplay || '',
+    availability: mappedFields.availability || result.availability || '',
+    oldPrice: '',
+    couponDetected: false,
+    couponValue: '',
+    subscribeDetected: false,
+    subscribeDiscount: '',
+    finalPrice: mappedFields.priceDisplay || result.priceDisplay || '',
+    finalPriceCalculated: false,
+    asin: asin || mappedFields.asin || result.asin || '',
+    finalUrl: finalAffiliateUrl || finalNormalizedUrl || resolvedUrl || inputUrl,
+    resolvedUrl: resolvedUrl || finalNormalizedUrl || result.detailPageUrl || inputUrl,
+    originalUrl: inputUrl,
+    normalizedUrl: finalNormalizedUrl,
+    affiliateUrl: finalAffiliateUrl,
+    sellerType: '',
+    sellerClass: '',
+    soldByAmazon: null,
+    shippedByAmazon: null,
+    sellerDetails: {
+      detectionSource: 'paapi',
+      detectionSources: ['paapi'],
+      matchedPatterns: [],
+      merchantText: mappedFields.merchant || '',
+      sellerProfile: null
+    },
+    sellerProfile: null,
+    imageDebug: {
+      rawScrapeImage: null,
+      paapiImage: finalImageUrl || null,
+      ogImage: null,
+      twitterImage: null,
+      firstHtmlImage: null,
+      existingFieldImage: null,
+      resolvedImageUrl: finalImageUrl || null,
+      finalImageUrl: finalImageUrl || null,
+      selectedSource: finalImageUrl ? 'paapi' : 'none',
+      reason: finalImageUrl ? null : 'no_image_from_paapi',
+      paapiStatus: paapiContext?.status || 'loaded',
+      paapiReason: paapiContext?.available ? null : paapiContext?.reason || null,
+      resolvedUrl,
+      wasShortLink: isAmazonShortLink(inputUrl)
+    },
+    dataSource: 'paapi'
+  };
+}
+
+async function resolveManualGeneratorAmazonInput(inputValue = '') {
+  const trimmedInput = String(inputValue || '').trim();
+  const asinInput = extractAsin(trimmedInput);
+
+  if (asinInput && !/^https?:\/\//i.test(trimmedInput)) {
+    const linkRecord = buildAmazonAffiliateLinkRecord(asinInput, { asin: asinInput });
+    console.info('[ASIN_DETECTED]', {
+      asin: asinInput,
+      source: 'asin_input'
+    });
+    console.info('[ASIN_INPUT_DETECTED]', {
+      asin: asinInput
+    });
+    console.info('[AFFILIATE_LINK_BUILT_FROM_ASIN]', {
+      asin: asinInput,
+      affiliateUrl: linkRecord.affiliateUrl || null
+    });
+    return {
+      inputType: 'asin',
+      asin: asinInput,
+      normalizedUrl: linkRecord.normalizedUrl || `https://www.amazon.de/dp/${asinInput}`,
+      affiliateUrl: linkRecord.affiliateUrl || '',
+      resolvedUrl: linkRecord.normalizedUrl || `https://www.amazon.de/dp/${asinInput}`,
+      originalUrl: trimmedInput,
+      redirectChain: []
+    };
+  }
+
+  if (!/^https?:\/\//i.test(trimmedInput)) {
+    console.error('[MANUAL_GENERATOR_INPUT_NEEDS_DIRECT_LINK_OR_ASIN]', {
+      originalInput: trimmedInput || null,
+      reason: 'Kein Amazon-Direktlink, Shortlink oder ASIN erkannt.'
+    });
+    throw buildManualGeneratorInputError(
+      'Shortlink konnte technisch nicht aufgeloest werden. Bitte Amazon-Direktlink oder ASIN einfuegen.',
+      'MANUAL_GENERATOR_INPUT_NEEDS_DIRECT_LINK_OR_ASIN',
+      400
+    );
+  }
+
+  if (isAmazonShortLink(trimmedInput)) {
+    console.info('[SHORTLINK_DETECTED]', {
+      originalUrl: trimmedInput
+    });
+    console.info('[SHORTLINK_RESOLVE_START]', {
+      originalUrl: trimmedInput
+    });
+    logGeneratorDebug('SHORTLINK RESOLVE START', {
+      originalUrl: trimmedInput
+    });
+
+    let currentUrl = trimmedInput;
+    const redirectChain = [];
+
+    for (let redirectIndex = 0; redirectIndex <= AMAZON_REDIRECT_LIMIT; redirectIndex += 1) {
+      const response = await fetch(currentUrl, {
+        headers: AMAZON_FETCH_HEADERS,
+        redirect: 'manual'
+      });
+      const locationHeader = response.headers.get('location');
+      const nextLocation = typeof locationHeader === 'string' ? locationHeader.trim() : '';
+
+      redirectChain.push({
+        url: currentUrl,
+        status: response.status,
+        location: nextLocation || null
+      });
+
+      if (isRedirectStatus(response.status) && nextLocation) {
+        const nextUrl = new URL(nextLocation, currentUrl).toString();
+        const nextAsin = extractAsin(nextUrl);
+        if (nextAsin && isAmazonHostname(safeUrl(nextUrl)?.hostname || '')) {
+          const linkRecord = buildAmazonAffiliateLinkRecord(nextUrl, { asin: nextAsin, resolvedUrl: nextUrl });
+          console.info('[SHORTLINK_RESOLVE_SUCCESS]', {
+            originalUrl: trimmedInput,
+            resolvedUrl: nextUrl,
+            redirectCount: redirectChain.length
+          });
+          console.info('[SHORTLINK_RESOLVED_URL]', {
+            originalUrl: trimmedInput,
+            resolvedUrl: nextUrl
+          });
+          console.info('[ASIN_EXTRACTED_FROM_RESOLVED_URL]', {
+            asin: nextAsin,
+            resolvedUrl: nextUrl
+          });
+          console.info('[ASIN_EXTRACTED]', {
+            asin: nextAsin,
+            resolvedUrl: nextUrl,
+            source: 'shortlink_resolved_url'
+          });
+          console.info('[AFFILIATE_LINK_BUILT]', {
+            asin: nextAsin,
+            affiliateUrl: linkRecord.affiliateUrl || null
+          });
+          return {
+            inputType: 'shortlink',
+            asin: nextAsin,
+            normalizedUrl: linkRecord.normalizedUrl || normalizeAmazonLink(nextUrl),
+            affiliateUrl: linkRecord.affiliateUrl || '',
+            resolvedUrl: nextUrl,
+            originalUrl: trimmedInput,
+            redirectChain
+          };
+        }
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      const currentAsin = extractAsin(currentUrl);
+      if (currentAsin && isAmazonHostname(safeUrl(currentUrl)?.hostname || '')) {
+        const linkRecord = buildAmazonAffiliateLinkRecord(currentUrl, { asin: currentAsin, resolvedUrl: currentUrl });
+        console.info('[SHORTLINK_RESOLVE_SUCCESS]', {
+          originalUrl: trimmedInput,
+          resolvedUrl: currentUrl,
+          redirectCount: redirectChain.length
+        });
+        console.info('[SHORTLINK_RESOLVED_URL]', {
+          originalUrl: trimmedInput,
+          resolvedUrl: currentUrl
+        });
+        console.info('[ASIN_EXTRACTED_FROM_RESOLVED_URL]', {
+          asin: currentAsin,
+          resolvedUrl: currentUrl
+        });
+        console.info('[ASIN_EXTRACTED]', {
+          asin: currentAsin,
+          resolvedUrl: currentUrl,
+          source: 'shortlink_current_url'
+        });
+        console.info('[AFFILIATE_LINK_BUILT]', {
+          asin: currentAsin,
+          affiliateUrl: linkRecord.affiliateUrl || null
+        });
+        return {
+          inputType: 'shortlink',
+          asin: currentAsin,
+          normalizedUrl: linkRecord.normalizedUrl || normalizeAmazonLink(currentUrl),
+          affiliateUrl: linkRecord.affiliateUrl || '',
+          resolvedUrl: currentUrl,
+          originalUrl: trimmedInput,
+          redirectChain
+        };
+      }
+
+      break;
+    }
+
+    console.error('[SHORTLINK_RESOLVE_FAILED]', {
+      originalUrl: trimmedInput,
+      redirectChain
+    });
+    return {
+      inputType: 'shortlink',
+      asin: '',
+      normalizedUrl: '',
+      affiliateUrl: trimmedInput,
+      resolvedUrl: currentUrl !== trimmedInput ? currentUrl : '',
+      originalUrl: trimmedInput,
+      redirectChain,
+      resolutionFailed: true
+    };
+  }
+
+  if (isAmazonDirectLink(trimmedInput)) {
+    const asin = extractAsin(trimmedInput);
+    const linkRecord = buildAmazonAffiliateLinkRecord(trimmedInput, { asin, resolvedUrl: trimmedInput });
+    console.info('[ASIN_DETECTED]', {
+      asin,
+      source: 'amazon_direct_link'
+    });
+    console.info('[AMAZON_DIRECT_LINK_DETECTED]', {
+      originalUrl: trimmedInput
+    });
+    console.info('[ASIN_EXTRACTED]', {
+      asin,
+      originalUrl: trimmedInput
+    });
+    console.info('[AFFILIATE_LINK_BUILT]', {
+      asin,
+      affiliateUrl: linkRecord.affiliateUrl || null
+    });
+    return {
+      inputType: 'direct_link',
+      asin,
+      normalizedUrl: linkRecord.normalizedUrl || normalizeAmazonLink(trimmedInput),
+      affiliateUrl: linkRecord.affiliateUrl || '',
+      resolvedUrl: trimmedInput,
+      originalUrl: trimmedInput,
+      redirectChain: []
+    };
+  }
+
+  console.error('[MANUAL_GENERATOR_INPUT_NEEDS_DIRECT_LINK_OR_ASIN]', {
+    originalUrl: trimmedInput,
+    reason: 'Kein Amazon-Direktlink mit ASIN erkannt.'
+  });
+  throw buildManualGeneratorInputError(
+    'Shortlink konnte technisch nicht aufgeloest werden. Bitte Amazon-Direktlink oder ASIN einfuegen.',
+    'MANUAL_GENERATOR_INPUT_NEEDS_DIRECT_LINK_OR_ASIN',
+    400
+  );
+}
+
 function normalizeAnalysisText(value = '') {
   const normalized = decodeHtml(String(value || ''))
     .normalize('NFD')
@@ -370,6 +760,30 @@ function extractCanonicalUrl(html) {
     /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
     /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i
   ]);
+}
+
+function extractAmazonTitleFromResolvedUrl(value = '') {
+  const parsed = safeUrl(value);
+  const segments = parsed?.pathname?.split('/').filter(Boolean) || [];
+
+  if (!segments.length) {
+    return '';
+  }
+
+  const dpIndex = segments.findIndex((segment) => /^dp$/i.test(segment));
+  const gpProductIndex = segments.findIndex((segment, index) => /^product$/i.test(segment) && /^gp$/i.test(segments[index - 1] || ''));
+  const slugIndex = dpIndex > 0 ? dpIndex - 1 : gpProductIndex > 1 ? gpProductIndex - 2 : -1;
+  const rawSlug = slugIndex >= 0 ? segments[slugIndex] || '' : '';
+
+  if (!rawSlug) {
+    return '';
+  }
+
+  return decodeURIComponent(rawSlug)
+    .replace(/\+/g, ' ')
+    .replace(/-/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function extractAmazonPrice(html) {
@@ -1140,28 +1554,388 @@ export async function scrapeAmazonProduct(inputUrl = '') {
     url: trimmedUrl
   });
 
-  if (!/^https?:\/\//i.test(trimmedUrl)) {
-    const error = new Error('Ungueltige URL');
-    error.code = 'INVALID_URL';
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const resolvedRequest = await resolveScrapeRequest(trimmedUrl);
-  const response = resolvedRequest.response;
-  const resolvedUrl = resolvedRequest.resolvedUrl || trimmedUrl;
+  const resolvedInput = await resolveManualGeneratorAmazonInput(trimmedUrl);
+  const finalAffiliateUrl = resolvedInput.affiliateUrl || '';
+  const finalScrapeUrl = resolvedInput.normalizedUrl || resolvedInput.resolvedUrl || trimmedUrl;
+  const resolvedUrl = resolvedInput.resolvedUrl || finalScrapeUrl;
+  const isShortlinkInput = resolvedInput.inputType === 'shortlink';
+  const isForcedPaapiInput = resolvedInput.inputType === 'asin' || resolvedInput.inputType === 'direct_link';
+  let shortlinkFallbackCandidate = null;
+  let forcedPaapiFallbackCandidate = null;
+  let forcedPaapiScrapeFallbackTriggered = false;
 
   logGeneratorDebug('api.amazon.scrape.redirect_resolution', {
     originalUrl: trimmedUrl,
     resolvedUrl,
-    wasShortLink: resolvedRequest.wasShortLink,
-    redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1),
-    redirectChain: resolvedRequest.redirectChain
+    wasShortLink: isShortlinkInput,
+    redirectCount: Math.max(0, resolvedInput.redirectChain.length),
+    redirectChain: resolvedInput.redirectChain
   });
 
+  if (resolvedInput.asin) {
+    console.info('[PAAPI_LOOKUP_START]', {
+      asin: resolvedInput.asin,
+      resolvedUrl,
+      inputType: resolvedInput.inputType
+    });
+  }
+
+  const paapiContext = resolvedInput.asin ? await loadAmazonAffiliateContext({ asin: resolvedInput.asin }) : null;
+  const paapiMappedFields = paapiContext?.available === true ? extractPaapiMappedFields(paapiContext) : null;
+  if (resolvedInput.asin && paapiContext?.available === true) {
+    console.info('[PAAPI_LOOKUP_SUCCESS]', {
+      asin: resolvedInput.asin,
+      resolvedUrl,
+      inputType: resolvedInput.inputType,
+      hasTitle: Boolean(paapiMappedFields?.title),
+      hasPrice: Boolean(paapiMappedFields?.priceDisplay),
+      hasImage: Boolean(paapiMappedFields?.imageUrl)
+    });
+    console.info('[PAAPI_RAW_ITEM_KEYS]', {
+      asin: resolvedInput.asin,
+      keys: paapiMappedFields?.rawKeys || [],
+      hasItem: Boolean(paapiMappedFields?.rawItem && Object.keys(paapiMappedFields.rawItem).length)
+    });
+    if (paapiMappedFields?.title) {
+      console.info('[PAAPI_TITLE_FOUND]', {
+        asin: resolvedInput.asin,
+        titleLength: paapiMappedFields.title.length
+      });
+    }
+    if (paapiMappedFields?.imageUrl) {
+      console.info('[PAAPI_IMAGE_FOUND]', {
+        asin: resolvedInput.asin,
+        imageUrl: paapiMappedFields.imageUrl
+      });
+    } else {
+      console.warn('[PAAPI_IMAGE_MISSING]', {
+        asin: resolvedInput.asin
+      });
+    }
+    if (paapiMappedFields?.priceDisplay) {
+      console.info('[PAAPI_PRICE_FOUND]', {
+        asin: resolvedInput.asin,
+        price: paapiMappedFields.priceDisplay
+      });
+    } else {
+      console.warn('[PAAPI_PRICE_MISSING]', {
+        asin: resolvedInput.asin
+      });
+    }
+  }
+
+  if (isForcedPaapiInput && resolvedInput.asin) {
+    console.info('[PAAPI_FORCED_INSTEAD_OF_SCRAPE]', {
+      asin: resolvedInput.asin,
+      inputType: resolvedInput.inputType,
+      resolvedUrl
+    });
+
+    const payload = mapPaapiContextToScrapeResponse({
+      inputUrl: trimmedUrl,
+      asin: resolvedInput.asin,
+      normalizedUrl: finalScrapeUrl,
+      affiliateUrl: finalAffiliateUrl,
+      resolvedUrl,
+      paapiContext
+    });
+    const offersCount = Number(paapiMappedFields?.offersCount || 0);
+    const noOffers = offersCount === 0;
+
+    if (paapiContext?.available === true && !noOffers) {
+      console.info('[PRODUCT_DATA_SOURCE_PAAPI]', {
+        asin: resolvedInput.asin,
+        normalizedUrl: finalScrapeUrl,
+        affiliateUrl: finalAffiliateUrl || paapiContext.result?.affiliateUrl || null
+      });
+      console.info('[PAAPI_PRODUCT_MAPPED]', {
+        asin: payload.asin || resolvedInput.asin,
+        title: payload.title || '',
+        hasImage: Boolean(payload.imageUrl),
+        price: payload.price || '',
+        availability: payload.availability || '',
+        merchant: payload.sellerDetails?.merchantText || ''
+      });
+      return payload;
+    }
+
+    forcedPaapiFallbackCandidate = payload;
+    forcedPaapiScrapeFallbackTriggered = noOffers;
+
+    if (noOffers) {
+      console.info('[PAAPI_NO_OFFERS]', {
+        asin: resolvedInput.asin,
+        offersCount,
+        inputType: resolvedInput.inputType,
+        resolvedUrl,
+        paapiAvailable: paapiContext?.available === true,
+        paapiReason: paapiContext?.reason || null
+      });
+    } else {
+      console.warn('[SCRAPE_BLOCKED_FOR_ASIN]', {
+        asin: resolvedInput.asin,
+        inputType: resolvedInput.inputType,
+        resolvedUrl,
+        paapiAvailable: paapiContext?.available === true,
+        paapiReason: paapiContext?.reason || null,
+        hasTitle: Boolean(paapiMappedFields?.title),
+        hasPrice: Boolean(paapiMappedFields?.priceDisplay),
+        hasImage: Boolean(paapiMappedFields?.imageUrl),
+        offersCount
+      });
+      return forcedPaapiFallbackCandidate;
+    }
+
+    forcedPaapiFallbackCandidate.message = 'PAAPI liefert aktuell keinen Preis fuer diese ASIN';
+  }
+
+  if (isShortlinkInput) {
+    if (paapiContext?.available === true && hasCompletePaapiProductData(paapiContext.result)) {
+      console.info('[PRODUCT_DATA_SOURCE_PAAPI]', {
+        asin: resolvedInput.asin,
+        normalizedUrl: finalScrapeUrl,
+        affiliateUrl: finalAffiliateUrl || paapiContext.result?.affiliateUrl || null
+      });
+      const payload = {
+        ...mapPaapiContextToScrapeResponse({
+          inputUrl: trimmedUrl,
+          asin: resolvedInput.asin,
+          normalizedUrl: finalScrapeUrl,
+          affiliateUrl: finalAffiliateUrl,
+          resolvedUrl,
+          paapiContext
+        }),
+        inputMode: 'shortlink',
+        preserveInputLink: false,
+        finalUrl: finalAffiliateUrl || finalScrapeUrl || trimmedUrl,
+        affiliateUrl: finalAffiliateUrl || '',
+        originalUrl: trimmedUrl,
+        shortlinkAllowed: true,
+        manualCompletionNeeded: false,
+        message: 'Shortlink aufgeloest. Produktdaten wurden automatisch ueber PAAPI geladen.'
+      };
+      console.info('[PRODUCT_DATA_FILLED]', {
+        source: 'paapi',
+        asin: resolvedInput.asin,
+        hasTitle: true,
+        hasPrice: true,
+        hasImage: true,
+        affiliateUrl: finalAffiliateUrl || paapiContext.result?.affiliateUrl || null
+      });
+      return payload;
+    }
+
+    const partialPaapiResult = paapiContext?.result || {};
+    let resolvedUrlTitle = '';
+    let resolvedUrlPrice = '';
+    let resolvedUrlImage = '';
+    let resolvedUrlAsin = resolvedInput.asin || '';
+    let resolvedUrlNormalized = finalScrapeUrl;
+    let resolvedUrlFinal = resolvedUrl;
+    let resolvedUrlDataSource = '';
+
+    resolvedUrlAsin =
+      resolvedInput.asin ||
+      partialPaapiResult.asin ||
+      extractAsin(resolvedUrl) ||
+      extractAsin(finalScrapeUrl) ||
+      '';
+    resolvedUrlTitle = extractAmazonTitleFromResolvedUrl(resolvedUrl || finalScrapeUrl || trimmedUrl);
+    resolvedUrlFinal = resolvedUrl || finalScrapeUrl;
+    resolvedUrlNormalized = normalizeAmazonLink(resolvedUrlFinal) || finalScrapeUrl;
+    resolvedUrlDataSource = resolvedUrlAsin || resolvedUrlTitle ? 'resolved_amazon_url' : '';
+
+    const finalResolvedAsin = resolvedInput.asin || partialPaapiResult.asin || resolvedUrlAsin || extractAsin(resolvedUrlFinal) || '';
+    if (finalResolvedAsin && !resolvedInput.asin) {
+      console.info('[ASIN_EXTRACTED]', {
+        asin: finalResolvedAsin,
+        resolvedUrl: resolvedUrlFinal || resolvedUrl || null,
+        source: resolvedUrlDataSource || 'shortlink_fallback'
+      });
+    }
+    const shortlinkAffiliateRecord = finalResolvedAsin
+      ? buildAmazonAffiliateLinkRecord(finalResolvedAsin, {
+          asin: finalResolvedAsin,
+          resolvedUrl: resolvedUrlNormalized || resolvedUrlFinal || finalScrapeUrl
+        })
+      : null;
+    const shortlinkImageUrl = normalizeDealImageUrl(partialPaapiResult.imageUrl || resolvedUrlImage || '');
+    const shortlinkTitle = partialPaapiResult.title || resolvedUrlTitle || '';
+    const shortlinkPrice = partialPaapiResult.priceDisplay || resolvedUrlPrice || '';
+    const shortlinkAffiliateUrl = shortlinkAffiliateRecord?.affiliateUrl || '';
+    const preserveInputLink = !shortlinkAffiliateUrl;
+    const manualCompletionNeeded = !shortlinkTitle || !shortlinkPrice;
+    const manualInputRequired = !finalResolvedAsin && !shortlinkTitle && !shortlinkPrice && !shortlinkImageUrl;
+
+    shortlinkFallbackCandidate = {
+      success: true,
+      title: shortlinkTitle,
+      productTitle: shortlinkTitle,
+      productDescription: Array.isArray(partialPaapiResult.features) ? partialPaapiResult.features.join(' | ') : '',
+      bulletPoints: Array.isArray(partialPaapiResult.features) ? partialPaapiResult.features : [],
+      imageUrl: shortlinkImageUrl,
+      image: shortlinkImageUrl,
+      productImage: shortlinkImageUrl,
+      previewImage: shortlinkImageUrl,
+      thumbnail: shortlinkImageUrl,
+      images: shortlinkImageUrl ? [shortlinkImageUrl] : [],
+      product: {
+        imageUrl: shortlinkImageUrl
+      },
+      basePrice: shortlinkPrice,
+      price: shortlinkPrice,
+      oldPrice: '',
+      couponDetected: false,
+      couponValue: '',
+      subscribeDetected: false,
+      subscribeDiscount: '',
+      finalPrice: shortlinkPrice,
+      finalPriceCalculated: false,
+      asin: finalResolvedAsin,
+      finalUrl: shortlinkAffiliateUrl || trimmedUrl,
+      resolvedUrl: resolvedUrlFinal || resolvedUrl,
+      originalUrl: trimmedUrl,
+      normalizedUrl: shortlinkAffiliateRecord?.normalizedUrl || resolvedUrlNormalized || finalScrapeUrl,
+      affiliateUrl: shortlinkAffiliateUrl,
+      sellerType: '',
+      sellerClass: '',
+      soldByAmazon: null,
+      shippedByAmazon: null,
+      sellerDetails: {
+        detectionSource: paapiContext?.available === true ? 'paapi_partial' : 'manual_shortlink',
+        detectionSources: paapiContext?.available === true ? ['paapi_partial'] : ['manual_shortlink'],
+        matchedPatterns: [],
+        merchantText: '',
+        sellerProfile: null
+      },
+      sellerProfile: null,
+      imageDebug: {
+        rawScrapeImage: null,
+        paapiImage: normalizeDealImageUrl(partialPaapiResult.imageUrl || '') || null,
+        ogImage: null,
+        twitterImage: null,
+        firstHtmlImage: null,
+        existingFieldImage: null,
+        resolvedImageUrl: shortlinkImageUrl || null,
+        finalImageUrl: shortlinkImageUrl || null,
+        selectedSource: normalizeDealImageUrl(partialPaapiResult.imageUrl || '')
+          ? 'paapi'
+          : resolvedUrlImage
+            ? 'resolved_amazon_url'
+            : 'none',
+        reason: shortlinkImageUrl ? null : 'no_image_from_shortlink_resolution',
+        paapiStatus: paapiContext?.status || (resolvedInput.asin ? 'missing' : 'not_requested'),
+        paapiReason: paapiContext?.available ? null : paapiContext?.reason || null,
+        resolvedUrl: resolvedUrlFinal || resolvedUrl,
+        wasShortLink: true
+      },
+      dataSource:
+        paapiContext?.available === true && partialPaapiResult.title
+          ? 'paapi_partial'
+          : resolvedUrlDataSource || (manualInputRequired ? 'manual_shortlink' : 'shortlink_partial'),
+      inputMode: 'shortlink',
+      preserveInputLink,
+      manualCompletionNeeded,
+      manualInputRequired,
+      shortlinkAllowed: true,
+      message: manualInputRequired
+        ? 'Shortlink erkannt, aber es konnten keine Produktdaten automatisch geladen werden. Bitte Titel und Preis manuell eingeben.'
+        : manualCompletionNeeded
+          ? 'Shortlink aufgeloest. Teilweise Produktdaten wurden automatisch geladen. Fehlende Werte kannst du ergaenzen.'
+          : 'Shortlink aufgeloest. Produktdaten wurden automatisch uebernommen.'
+    };
+
+    if (!manualCompletionNeeded && shortlinkAffiliateUrl) {
+      console.info('[PRODUCT_DATA_FILLED]', {
+        source: shortlinkFallbackCandidate.dataSource || 'shortlink_partial',
+        asin: finalResolvedAsin || null,
+        hasTitle: Boolean(shortlinkTitle),
+        hasPrice: Boolean(shortlinkPrice),
+        hasImage: Boolean(shortlinkImageUrl),
+        affiliateUrl: shortlinkAffiliateUrl
+      });
+      return shortlinkFallbackCandidate;
+    }
+
+    if (resolvedInput.resolutionFailed || !isAmazonHostname(safeUrl(finalScrapeUrl)?.hostname || '')) {
+      console.warn('[SHORTLINK_FAILED_NEEDS_MANUAL_INPUT]', {
+        originalUrl: trimmedUrl,
+        resolvedUrl: resolvedUrlFinal || resolvedUrl || null,
+        asin: finalResolvedAsin || null,
+        reason: resolvedInput.resolutionFailed ? 'SHORTLINK_RESOLUTION_FAILED' : 'NO_AMAZON_TARGET_URL'
+      });
+      console.warn('[MANUAL_INPUT_ONLY_LAST_FALLBACK]', {
+        originalUrl: trimmedUrl,
+        resolvedUrl: resolvedUrlFinal || resolvedUrl || null,
+        asin: finalResolvedAsin || null
+      });
+      return shortlinkFallbackCandidate;
+    }
+  }
+
+  if (paapiContext?.available === true && hasCompletePaapiProductData(paapiContext.result)) {
+    console.info('[PRODUCT_DATA_SOURCE_PAAPI]', {
+      asin: resolvedInput.asin,
+      normalizedUrl: finalScrapeUrl,
+      affiliateUrl: finalAffiliateUrl || paapiContext.result?.affiliateUrl || null
+    });
+    return mapPaapiContextToScrapeResponse({
+      inputUrl: trimmedUrl,
+      asin: resolvedInput.asin,
+      normalizedUrl: finalScrapeUrl,
+      affiliateUrl: finalAffiliateUrl,
+      resolvedUrl,
+      paapiContext
+    });
+  }
+
+  if (isShortlinkInput) {
+    console.info('[SCRAPE_LAST_FALLBACK_START]', {
+      originalUrl: trimmedUrl,
+      resolvedUrl: finalScrapeUrl,
+      asin: shortlinkFallbackCandidate?.asin || resolvedInput.asin || null
+    });
+  }
+
+  if (forcedPaapiScrapeFallbackTriggered) {
+    console.info('[SCRAPE_FALLBACK_START]', {
+      originalUrl: trimmedUrl,
+      resolvedUrl: finalScrapeUrl,
+      asin: resolvedInput.asin || null,
+      reason: 'PAAPI_NO_OFFERS'
+    });
+  }
+
+  const resolvedRequest = await resolveScrapeRequest(finalScrapeUrl);
+  const response = resolvedRequest.response;
+  const scrapeResolvedUrl = resolvedRequest.resolvedUrl || finalScrapeUrl;
   const html = await response.text();
 
   if (response.status === 403 || /captcha|robot check|sorry/i.test(html)) {
+    if (isForcedPaapiInput && forcedPaapiFallbackCandidate) {
+      console.warn('[SCRAPE_FAILED]', {
+        asin: resolvedInput.asin || null,
+        resolvedUrl: scrapeResolvedUrl || finalScrapeUrl || null,
+        reason: 'AMAZON_BLOCKED'
+      });
+      return forcedPaapiFallbackCandidate;
+    }
+    if (isShortlinkInput && shortlinkFallbackCandidate) {
+      console.warn('[SHORTLINK_FAILED_NEEDS_MANUAL_INPUT]', {
+        originalUrl: trimmedUrl,
+        resolvedUrl: scrapeResolvedUrl || finalScrapeUrl || null,
+        asin: shortlinkFallbackCandidate.asin || null,
+        reason: 'AMAZON_BLOCKED'
+      });
+      if (shortlinkFallbackCandidate.manualInputRequired === true) {
+        console.warn('[MANUAL_INPUT_ONLY_LAST_FALLBACK]', {
+          originalUrl: trimmedUrl,
+          resolvedUrl: scrapeResolvedUrl || finalScrapeUrl || null,
+          asin: shortlinkFallbackCandidate.asin || null
+        });
+      }
+      return shortlinkFallbackCandidate;
+    }
     const error = new Error('Amazon blockiert den Scrape-Zugriff');
     error.code = 'AMAZON_BLOCKED';
     error.statusCode = 502;
@@ -1169,6 +1943,30 @@ export async function scrapeAmazonProduct(inputUrl = '') {
   }
 
   if (!response.ok) {
+    if (isForcedPaapiInput && forcedPaapiFallbackCandidate) {
+      console.warn('[SCRAPE_FAILED]', {
+        asin: resolvedInput.asin || null,
+        resolvedUrl: scrapeResolvedUrl || finalScrapeUrl || null,
+        reason: `SCRAPE_FAILED_${response.status}`
+      });
+      return forcedPaapiFallbackCandidate;
+    }
+    if (isShortlinkInput && shortlinkFallbackCandidate) {
+      console.warn('[SHORTLINK_FAILED_NEEDS_MANUAL_INPUT]', {
+        originalUrl: trimmedUrl,
+        resolvedUrl: scrapeResolvedUrl || finalScrapeUrl || null,
+        asin: shortlinkFallbackCandidate.asin || null,
+        reason: `SCRAPE_FAILED_${response.status}`
+      });
+      if (shortlinkFallbackCandidate.manualInputRequired === true) {
+        console.warn('[MANUAL_INPUT_ONLY_LAST_FALLBACK]', {
+          originalUrl: trimmedUrl,
+          resolvedUrl: scrapeResolvedUrl || finalScrapeUrl || null,
+          asin: shortlinkFallbackCandidate.asin || null
+        });
+      }
+      return shortlinkFallbackCandidate;
+    }
     const error = new Error(`Scrape failed (${response.status})`);
     error.code = 'SCRAPE_FAILED';
     error.statusCode = 502;
@@ -1176,16 +1974,37 @@ export async function scrapeAmazonProduct(inputUrl = '') {
   }
 
   const canonicalUrl = extractCanonicalUrl(html);
-  const productTitle = extractAmazonTitle(html) || '';
+  const productTitle = extractAmazonTitle(html) || shortlinkFallbackCandidate?.title || '';
   const productDescription = stripHtml(extractAmazonDescription(html) || '');
   const bulletPoints = extractAmazonBulletPoints(html);
-  const basePrice = extractAmazonPrice(html) || '';
+  const basePrice = extractAmazonPrice(html) || shortlinkFallbackCandidate?.price || '';
   const couponDetails = extractCouponDetails(html);
   const subscribeDetails = extractSubscribeDetails(html);
   const finalPriceResult = calculateFinalPriceFromDiscounts(basePrice, couponDetails.couponValue, subscribeDetails.subscribeDiscount);
-  const finalUrl = canonicalUrl || resolvedUrl || trimmedUrl;
-  const asin = extractAsin(canonicalUrl) || extractAsin(resolvedUrl) || extractAsin(trimmedUrl) || '';
+  const finalUrl = canonicalUrl || scrapeResolvedUrl || resolvedUrl || finalScrapeUrl;
+  const asin =
+    extractAsin(canonicalUrl) ||
+    extractAsin(scrapeResolvedUrl) ||
+    extractAsin(finalScrapeUrl) ||
+    shortlinkFallbackCandidate?.asin ||
+    resolvedInput.asin ||
+    '';
   const normalizedUrl = normalizeAmazonLink(finalUrl);
+  const affiliateLinkRecord = buildAmazonAffiliateLinkRecord(finalUrl || finalScrapeUrl || asin, {
+    asin,
+    resolvedUrl: normalizedUrl || scrapeResolvedUrl || finalScrapeUrl
+  });
+  const finalDisplayPrice = finalPriceResult.finalPriceCalculated ? finalPriceResult.finalPrice : basePrice;
+  const finalProductTitle =
+    (isForcedPaapiInput && forcedPaapiFallbackCandidate?.title) || productTitle;
+  const finalProductDescription =
+    (isForcedPaapiInput && forcedPaapiFallbackCandidate?.productDescription) || productDescription;
+  const finalBulletPoints =
+    isForcedPaapiInput &&
+    Array.isArray(forcedPaapiFallbackCandidate?.bulletPoints) &&
+    forcedPaapiFallbackCandidate.bulletPoints.length
+      ? forcedPaapiFallbackCandidate.bulletPoints
+      : bulletPoints;
   const sellerInfo = extractSellerInfoFromAmazonHtml(html);
   const sellerProfile =
     sellerInfo.sellerClass === 'FBM_THIRDPARTY'
@@ -1208,13 +2027,29 @@ export async function scrapeAmazonProduct(inputUrl = '') {
           profileUrl: '',
           reason: 'Haendlerprofil fuer diesen Seller-Typ nicht noetig.'
         };
-  const paapiContext = asin ? await loadAmazonAffiliateContext({ asin }) : null;
-  const paapiImage = paapiContext?.available ? paapiContext.result?.imageUrl || '' : '';
+  const paapiContextForImage = paapiContext || (asin ? await loadAmazonAffiliateContext({ asin }) : null);
+  const paapiImage = paapiContextForImage?.available ? paapiContextForImage.result?.imageUrl || '' : '';
   const imageResolution = resolveAmazonImage(html, {
     baseUrl: finalUrl,
     paapiImage
   });
-  const finalImageUrl = imageResolution.finalImageUrl;
+  const finalImageUrl = imageResolution.finalImageUrl || shortlinkFallbackCandidate?.imageUrl || '';
+  if (forcedPaapiScrapeFallbackTriggered && finalDisplayPrice) {
+    console.info('[SCRAPE_PRICE_FOUND]', {
+      asin,
+      price: finalDisplayPrice
+    });
+  }
+  if (forcedPaapiScrapeFallbackTriggered && finalImageUrl) {
+    console.info('[SCRAPE_IMAGE_FOUND]', {
+      asin,
+      imageUrl: finalImageUrl
+    });
+  }
+  const shortlinkManualCompletionNeededAfterScrape =
+    isShortlinkInput && (!finalProductTitle || !finalDisplayPrice);
+  const shortlinkManualInputRequiredAfterScrape =
+    isShortlinkInput && !asin && !finalProductTitle && !finalDisplayPrice && !finalImageUrl;
   const imageDebug = {
     rawScrapeImage: imageResolution.rawScrapeImage,
     paapiImage: imageResolution.paapiImage,
@@ -1226,11 +2061,11 @@ export async function scrapeAmazonProduct(inputUrl = '') {
     finalImageUrl,
     selectedSource: imageResolution.selectedSource,
     reason: imageResolution.reasonIfMissing,
-    paapiStatus: paapiContext?.status || (asin ? 'not_requested' : 'missing_asin'),
-    paapiReason: paapiContext?.available ? null : paapiContext?.reason || null,
-    resolvedUrl,
-    wasShortLink: resolvedRequest.wasShortLink,
-    redirectCount: Math.max(0, resolvedRequest.redirectChain.length - 1)
+    paapiStatus: paapiContextForImage?.status || (asin ? 'not_requested' : 'missing_asin'),
+    paapiReason: paapiContextForImage?.available ? null : paapiContextForImage?.reason || null,
+    resolvedUrl: scrapeResolvedUrl,
+    wasShortLink: resolvedInput.inputType === 'shortlink',
+    redirectCount: Math.max(0, resolvedInput.redirectChain.length)
   };
 
   logGeneratorDebug('api.amazon.scrape.image_resolution', {
@@ -1249,7 +2084,7 @@ export async function scrapeAmazonProduct(inputUrl = '') {
 
   logGeneratorDebug('api.amazon.scrape.success', {
     url: trimmedUrl,
-    resolvedUrl,
+    resolvedUrl: scrapeResolvedUrl,
     asin,
     sellerType: sellerInfo.sellerType,
     sellerClass: sellerInfo.sellerClass,
@@ -1261,6 +2096,21 @@ export async function scrapeAmazonProduct(inputUrl = '') {
     selectedImageSource: imageResolution.selectedSource,
     reasonIfMissing: imageResolution.reasonIfMissing
   });
+  console.info('[PRODUCT_DATA_SOURCE_SCRAPE]', {
+    asin,
+    normalizedUrl,
+    affiliateUrl: affiliateLinkRecord.affiliateUrl || finalAffiliateUrl || null
+  });
+  if (isShortlinkInput) {
+    console.info('[PRODUCT_DATA_FILLED]', {
+      source: 'scrape_last_fallback',
+      asin,
+      hasTitle: Boolean(finalProductTitle),
+      hasPrice: Boolean(finalDisplayPrice),
+      hasImage: Boolean(finalImageUrl),
+      affiliateUrl: affiliateLinkRecord.affiliateUrl || finalAffiliateUrl || null
+    });
+  }
   console.info('[SELLER_DETAILS]', {
     asin,
     sellerType: sellerInfo.sellerType,
@@ -1312,10 +2162,10 @@ export async function scrapeAmazonProduct(inputUrl = '') {
 
   return {
     success: true,
-    title: productTitle,
-    productTitle,
-    productDescription,
-    bulletPoints,
+    title: finalProductTitle,
+    productTitle: finalProductTitle,
+    productDescription: finalProductDescription,
+    bulletPoints: finalBulletPoints,
     imageUrl: finalImageUrl,
     image: finalImageUrl,
     productImage: finalImageUrl,
@@ -1326,7 +2176,7 @@ export async function scrapeAmazonProduct(inputUrl = '') {
       imageUrl: finalImageUrl
     },
     basePrice,
-    price: finalPriceResult.finalPriceCalculated ? finalPriceResult.finalPrice : basePrice,
+    price: finalDisplayPrice,
     oldPrice: extractAmazonOldPrice(html) || '',
     couponDetected: couponDetails.couponDetected,
     couponValue: couponDetails.couponValue,
@@ -1335,10 +2185,11 @@ export async function scrapeAmazonProduct(inputUrl = '') {
     finalPrice: finalPriceResult.finalPrice,
     finalPriceCalculated: finalPriceResult.finalPriceCalculated,
     asin,
-    finalUrl,
-    resolvedUrl,
+    finalUrl: affiliateLinkRecord.affiliateUrl || finalAffiliateUrl || finalUrl,
+    resolvedUrl: scrapeResolvedUrl,
     originalUrl: trimmedUrl,
     normalizedUrl,
+    affiliateUrl: affiliateLinkRecord.affiliateUrl || finalAffiliateUrl,
     sellerType: sellerInfo.sellerType,
     sellerClass: sellerInfo.sellerClass,
     soldByAmazon: sellerInfo.soldByAmazon,
@@ -1348,7 +2199,22 @@ export async function scrapeAmazonProduct(inputUrl = '') {
       sellerProfile
     },
     sellerProfile,
-    imageDebug
+    imageDebug,
+    dataSource: 'scrape',
+    ...(isShortlinkInput
+      ? {
+          inputMode: 'shortlink',
+          preserveInputLink: false,
+          manualCompletionNeeded: shortlinkManualCompletionNeededAfterScrape,
+          manualInputRequired: shortlinkManualInputRequiredAfterScrape,
+          shortlinkAllowed: true,
+          message: shortlinkManualInputRequiredAfterScrape
+            ? 'Shortlink erkannt, aber die Produktdaten konnten nicht vollstaendig geladen werden. Bitte Titel und Preis manuell ergaenzen.'
+            : shortlinkManualCompletionNeededAfterScrape
+              ? 'Shortlink aufgeloest. Einige Produktdaten wurden geladen. Fehlende Werte kannst du ergaenzen.'
+              : 'Shortlink aufgeloest. Produktdaten wurden automatisch uebernommen.'
+        }
+      : {})
   };
 }
 
@@ -1356,12 +2222,21 @@ async function handleScrape(req, res) {
   try {
     return res.status(200).json(await scrapeAmazonProduct(req.body?.url));
   } catch (error) {
+    console.error('[PRODUCT_DATA_FAILED]', {
+      inputUrl: typeof req.body?.url === 'string' ? req.body.url : null,
+      errorCode: error instanceof Error ? error.code || 'SCRAPE_FAILED' : 'SCRAPE_FAILED',
+      errorMessage: error instanceof Error ? error.message : 'Scrape failed'
+    });
     logGeneratorDebug('api.amazon.scrape.error', {
       error: error instanceof Error ? error.message : 'Scrape failed'
     });
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : 'Scrape failed';
     return res.status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 500).json({
       success: false,
-      error: error instanceof Error ? `Scrape failed: ${error.message}` : 'Scrape failed',
+      error: errorMessage,
       code: error instanceof Error ? error.code || 'SCRAPE_FAILED' : 'SCRAPE_FAILED'
     });
   }
