@@ -162,6 +162,9 @@ function buildDirectPublishingPayload(input = {}, generatorPostId, generatorCont
     oldPrice: cleanText(input.oldPrice),
     couponCode: cleanText(input.couponCode),
     textByChannel: input.textByChannel && typeof input.textByChannel === 'object' ? input.textByChannel : {},
+    debugInfoByChannel:
+      input.debugInfoByChannel && typeof input.debugInfoByChannel === 'object' ? input.debugInfoByChannel : {},
+    testMode: input.testMode === true,
     telegramChatIds: testGroupConfig.chatId ? [String(testGroupConfig.chatId)] : [],
     imageVariants: {
       standard: cleanText(input.generatedImagePath),

@@ -1,4 +1,6 @@
 import './env.js';
+import fs from 'fs';
+import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import { getApiPort, getReaderRuntimeConfig, getTelegramTestGroupConfig, getTelegramUserReaderConfig } from './env.js';
@@ -21,14 +23,114 @@ import learningRoutes from './routes/learning.js';
 import dealEngineRoutes from './routes/dealEngine.js';
 import advertisingRoutes from './routes/advertising.js';
 import debugRoutes from './routes/debug.js';
+import createSystemRoutes from './routes/system.js';
 import { startKeepaScheduler } from './services/keepaService.js';
 import { startPublishingWorkerLoop } from './services/publisherService.js';
 import { startAdvertisingScheduler } from './services/advertisingService.js';
 import { startTelegramUserReaderRuntime } from './services/telegramUserClientService.js';
 
+const backendStartedAt = new Date().toISOString();
+const restartManager = String(process.env.BACKEND_RESTART_MANAGER || '').trim().toLowerCase();
+const nodemonRestartTriggerPath = path.join(process.cwd(), 'nodemon-restart-trigger.json');
+let restartPending = false;
+let server = null;
+
 console.info('[BOOT_START]', {
-  startedAt: new Date().toISOString()
+  startedAt: backendStartedAt
 });
+console.info('[SERVER_RESTARTED]', {
+  startedAt: backendStartedAt
+});
+
+function getRestartStatus() {
+  return {
+    enabled: restartManager === 'nodemon',
+    pending: restartPending === true,
+    manager: restartManager || 'unavailable'
+  };
+}
+
+function getHealthPayload() {
+  return {
+    ok: true,
+    restartManager: restartManager || 'unavailable',
+    restartPending: restartPending === true,
+    startedAt: backendStartedAt,
+    uptimeSeconds: Math.round(process.uptime())
+  };
+}
+
+function scheduleBackendRestart(meta = {}) {
+  const restartStatus = getRestartStatus();
+
+  if (restartStatus.enabled !== true) {
+    return {
+      accepted: false,
+      reason: 'restart_manager_unavailable',
+      manager: restartStatus.manager
+    };
+  }
+
+  if (restartPending === true) {
+    return {
+      accepted: true,
+      alreadyPending: true,
+      manager: restartStatus.manager,
+      reloadAfterMs: 3000
+    };
+  }
+
+  restartPending = true;
+
+  console.info('[SERVER_SHUTDOWN_INIT]', {
+    requestedAt: meta.requestedAt || new Date().toISOString(),
+    requesterRole: meta.requesterRole || 'unknown',
+    source: meta.source || 'manual',
+    restartManager: restartStatus.manager,
+    shutdownDelayMs: 200,
+    restartTriggerFile: nodemonRestartTriggerPath
+  });
+
+  const shutdownDelay = setTimeout(() => {
+    try {
+      fs.writeFileSync(
+        nodemonRestartTriggerPath,
+        JSON.stringify(
+          {
+            requestedAt: meta.requestedAt || new Date().toISOString(),
+            source: meta.source || 'manual',
+            requesterRole: meta.requesterRole || 'unknown',
+            triggeredAt: new Date().toISOString()
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+    } catch (error) {
+      restartPending = false;
+      console.warn('[NO_POST_REASON]', {
+        reason: 'Backend Restart Trigger Fehler',
+        detail: error instanceof Error ? error.message : 'Nodemon Restart-Datei konnte nicht geschrieben werden.'
+      });
+      return;
+    }
+
+    console.info('[SERVER_RESTART_TRIGGERED]', {
+      triggeredAt: new Date().toISOString(),
+      triggerPath: nodemonRestartTriggerPath,
+      restartManager: restartStatus.manager
+    });
+  }, 200);
+
+  shutdownDelay.unref?.();
+
+  return {
+    accepted: true,
+    manager: restartStatus.manager,
+    reloadAfterMs: 3000
+  };
+}
 
 const app = express();
 const port = getApiPort();
@@ -73,6 +175,10 @@ app.use(
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
+app.get('/api/health', (req, res) => {
+  res.json(getHealthPayload());
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/bot', botRoutes);
 app.use('/api/copybot', copybotRoutes);
@@ -93,9 +199,18 @@ app.use('/api/learning', learningRoutes);
 app.use('/api/deal-engine', dealEngineRoutes);
 app.use('/api/advertising', advertisingRoutes);
 app.use('/api/debug', debugRoutes);
+app.use(
+  '/api/system',
+  createSystemRoutes({
+    getHealthPayload,
+    getRestartStatus,
+    scheduleBackendRestart
+  })
+);
 
 console.info('[ROUTES_MOUNTED]', {
   mounted: [
+    '/api/health',
     '/api/auth',
     '/api/bot',
     '/api/copybot',
@@ -114,7 +229,8 @@ console.info('[ROUTES_MOUNTED]', {
     '/api/learning',
     '/api/deal-engine',
     '/api/advertising',
-    '/api/debug'
+    '/api/debug',
+    '/api/system'
   ]
 });
 
@@ -137,7 +253,7 @@ console.info('[PORT_BIND_ATTEMPT]', {
   port
 });
 
-const server = app.listen(port, () => {
+server = app.listen(port, () => {
   if (String(port) === '4000') {
     console.info('[PORT_BOUND_4000_OK]', {
       port: 4000

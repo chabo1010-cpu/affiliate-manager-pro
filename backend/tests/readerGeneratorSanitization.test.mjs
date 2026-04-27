@@ -77,6 +77,24 @@ await test('Amazon-Preis priorisiert BuyBox vor Deal- und Telegram-Preis', async
   assert.doesNotMatch(template.telegramCaption, /39,99/);
 });
 
+await test('Amazon-Preis uebernimmt keinen Quellenpreis, wenn kein verifizierter Amazon-Preis vorliegt', async () => {
+  const pricePayload = __testablesTelegramUserClient.resolveReaderPricePayload({
+    dealType: 'AMAZON',
+    scrapedDeal: {
+      basePrice: '',
+      price: '',
+      finalPrice: '',
+      finalPriceCalculated: false
+    },
+    pricing: {
+      currentPrice: '39,99'
+    }
+  });
+
+  assert.equal(pricePayload.priceSource, 'unknown');
+  assert.equal(pricePayload.currentPrice, '');
+});
+
 await test('Fallback-Bild wird erzeugt, wenn keine Bildquelle vorhanden ist', async () => {
   const imagePayload = __testablesTelegramUserClient.resolveReaderImagePayload({
     dealType: 'NON_AMAZON',
@@ -102,7 +120,7 @@ await test('Cloudflare-Titel wird erkannt und nicht als Produktdaten verwendet',
   assert.ok(matches.some((entry) => entry.key === 'checking_your_browser'));
 });
 
-await test('Amazon-Deal nutzt im Testpfad Quellenbild als Fallback statt zu blockieren', async () => {
+await test('Amazon-Deal blockiert Quellenbild und liefert kein finales Bildfallback', async () => {
   const imagePayload = __testablesTelegramUserClient.resolveReaderImagePayload({
     dealType: 'AMAZON',
     scrapedDeal: {
@@ -117,8 +135,8 @@ await test('Amazon-Deal nutzt im Testpfad Quellenbild als Fallback statt zu bloc
     currentPrice: '49,99'
   });
 
-  assert.equal(imagePayload.imageSource, 'telegram');
-  assert.equal(imagePayload.generatedImagePath, 'https://cdn.example.com/source-image.jpg');
+  assert.equal(imagePayload.imageSource, '');
+  assert.equal(imagePayload.generatedImagePath, '');
   assert.equal(imagePayload.uploadedImagePath, '');
 });
 
@@ -151,7 +169,7 @@ await test('Produktverifikation blockiert Cloudflare/Fremdlink ohne Amazon-Bild 
   assert.match(verification.reason, /Cloudflare|Partnerlink|ASIN|Amazon-Bild/i);
 });
 
-await test('Produktverifikation wird im Reader-Testmodus nur noch als Warnung markiert', async () => {
+await test('Produktverifikation blockiert Amazon-Deals auch im Reader-Testmodus bei Fremdlink oder fehlender ASIN', async () => {
   const verification = __testablesTelegramUserClient.resolveProductVerification({
     dealType: 'AMAZON',
     linkRecord: {
@@ -180,8 +198,8 @@ await test('Produktverifikation wird im Reader-Testmodus nur noch als Warnung ma
     }
   });
 
-  assert.equal(verification.verified, true);
-  assert.equal(verification.warningOnly, true);
+  assert.equal(verification.verified, false);
+  assert.equal(verification.warningOnly, false);
   assert.match(verification.reason, /Cloudflare|Partnerlink|ASIN/i);
 });
 

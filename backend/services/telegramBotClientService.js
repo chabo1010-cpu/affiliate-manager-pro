@@ -1,7 +1,7 @@
 import { getDb } from '../db.js';
 import { getTelegramConfig } from '../env.js';
 import { cleanText } from './dealHistoryService.js';
-import { sendTelegramPost } from './telegramSenderService.js';
+import { sendTelegramDealPost } from './telegramSenderService.js';
 
 const db = getDb();
 const DEFAULT_RETRY_LIMIT = 3;
@@ -398,6 +398,10 @@ export async function sendTelegramDealToTargets(input = {}) {
     ? resolveTargetsFromPayload({ telegramChatIds: requestedChatIds }, config)
     : resolveTargetsFromPayload(input.queuePayload ?? {}, config);
   const text = cleanText(input.text);
+  const queuePayload = input.queuePayload && typeof input.queuePayload === 'object' ? input.queuePayload : {};
+  const hasStructuredDealPayload = Boolean(
+    cleanText(queuePayload.title) || cleanText(queuePayload.currentPrice) || cleanText(queuePayload.link)
+  );
 
   if (!config.enabled) {
     throw buildTelegramBotError('Telegram Bot Client ist deaktiviert.', { retryable: false });
@@ -407,7 +411,7 @@ export async function sendTelegramDealToTargets(input = {}) {
     throw buildTelegramBotError('TELEGRAM_BOT_TOKEN fehlt im Backend.', { retryable: false });
   }
 
-  if (!text) {
+  if (!text && !hasStructuredDealPayload) {
     throw buildTelegramBotError('Telegram-Text fuer den Versand fehlt.', { retryable: false });
   }
 
@@ -433,7 +437,9 @@ export async function sendTelegramDealToTargets(input = {}) {
     hasUploadedImage: Boolean(cleanText(input.uploadedImage)),
     hasImageUrl: Boolean(cleanText(input.imageUrl)),
     disableWebPagePreview: input.disableWebPagePreview === true,
-    hasCouponCode: Boolean(cleanText(input.rabattgutscheinCode))
+    hasCouponCode: Boolean(cleanText(input.rabattgutscheinCode)),
+    hasStructuredDealPayload,
+    titlePreview: cleanText(queuePayload.title).slice(0, 120) || null
   });
 
   const deliveredTargets = [];
@@ -441,14 +447,19 @@ export async function sendTelegramDealToTargets(input = {}) {
 
   for (const target of resolution.targets) {
     try {
-      const result = await sendTelegramPost({
-        text,
+      const result = await sendTelegramDealPost({
+        title: cleanText(queuePayload.title),
+        price: cleanText(queuePayload.currentPrice),
+        affiliateLink: cleanText(queuePayload.link),
+        asin: cleanText(queuePayload.asin).toUpperCase(),
+        debugInfo: cleanText(queuePayload.debugInfoByChannel?.telegram || ''),
+        testMode: queuePayload.testMode === true,
         uploadedFile: input.uploadedFile,
         uploadedImage: input.uploadedImage,
         imageUrl: input.imageUrl,
-        disableWebPagePreview: input.disableWebPagePreview,
-        rabattgutscheinCode: input.rabattgutscheinCode,
-        chatId: target.chatId
+        chatId: target.chatId,
+        fallbackText: text,
+        rabattgutscheinCode: input.rabattgutscheinCode
       });
 
       deliveredTargets.push({

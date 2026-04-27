@@ -1,5 +1,5 @@
 import { getTelegramConfig } from '../env.js';
-import { getTelegramCopyButtonText } from './dealHistoryService.js';
+import { buildAmazonAffiliateLinkRecord, getTelegramCopyButtonText } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 import sharp from 'sharp';
 
@@ -10,8 +10,384 @@ const NORMALIZED_POST_IMAGE = {
   background: '#ffffff'
 };
 const TELEGRAM_CAPTION_LIMIT = 1024;
+const TELEGRAM_SAFE_CAPTION_LIMIT = 900;
 const TELEGRAM_MESSAGE_LIMIT = 4096;
-const TELEGRAM_SHORT_CAPTION_FALLBACK = '🔥 Deal gefunden';
+const TELEGRAM_EXTRA_INFO_HEADER_PATTERN =
+  /\n{2,}(?=[^\n]*<b>(?:TESTPOST(?: NICHT FREIGEGEBEN)?|Kurzinfo|DEAL STATUS|SELLER CHECK|VERGLEICH & KI|SYSTEM REGELN)<\/b>)/;
+
+function cleanText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function escapeTelegramHtml(value = '') {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildTelegramMainDealText({ title = '', price = '', affiliateLink = '', fallbackText = '' } = {}) {
+  const safeTitle = cleanText(title);
+  const safePrice = cleanText(price);
+  const safeAffiliateLink = cleanText(affiliateLink);
+
+  if (!safeTitle && !safePrice && !safeAffiliateLink) {
+    return cleanText(fallbackText);
+  }
+
+  const titleBlock = safeTitle ? `<b>${escapeTelegramHtml(safeTitle)}</b>` : '';
+  const dealLines = [];
+  if (safePrice) {
+    dealLines.push(`🔥 Jetzt <b>${escapeTelegramHtml(safePrice)}</b>`);
+  }
+  if (safeAffiliateLink) {
+    dealLines.push(`➡️ <b>${escapeTelegramHtml(safeAffiliateLink)}</b>`);
+  }
+  const dealBlock = dealLines.join('\n').trim();
+  const footerBlock = '<i>Anzeige/Partnerlink</i>';
+  const leadingBlocks = [titleBlock, dealBlock].filter(Boolean).join('\n\n').trim();
+  const finalText = `${leadingBlocks}\n\n\n${footerBlock}`.trim();
+
+  console.info('[MAIN_POST_PROTECTED]', {
+    hasTitle: Boolean(safeTitle),
+    hasPrice: Boolean(safePrice),
+    hasAffiliateLink: Boolean(safeAffiliateLink),
+    hasDisclaimer: true,
+    debugDetached: true
+  });
+  console.info('[MAIN_POST_SPACING_FIXED]', {
+    hasTitle: Boolean(safeTitle),
+    hasPrice: Boolean(safePrice),
+    hasAffiliateLink: Boolean(safeAffiliateLink),
+    footerSpacing: 'double_blank_line'
+  });
+  console.info('[MAIN_CAPTION_SPACING_FIXED]', {
+    hasTitle: Boolean(safeTitle),
+    hasPrice: Boolean(safePrice),
+    hasAffiliateLink: Boolean(safeAffiliateLink),
+    footerSpacing: 'double_blank_line'
+  });
+  return finalText;
+}
+
+function extractFirstUrl(text = '') {
+  const match = cleanText(text).match(/https?:\/\/[^\s<>"']+/i);
+  return cleanText(match?.[0] || '');
+}
+
+function looksLikeTelegramDebugText(text = '') {
+  const normalized = cleanText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return /TESTPOST|DEAL STATUS|ERGEBNIS|PR\u00dcFUNGEN|PRÜFUNGEN|WO EINSTELLBAR/i.test(normalized);
+}
+
+function looksLikeGeneratorRenderedText(text = '') {
+  const normalized = cleanText(text);
+  if (!normalized || looksLikeTelegramDebugText(normalized)) {
+    return false;
+  }
+
+  return (
+    /Anzeige\/Partnerlink/i.test(normalized) &&
+    /<b>.*<\/b>/i.test(normalized) &&
+    /https?:\/\/[^\s<>"']+/i.test(normalized)
+  );
+}
+
+function buildTelegramFallbackMainPostText({
+  title = '',
+  price = '',
+  affiliateLink = '',
+  sourceLink = '',
+  diagnostic = false
+} = {}) {
+  const safeTitle = cleanText(title) || (diagnostic ? '⚠️ Deal erkannt' : 'Deal erkannt');
+  const safePrice = cleanText(price) || 'n/a';
+  const safeLink = cleanText(affiliateLink) || cleanText(sourceLink) || 'Link nicht verfuegbar';
+
+  return [
+    `<b>${escapeTelegramHtml(safeTitle)}</b>`,
+    '',
+    `🔥 Jetzt <b>${escapeTelegramHtml(safePrice)}</b>`,
+    `➡️ <b>${escapeTelegramHtml(safeLink)}</b>`,
+    '',
+    '',
+    '<i>Anzeige/Partnerlink</i>'
+  ].join('\n');
+}
+
+function stripTelegramHtml(text = '') {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\r/g, '');
+}
+
+function normalizeFallbackLine(line = '') {
+  return cleanText(
+    stripTelegramHtml(line)
+      .replace(/\s+/g, ' ')
+      .replace(/\u00a0/g, ' ')
+  );
+}
+
+function isMeaningfulFallbackTitle(line = '') {
+  const normalized = normalizeFallbackLine(line);
+  if (!normalized) {
+    return false;
+  }
+
+  if (
+    /^(TESTPOST|ERGEBNIS|DEAL STATUS|PRÜFUNGEN|PRUEFUNGEN|WERTE|WO EINSTELLBAR|ANZEIGE\/PARTNERLINK)$/i.test(
+      normalized
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    /^(📌|🚀|🧪|📝|🌍|🤖|📈|🛒|💶|📉|⭐|🎟|🔁|⚠️|🔥|➡️)/u.test(normalized) ||
+    /^(Entscheidung|Live|Testgruppe|Grund|Preis|Rabatt|Score|Fake-Risiko|Coupon|Spar-Abo)\s*:/i.test(normalized)
+  ) {
+    return false;
+  }
+
+  if (/^https?:\/\//i.test(normalized)) {
+    return false;
+  }
+
+  if (/^(?:⚠️\s*)?(Amazon Produkt|Deal erkannt)$/iu.test(normalized)) {
+    return false;
+  }
+
+  return normalized.length >= 4;
+}
+
+function extractFallbackTitleFromText(text = '') {
+  const normalizedText = cleanText(text);
+  if (!normalizedText) {
+    return { value: '', source: '' };
+  }
+
+  const boldMatches = [...normalizedText.matchAll(/<b>([^<]+)<\/b>/gi)];
+  for (const match of boldMatches) {
+    const candidate = normalizeFallbackLine(match[1]);
+    if (isMeaningfulFallbackTitle(candidate)) {
+      return {
+        value: candidate,
+        source: 'textPreviewBold'
+      };
+    }
+  }
+
+  const lines = stripTelegramHtml(normalizedText).split('\n');
+  for (const line of lines) {
+    const candidate = normalizeFallbackLine(line);
+    if (isMeaningfulFallbackTitle(candidate)) {
+      return {
+        value: candidate,
+        source: 'textPreviewLine'
+      };
+    }
+  }
+
+  return { value: '', source: '' };
+}
+
+function extractFallbackPriceFromText(text = '') {
+  const normalizedText = cleanText(text);
+  if (!normalizedText) {
+    return { value: '', source: '' };
+  }
+
+  const plainText = stripTelegramHtml(normalizedText);
+  const lines = plainText.split('\n').map((line) => normalizeFallbackLine(line)).filter(Boolean);
+  const labelledLine =
+    lines.find((line) => /^💶\s*Preis\s*:/u.test(line)) || lines.find((line) => /^Preis\s*:/i.test(line));
+  if (labelledLine) {
+    const candidate = cleanText(labelledLine.replace(/^.*?:\s*/u, ''));
+    if (candidate && !/^n\/a$/i.test(candidate)) {
+      return {
+        value: candidate,
+        source: 'priceFromMessage'
+      };
+    }
+  }
+
+  const dealLine = lines.find((line) => /🔥\s*Jetzt/u.test(line));
+  if (dealLine) {
+    const candidate = cleanText(dealLine.replace(/^.*?Jetzt\s*/u, ''));
+    if (candidate && !/^n\/a$/i.test(candidate)) {
+      return {
+        value: candidate,
+        source: 'parsedPrice'
+      };
+    }
+  }
+
+  const genericMatch = plainText.match(/(?:\b|^)(\d{1,4}(?:[.,]\d{2})\s*(?:€|EUR)|€\s*\d{1,4}(?:[.,]\d{2})?)/i);
+  if (genericMatch?.[1]) {
+    return {
+      value: cleanText(genericMatch[1].replace(/^€\s*/i, '').replace(/\s+EUR$/i, ' EUR')),
+      source: 'parsedPrice'
+    };
+  }
+
+  return { value: '', source: '' };
+}
+
+function extractAllUrls(text = '') {
+  return [...String(text || '').matchAll(/https?:\/\/[^\s<>"']+/gi)].map((match) => cleanText(match[0])).filter(Boolean);
+}
+
+function isAmazonDomainLink(url = '') {
+  return /https?:\/\/(?:www\.)?amazon\.[^/\s]+/i.test(cleanText(url));
+}
+
+function resolveMainFallbackSourceValues({
+  title = '',
+  price = '',
+  affiliateLink = '',
+  sourceLink = '',
+  fallbackText = '',
+  debugInfo = '',
+  testMode = false,
+  imageUrl = '',
+  uploadedFile,
+  uploadedImage
+} = {}) {
+  const explicitTitle = cleanText(title);
+  const explicitPrice = cleanText(price);
+  const explicitAffiliateLink = cleanText(affiliateLink);
+  const safeSourceLink = cleanText(sourceLink);
+  const texts = [cleanText(fallbackText), cleanText(debugInfo)].filter(Boolean);
+  const titleSources = [];
+  const priceSources = [];
+  const linkCandidates = [];
+
+  if (explicitTitle && !/^(?:⚠️\s*)?(Amazon Produkt|Deal erkannt)$/iu.test(explicitTitle)) {
+    titleSources.push({ value: explicitTitle, source: 'extractedTitle' });
+  }
+  for (const text of texts) {
+    const titleCandidate = extractFallbackTitleFromText(text);
+    if (titleCandidate.value) {
+      titleSources.push(titleCandidate);
+    }
+  }
+
+  if (explicitPrice && !/^n\/a$/i.test(explicitPrice)) {
+    priceSources.push({ value: explicitPrice, source: 'extractedPrice' });
+  }
+  for (const text of texts) {
+    const priceCandidate = extractFallbackPriceFromText(text);
+    if (priceCandidate.value) {
+      priceSources.push(priceCandidate);
+    }
+  }
+
+  if (explicitAffiliateLink) {
+    linkCandidates.push({ value: explicitAffiliateLink, source: 'ownAffiliateLink' });
+  }
+  for (const text of texts) {
+    for (const url of extractAllUrls(text)) {
+      linkCandidates.push({
+        value: url,
+        source: isAmazonDomainLink(url) ? 'originalAmazonLink' : 'sourceLink'
+      });
+    }
+  }
+  if (safeSourceLink) {
+    linkCandidates.push({
+      value: safeSourceLink,
+      source: isAmazonDomainLink(safeSourceLink) ? 'originalAmazonLink' : 'sourceLink'
+    });
+  }
+
+  const fallbackTitle = titleSources[0]?.value || '';
+  const titleSource = titleSources[0]?.source || 'defaultTitle';
+  const fallbackPrice = priceSources[0]?.value || '';
+  const priceSource = priceSources[0]?.source || 'defaultPrice';
+  const preferredAmazonLink = linkCandidates.find((candidate) => candidate.source === 'ownAffiliateLink');
+  const rawAmazonLink = linkCandidates.find((candidate) => candidate.source === 'originalAmazonLink');
+  const rawSourceLink = linkCandidates.find((candidate) => candidate.source === 'sourceLink');
+  const selectedLink =
+    preferredAmazonLink ||
+    rawAmazonLink ||
+    (testMode === true ? rawSourceLink : null) || {
+      value: '',
+      source: 'defaultLink'
+    };
+  const imageSource = uploadedFile
+    ? 'uploadedFile'
+    : cleanText(uploadedImage)
+      ? 'screenshot'
+      : cleanText(imageUrl)
+        ? 'sourceImage'
+        : 'none';
+
+  return {
+    title: fallbackTitle || (texts.length ? '' : ''),
+    titleSource,
+    price: fallbackPrice,
+    priceSource,
+    link: cleanText(selectedLink.value),
+    linkSource: selectedLink.source,
+    imageSource
+  };
+}
+
+function resolveMainPostFieldValues({
+  title = '',
+  price = '',
+  resolvedAffiliateLink = '',
+  fallbackSourceValues = {}
+} = {}) {
+  const explicitTitle = cleanText(title);
+  const explicitPrice = cleanText(price);
+  const explicitAffiliateLink = cleanText(resolvedAffiliateLink);
+  const fallbackTitle = cleanText(fallbackSourceValues?.title);
+  const fallbackPrice = cleanText(fallbackSourceValues?.price);
+  const fallbackLink = cleanText(fallbackSourceValues?.link);
+  const hasExplicitTitle = explicitTitle && !/^(?:âš ï¸\s*)?(Amazon Produkt|Deal erkannt)$/iu.test(explicitTitle);
+  const hasExplicitPrice = explicitPrice && !/^n\/a$/i.test(explicitPrice);
+
+  return {
+    title: hasExplicitTitle ? explicitTitle : fallbackTitle,
+    titleSource: hasExplicitTitle ? 'extractedTitle' : fallbackSourceValues?.titleSource || 'defaultTitle',
+    price: hasExplicitPrice ? explicitPrice : fallbackPrice,
+    priceSource: hasExplicitPrice ? 'extractedPrice' : fallbackSourceValues?.priceSource || 'defaultPrice',
+    link: explicitAffiliateLink || fallbackLink,
+    linkSource: explicitAffiliateLink ? 'ownAffiliateLink' : fallbackSourceValues?.linkSource || 'defaultLink'
+  };
+}
+
+function resolveTelegramAffiliateLink({ affiliateLink = '', asin = '' } = {}) {
+  const rawAffiliateLink = cleanText(affiliateLink);
+  const normalizedAsin = cleanText(asin).toUpperCase();
+
+  if (normalizedAsin) {
+    const rebuiltRecord = buildAmazonAffiliateLinkRecord(rawAffiliateLink || normalizedAsin, { asin: normalizedAsin });
+    if (rebuiltRecord.valid && cleanText(rebuiltRecord.affiliateUrl)) {
+      return {
+        affiliateLink: cleanText(rebuiltRecord.affiliateUrl),
+        normalizedUrl: cleanText(rebuiltRecord.normalizedUrl),
+        strippedForeignLink: Boolean(rawAffiliateLink) && cleanText(rebuiltRecord.affiliateUrl) !== rawAffiliateLink
+      };
+    }
+  }
+
+  return {
+    affiliateLink: rawAffiliateLink,
+    normalizedUrl: rawAffiliateLink,
+    strippedForeignLink: false
+  };
+}
 
 async function sendTelegramRequest(token, method, payload, options = {}) {
   const useHtml = options.html !== false;
@@ -230,6 +606,155 @@ function splitTelegramTextIntoChunks(text = '', limit = TELEGRAM_MESSAGE_LIMIT) 
   return chunks.filter(Boolean);
 }
 
+function splitTelegramPhotoPostText(text = '') {
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  if (!normalizedText) {
+    return {
+      mainText: '',
+      extraText: '',
+      splitIndex: -1,
+      splitMarker: ''
+    };
+  }
+
+  const separatorMatch = TELEGRAM_EXTRA_INFO_HEADER_PATTERN.exec(normalizedText);
+  if (!separatorMatch || separatorMatch.index <= 0) {
+    return {
+      mainText: normalizedText,
+      extraText: '',
+      splitIndex: -1,
+      splitMarker: ''
+    };
+  }
+
+  const splitIndex = separatorMatch.index;
+  const mainText = normalizedText.slice(0, splitIndex).trim();
+  const extraText = normalizedText.slice(splitIndex).trim();
+  const splitMarkerMatch = extraText.match(/<b>([^<]+)<\/b>/);
+
+  if (!mainText) {
+    return {
+      mainText: normalizedText,
+      extraText: '',
+      splitIndex: -1,
+      splitMarker: ''
+    };
+  }
+
+  return {
+    mainText,
+    extraText,
+    splitIndex,
+    splitMarker: splitMarkerMatch?.[1] || ''
+  };
+}
+
+function closeUnbalancedTelegramTags(text = '') {
+  const tagPattern = /<\/?(b|i)>/g;
+  const openTags = [];
+  let match;
+
+  while ((match = tagPattern.exec(text))) {
+    const tagName = match[1];
+    const isClosingTag = match[0].startsWith('</');
+
+    if (!isClosingTag) {
+      openTags.push(tagName);
+      continue;
+    }
+
+    if (openTags[openTags.length - 1] === tagName) {
+      openTags.pop();
+      continue;
+    }
+
+    const danglingIndex = openTags.lastIndexOf(tagName);
+    if (danglingIndex !== -1) {
+      openTags.splice(danglingIndex, 1);
+    }
+  }
+
+  return `${text}${openTags.reverse().map((tagName) => `</${tagName}>`).join('')}`;
+}
+
+function findSafeCaptionCutIndex(text = '', limit = TELEGRAM_SAFE_CAPTION_LIMIT) {
+  if (text.length <= limit) {
+    return text.length;
+  }
+
+  let cutIndex = text.lastIndexOf('\n', limit);
+  if (cutIndex <= 0) {
+    cutIndex = text.lastIndexOf(' ', limit);
+  }
+  if (cutIndex <= 0) {
+    cutIndex = limit;
+  }
+
+  const lastOpenTagIndex = text.lastIndexOf('<', cutIndex);
+  const lastCloseTagIndex = text.lastIndexOf('>', cutIndex);
+  if (lastOpenTagIndex > lastCloseTagIndex) {
+    const priorLineBreak = text.lastIndexOf('\n', lastOpenTagIndex);
+    const priorSpace = text.lastIndexOf(' ', lastOpenTagIndex);
+    const priorBoundary = Math.max(priorLineBreak, priorSpace);
+    cutIndex = priorBoundary > 0 ? priorBoundary : lastOpenTagIndex;
+  }
+
+  if (cutIndex <= 0) {
+    cutIndex = Math.min(limit, text.length);
+  }
+
+  return cutIndex;
+}
+
+function trimTelegramPhotoCaption(text = '', limit = TELEGRAM_SAFE_CAPTION_LIMIT) {
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  if (!normalizedText) {
+    return {
+      text: '',
+      beforeLength: 0,
+      afterLength: 0,
+      cutAt: null,
+      cutContext: '',
+      trimmed: false,
+      limit
+    };
+  }
+
+  if (normalizedText.length <= limit) {
+    return {
+      text: normalizedText,
+      beforeLength: normalizedText.length,
+      afterLength: normalizedText.length,
+      cutAt: null,
+      cutContext: '',
+      trimmed: false,
+      limit
+    };
+  }
+
+  let workingCutIndex = findSafeCaptionCutIndex(normalizedText, limit);
+  let workingText = normalizedText.slice(0, workingCutIndex).trimEnd();
+  let trimmedCaption = closeUnbalancedTelegramTags(workingText).trim();
+
+  while (trimmedCaption.length > limit && workingText.length > 1) {
+    const overflow = trimmedCaption.length - limit;
+    workingText = workingText.slice(0, Math.max(1, workingText.length - overflow)).trimEnd();
+    trimmedCaption = closeUnbalancedTelegramTags(workingText).trim();
+  }
+
+  workingCutIndex = workingText.length;
+
+  return {
+    text: trimmedCaption,
+    beforeLength: normalizedText.length,
+    afterLength: trimmedCaption.length,
+    cutAt: workingCutIndex,
+    cutContext: normalizedText.slice(Math.max(0, workingCutIndex - 80), Math.min(normalizedText.length, workingCutIndex + 80)),
+    trimmed: true,
+    limit
+  };
+}
+
 async function sendSingleTelegramDelivery({
   token,
   finalChatId,
@@ -237,11 +762,18 @@ async function sendSingleTelegramDelivery({
   parsedUploadedImage = null,
   effectiveImageUrl = '',
   resolvedDisableWebPagePreview = false,
-  replyMarkup = undefined
+  replyMarkup = undefined,
+  deliveryMeta = {}
 }) {
   const telegramMethod = parsedUploadedImage || effectiveImageUrl ? 'sendPhoto' : 'sendMessage';
   let telegramResponse;
   let telegramData;
+  const titlePreview = cleanText(deliveryMeta.titlePreview || '').slice(0, 120);
+  const captionLength = Number.isFinite(Number(deliveryMeta.captionLength))
+    ? Number(deliveryMeta.captionLength)
+    : cleanText(text).length;
+  const hasAffiliateLink = deliveryMeta.hasAffiliateLink === true;
+  const hasImage = Boolean(parsedUploadedImage || effectiveImageUrl);
 
   console.info('[TELEGRAM_SEND_START]', {
     chatId: finalChatId,
@@ -249,7 +781,10 @@ async function sendSingleTelegramDelivery({
     textLength: text.trim().length,
     hasUploadedImage: Boolean(parsedUploadedImage),
     hasImageUrl: Boolean(effectiveImageUrl),
-    hasCouponCode: Boolean(replyMarkup)
+    hasCouponCode: Boolean(replyMarkup),
+    titlePreview: titlePreview || null,
+    captionLength,
+    hasAffiliateLink
   });
   console.info('[TELEGRAM_FORCE_SEND_START]', {
     chatId: finalChatId,
@@ -260,7 +795,10 @@ async function sendSingleTelegramDelivery({
       uploadedImage: Boolean(parsedUploadedImage),
       imageUrl: effectiveImageUrl || null,
       disableWebPagePreview: resolvedDisableWebPagePreview,
-      replyMarkup: Boolean(replyMarkup)
+      replyMarkup: Boolean(replyMarkup),
+      titlePreview: titlePreview || null,
+      captionLength,
+      hasAffiliateLink
     }
   });
 
@@ -313,6 +851,7 @@ async function sendSingleTelegramDelivery({
   if (!telegramResponse.ok || !telegramData?.ok) {
     const telegramDescription =
       telegramData?.description || telegramData?.raw || 'Telegram API hat einen unbekannten Fehler geliefert';
+    const errorCode = Number.isFinite(Number(telegramData?.error_code)) ? Number(telegramData.error_code) : null;
     console.warn('[NO_POST_REASON]', {
       reason: 'Telegram Send Fehler',
       detail: telegramDescription,
@@ -322,7 +861,12 @@ async function sendSingleTelegramDelivery({
     console.error('[TELEGRAM_SEND_ERROR]', {
       chatId: finalChatId,
       method: telegramMethod,
-      error: telegramDescription
+      errorCode,
+      errorMessage: telegramDescription,
+      titlePreview: titlePreview || null,
+      captionLength,
+      hasImage,
+      hasAffiliateLink
     });
     console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
       chatId: finalChatId,
@@ -347,7 +891,10 @@ async function sendSingleTelegramDelivery({
   console.info('[TELEGRAM_SEND_SUCCESS]', {
     chatId: telegramData.result?.chat?.id ?? finalChatId,
     method: telegramMethod,
-    messageId: telegramData.result?.message_id
+    messageId: telegramData.result?.message_id,
+    titlePreview: titlePreview || null,
+    captionLength,
+    hasAffiliateLink
   });
   console.info('[TELEGRAM_FORCE_SEND_SUCCESS]', {
     chatId: telegramData.result?.chat?.id ?? finalChatId,
@@ -363,6 +910,418 @@ async function sendSingleTelegramDelivery({
   };
 }
 
+export async function sendTelegramDealPost({
+  title = '',
+  price = '',
+  affiliateLink = '',
+  asin = '',
+  debugInfo = '',
+  testMode = false,
+  uploadedFile,
+  uploadedImage,
+  imageUrl = '',
+  chatId,
+  fallbackText = '',
+  rabattgutscheinCode = ''
+} = {}) {
+  const resolvedAffiliate = resolveTelegramAffiliateLink({
+    affiliateLink,
+    asin
+  });
+  const fallbackSourceLink = extractFirstUrl(fallbackText) || cleanText(affiliateLink);
+  const fallbackTextLooksLikeDebug = looksLikeTelegramDebugText(fallbackText);
+  const directDebugInfo = testMode === true ? cleanText(debugInfo) : '';
+  const trimmedDebugInfo = directDebugInfo || (testMode === true && fallbackTextLooksLikeDebug ? cleanText(fallbackText) : '');
+  const fallbackSourceValues = resolveMainFallbackSourceValues({
+    title,
+    price,
+    affiliateLink: resolvedAffiliate.affiliateLink || cleanText(affiliateLink),
+    sourceLink: fallbackSourceLink,
+    fallbackText,
+    debugInfo: trimmedDebugInfo,
+    testMode,
+    imageUrl,
+    uploadedFile,
+    uploadedImage
+  });
+  const resolvedMainPostFields = resolveMainPostFieldValues({
+    title,
+    price,
+    resolvedAffiliateLink: resolvedAffiliate.affiliateLink,
+    fallbackSourceValues
+  });
+  const renderedGeneratorMainText = cleanText(fallbackText);
+  const useRenderedGeneratorMainText = looksLikeGeneratorRenderedText(renderedGeneratorMainText);
+  const buildRequiresFallback =
+    !useRenderedGeneratorMainText &&
+    (!cleanText(resolvedMainPostFields.title) ||
+      !cleanText(resolvedMainPostFields.price) ||
+      !cleanText(resolvedMainPostFields.link) ||
+      fallbackTextLooksLikeDebug);
+  fallbackSourceValues.title = resolvedMainPostFields.title;
+  fallbackSourceValues.titleSource = resolvedMainPostFields.titleSource;
+  fallbackSourceValues.price = resolvedMainPostFields.price;
+  fallbackSourceValues.priceSource = resolvedMainPostFields.priceSource;
+  fallbackSourceValues.link = resolvedMainPostFields.link;
+  fallbackSourceValues.linkSource = resolvedMainPostFields.linkSource;
+  console.info('[MAIN_POST_BUILD_START]', {
+    titleSource: resolvedMainPostFields.titleSource,
+    priceSource: resolvedMainPostFields.priceSource,
+    linkSource: resolvedMainPostFields.linkSource,
+    buildRequiresFallback,
+    hasFallbackText: Boolean(cleanText(fallbackText)),
+    usesGeneratorRenderedText: useRenderedGeneratorMainText
+  });
+  const initialMainPostText = useRenderedGeneratorMainText
+    ? renderedGeneratorMainText
+    : buildTelegramMainDealText({
+        title: resolvedMainPostFields.title,
+        price: resolvedMainPostFields.price,
+        affiliateLink: resolvedMainPostFields.link,
+        fallbackText: buildRequiresFallback ? '' : fallbackTextLooksLikeDebug ? '' : fallbackText
+      });
+  const fallbackMainRequired =
+    (!useRenderedGeneratorMainText &&
+      (buildRequiresFallback || !cleanText(initialMainPostText) || looksLikeTelegramDebugText(initialMainPostText))) ||
+    (useRenderedGeneratorMainText && !cleanText(initialMainPostText));
+  const mainPostText = fallbackMainRequired
+    ? buildTelegramFallbackMainPostText({
+        title: resolvedMainPostFields.title,
+        price: resolvedMainPostFields.price,
+        affiliateLink: resolvedMainPostFields.linkSource === 'ownAffiliateLink' ? resolvedMainPostFields.link : '',
+        sourceLink: resolvedMainPostFields.link,
+        diagnostic: Boolean(trimmedDebugInfo) || fallbackTextLooksLikeDebug
+      })
+    : initialMainPostText;
+  const trimmedMainPostText = cleanText(mainPostText);
+  const hasImage = Boolean(uploadedFile || cleanText(uploadedImage) || cleanText(imageUrl));
+  const captionResult = trimTelegramPhotoCaption(trimmedMainPostText, TELEGRAM_SAFE_CAPTION_LIMIT);
+  const safeMainPostText = cleanText(captionResult.text || trimmedMainPostText);
+  let mainPostSent = false;
+
+  console.info('[CENTRAL_TELEGRAM_DEAL_SENDER_USED]', {
+    titlePreview: cleanText(title).slice(0, 120) || null,
+    hasImage,
+    testMode: testMode === true,
+    hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
+    debugInfoLength: trimmedDebugInfo.length
+  });
+  if (trimmedMainPostText) {
+    console.info('[MAIN_POST_BUILD_SUCCESS]', {
+      titleSource: resolvedMainPostFields.titleSource,
+      priceSource: resolvedMainPostFields.priceSource,
+      linkSource: resolvedMainPostFields.linkSource,
+      textLength: trimmedMainPostText.length,
+      fallbackUsed: fallbackMainRequired
+    });
+  } else {
+    console.error('[MAIN_POST_BUILD_FAILED]', {
+      titleSource: resolvedMainPostFields.titleSource,
+      priceSource: resolvedMainPostFields.priceSource,
+      linkSource: resolvedMainPostFields.linkSource,
+      fallbackUsed: fallbackMainRequired
+    });
+  }
+  if (resolvedAffiliate.strippedForeignLink) {
+    console.info('[FOREIGN_LINK_REMOVED]', {
+      originalLink: cleanText(affiliateLink) || null,
+      affiliateLink: resolvedAffiliate.affiliateLink || null,
+      asin: cleanText(asin).toUpperCase() || ''
+    });
+  }
+  if (resolvedAffiliate.affiliateLink) {
+    console.info('[AFFILIATE_LINK_BUILT]', {
+      affiliateLink: resolvedAffiliate.affiliateLink,
+      asin: cleanText(asin).toUpperCase() || ''
+    });
+    console.info('[OWN_AFFILIATE_LINK_USED]', {
+      affiliateLink: resolvedAffiliate.affiliateLink,
+      asin: cleanText(asin).toUpperCase() || ''
+    });
+  } else {
+    console.warn('[AFFILIATE_LINK_MISSING]', {
+      asin: cleanText(asin).toUpperCase() || '',
+      fallbackLinkSource: resolvedMainPostFields.linkSource,
+      fallbackLink: cleanText(resolvedMainPostFields.link) || null
+    });
+  }
+  if (hasImage) {
+    console.info('[MAIN_POST_IMAGE_FOUND]', {
+      imageSource: fallbackSourceValues.imageSource,
+      hasUploadedFile: Boolean(uploadedFile),
+      hasUploadedImage: Boolean(cleanText(uploadedImage)),
+      hasImageUrl: Boolean(cleanText(imageUrl))
+    });
+  } else {
+    console.warn('[MAIN_POST_IMAGE_MISSING]', {
+      imageSource: fallbackSourceValues.imageSource
+    });
+  }
+
+  console.info('[MAIN_POST_REQUIRED]', {
+    chatId: cleanText(String(chatId || '')) || null,
+    titlePreview: cleanText(title).slice(0, 120) || null,
+    hasImage,
+    fallbackMainRequired,
+    hasDebugInfo: Boolean(trimmedDebugInfo)
+  });
+  if (fallbackMainRequired) {
+    console.info('[MAIN_FALLBACK_FILLED_FROM_SOURCE]', {
+      titleSource: resolvedMainPostFields.titleSource,
+      priceSource: resolvedMainPostFields.priceSource,
+      linkSource: resolvedMainPostFields.linkSource,
+      imageSource: fallbackSourceValues.imageSource
+    });
+    console.warn('[MAIN_POST_SKIPPED_REASON]', {
+      reason: buildRequiresFallback ? 'structured_values_incomplete' : 'fallback_text_or_debug_detected',
+      titleSource: resolvedMainPostFields.titleSource,
+      priceSource: resolvedMainPostFields.priceSource,
+      linkSource: resolvedMainPostFields.linkSource,
+      imageSource: fallbackSourceValues.imageSource
+    });
+    if (!resolvedMainPostFields.title && !resolvedMainPostFields.price && !resolvedMainPostFields.link) {
+      console.warn('[MAIN_FALLBACK_VALUES_MISSING]', {
+        titleSource: resolvedMainPostFields.titleSource,
+        priceSource: resolvedMainPostFields.priceSource,
+        linkSource: resolvedMainPostFields.linkSource,
+        imageSource: fallbackSourceValues.imageSource
+      });
+    }
+    console.warn('[MAIN_POST_MISSING_SEND_FALLBACK]', {
+      chatId: cleanText(String(chatId || '')) || null,
+      titlePreview: cleanText(title).slice(0, 120) || null,
+      fallbackTitle: cleanText(fallbackSourceValues.title) || (trimmedDebugInfo ? '⚠️ Deal erkannt' : 'Deal erkannt'),
+      fallbackPrice: cleanText(resolvedMainPostFields.price) || 'n/a',
+      fallbackLink: cleanText(resolvedMainPostFields.link) || 'Link nicht verfuegbar'
+    });
+  }
+
+  let mainDeliveryResult;
+
+  if (hasImage) {
+    console.info('[MAIN_POST_SENDPHOTO_START]', {
+      chatId: cleanText(String(chatId || '')) || null,
+      titlePreview: cleanText(resolvedMainPostFields.title || title).slice(0, 120) || null,
+      imageSource: fallbackSourceValues.imageSource,
+      hasAffiliateLink: Boolean(cleanText(resolvedMainPostFields.link))
+    });
+    console.info('[TELEGRAM_MAIN_PHOTO_POST_START]', {
+      chatId: cleanText(String(chatId || '')) || null,
+      titlePreview: cleanText(title).slice(0, 120) || null,
+      captionLengthBeforeTrim: captionResult.beforeLength,
+      captionLengthAfterTrim: captionResult.afterLength,
+      hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink)
+    });
+
+    if (captionResult.trimmed) {
+      console.info('[CAPTION_TOO_LONG]', {
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        beforeLength: captionResult.beforeLength,
+        safeLimit: TELEGRAM_SAFE_CAPTION_LIMIT
+      });
+      console.info('[CAPTION_TRIMMED_TO_SAFE_LIMIT]', {
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        beforeLength: captionResult.beforeLength,
+        afterLength: captionResult.afterLength,
+        cutAt: captionResult.cutAt,
+        cutContext: captionResult.cutContext
+      });
+    }
+
+    try {
+      mainDeliveryResult = await sendTelegramPost({
+        text: safeMainPostText,
+        uploadedFile,
+        uploadedImage,
+        imageUrl,
+        disableWebPagePreview: false,
+        rabattgutscheinCode,
+        chatId,
+        titlePreview: title,
+        hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
+        postContext: 'deal_main_photo'
+      });
+      console.info('[TELEGRAM_MAIN_PHOTO_POST_SUCCESS]', {
+        chatId: mainDeliveryResult.chatId,
+        messageId: mainDeliveryResult.messageId,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        captionLengthAfterTrim: captionResult.afterLength,
+        hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink)
+      });
+      console.info('[MAIN_POST_SENDPHOTO_SUCCESS]', {
+        chatId: mainDeliveryResult.chatId,
+        messageId: mainDeliveryResult.messageId,
+        imageSource: fallbackSourceValues.imageSource
+      });
+      mainPostSent = true;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'sendPhoto fehlgeschlagen.';
+      console.error('[MAIN_POST_SENDPHOTO_FAILED]', {
+        chatId: cleanText(String(chatId || '')) || null,
+        titlePreview: cleanText(resolvedMainPostFields.title || title).slice(0, 120) || null,
+        imageSource: fallbackSourceValues.imageSource,
+        errorMessage
+      });
+      console.error('[TELEGRAM_MAIN_PHOTO_POST_ERROR]', {
+        chatId: cleanText(String(chatId || '')) || null,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        errorMessage,
+        captionLength: captionResult.afterLength,
+        hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink)
+      });
+      console.error('[PHOTO_SEND_FAILED]', {
+        chatId: cleanText(String(chatId || '')) || null,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        errorMessage,
+        captionLength: captionResult.afterLength,
+        hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink)
+      });
+
+      mainDeliveryResult = await sendTelegramPost({
+        text: safeMainPostText,
+        disableWebPagePreview: true,
+        rabattgutscheinCode,
+        chatId,
+        titlePreview: title,
+        hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
+        postContext: 'deal_main_text_fallback'
+      });
+      console.info('[PHOTO_SEND_FAILED_TEXT_FALLBACK_SENT]', {
+        chatId: mainDeliveryResult.chatId,
+        messageId: mainDeliveryResult.messageId,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink)
+      });
+      mainPostSent = true;
+    }
+  } else {
+    console.warn('[MAIN_POST_SKIPPED_REASON]', {
+      reason: 'image_missing_send_message_used',
+      titleSource: resolvedMainPostFields.titleSource,
+      priceSource: resolvedMainPostFields.priceSource,
+      linkSource: resolvedMainPostFields.linkSource,
+      imageSource: fallbackSourceValues.imageSource
+    });
+    mainDeliveryResult = await sendTelegramPost({
+      text: safeMainPostText,
+      disableWebPagePreview: true,
+      rabattgutscheinCode,
+      chatId,
+      titlePreview: title,
+      hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
+      postContext: 'deal_main_text_only'
+    });
+    mainPostSent = true;
+  }
+
+  if (mainPostSent) {
+    console.info('[MAIN_POST_SENT]', {
+      chatId: mainDeliveryResult?.chatId || cleanText(String(chatId || '')) || null,
+      messageId: mainDeliveryResult?.messageId || null,
+      titlePreview: cleanText(title).slice(0, 120) || null,
+      fallbackUsed: fallbackMainRequired
+    });
+  }
+
+  const extraMessageIds = [];
+
+  if (trimmedDebugInfo) {
+    if (!mainPostSent) {
+      console.warn('[NO_DEBUG_WITHOUT_MAIN]', {
+        chatId: cleanText(String(chatId || '')) || null,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        reason: 'Debugpost blockiert bis Hauptpost gesendet wurde.'
+      });
+      console.warn('[MAIN_POST_MISSING_SEND_FALLBACK]', {
+        chatId: cleanText(String(chatId || '')) || null,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        reason: 'Kein Hauptpost vor Debug erkannt.'
+      });
+      mainDeliveryResult = await sendTelegramPost({
+        text: buildTelegramFallbackMainPostText({
+          title: fallbackSourceValues.title,
+          price: fallbackSourceValues.price,
+          affiliateLink: fallbackSourceValues.linkSource === 'ownAffiliateLink' ? fallbackSourceValues.link : '',
+          sourceLink: fallbackSourceValues.link,
+          diagnostic: true
+        }),
+        disableWebPagePreview: true,
+        chatId,
+        titlePreview: cleanText(fallbackSourceValues.title) || '⚠️ Deal erkannt',
+        hasAffiliateLink: fallbackSourceValues.linkSource === 'ownAffiliateLink',
+        postContext: 'deal_main_required_fallback'
+      });
+      mainPostSent = true;
+      console.info('[MAIN_POST_SENT]', {
+        chatId: mainDeliveryResult?.chatId || cleanText(String(chatId || '')) || null,
+        messageId: mainDeliveryResult?.messageId || null,
+        titlePreview: cleanText(title).slice(0, 120) || null,
+        fallbackUsed: true
+      });
+    }
+
+    const debugDelivery = await sendTelegramPost({
+      text: trimmedDebugInfo,
+      disableWebPagePreview: true,
+      chatId,
+      titlePreview: title,
+      hasAffiliateLink: false,
+      postContext: 'deal_debug'
+    });
+    extraMessageIds.push(debugDelivery.messageId);
+    console.info('[TELEGRAM_DEBUG_POST_SENT]', {
+      chatId: debugDelivery.chatId,
+      messageId: debugDelivery.messageId,
+      titlePreview: cleanText(title).slice(0, 120) || null
+    });
+    console.info('[DEBUG_MESSAGE_ONLY]', {
+      chatId: debugDelivery.chatId,
+      messageId: debugDelivery.messageId,
+      titlePreview: cleanText(title).slice(0, 120) || null
+    });
+    console.info('[DEBUG_POST_ONLY_UPDATED]', {
+      chatId: debugDelivery.chatId,
+      messageId: debugDelivery.messageId,
+      titlePreview: cleanText(title).slice(0, 120) || null,
+      totalMessages: 2
+    });
+    console.info('[DEBUG_SENT_AFTER_MAIN]', {
+      chatId: debugDelivery.chatId,
+      messageId: debugDelivery.messageId,
+      mainPostMessageId: mainDeliveryResult?.messageId || null,
+      titlePreview: cleanText(title).slice(0, 120) || null
+    });
+  }
+
+  console.info('[NO_THIRD_MESSAGE]', {
+    chatId: mainDeliveryResult?.chatId || cleanText(String(chatId || '')) || null,
+    titlePreview: cleanText(title).slice(0, 120) || null,
+    totalMessages: 1 + extraMessageIds.length,
+    hasDebugPost: extraMessageIds.length > 0
+  });
+  console.info('[NO_THIRD_TELEGRAM_MESSAGE]', {
+    chatId: mainDeliveryResult?.chatId || cleanText(String(chatId || '')) || null,
+    titlePreview: cleanText(title).slice(0, 120) || null,
+    totalMessages: 1 + extraMessageIds.length,
+    hasDebugPost: extraMessageIds.length > 0
+  });
+
+  return {
+    ...mainDeliveryResult,
+    extraMessageIds,
+    captionInfo: {
+      beforeLength: captionResult.beforeLength,
+      afterLength: captionResult.afterLength,
+      cutAt: captionResult.cutAt,
+      cutContext: captionResult.cutContext,
+      trimmed: captionResult.trimmed,
+      limit: TELEGRAM_SAFE_CAPTION_LIMIT
+    },
+    affiliateLink: resolvedAffiliate.affiliateLink,
+    strippedForeignLink: resolvedAffiliate.strippedForeignLink
+  };
+}
+
 export async function sendTelegramPost({
   text,
   uploadedFile,
@@ -370,7 +1329,10 @@ export async function sendTelegramPost({
   imageUrl,
   disableWebPagePreview = false,
   rabattgutscheinCode,
-  chatId
+  chatId,
+  titlePreview = '',
+  hasAffiliateLink = false,
+  postContext = 'generic'
 }) {
   const { token, chatId: envChatId } = getTelegramConfig();
   const finalChatId = (chatId || envChatId || '').toString().trim();
@@ -396,7 +1358,42 @@ export async function sendTelegramPost({
   const effectiveImageUrl = parsedUploadedImage ? '' : trimmedImageUrl;
   const resolvedDisableWebPagePreview = disableWebPagePreview || (!parsedUploadedImage && !effectiveImageUrl);
   const telegramMethod = parsedUploadedImage || effectiveImageUrl ? 'sendPhoto' : 'sendMessage';
-  const trimmedText = text.trim();
+  const normalizedText = typeof text === 'string' ? text : '';
+  const trimmedText = normalizedText.trim();
+  const genericSplitPreview =
+    postContext === 'generic'
+      ? splitTelegramPhotoPostText(trimmedText)
+      : { mainText: '', extraText: '', splitMarker: '', splitIndex: -1 };
+  const standaloneDebugOnly =
+    postContext === 'generic' &&
+    looksLikeTelegramDebugText(trimmedText) &&
+    !cleanText(genericSplitPreview.extraText) &&
+    !/(Anzeige\/Partnerlink|🔥 Jetzt|➡️)/i.test(trimmedText);
+
+  if (standaloneDebugOnly) {
+    console.info('[MAIN_POST_REQUIRED]', {
+      chatId: finalChatId || null,
+      titlePreview: cleanText(titlePreview).slice(0, 120) || null,
+      hasImage: Boolean(parsedUploadedImage || effectiveImageUrl),
+      fallbackMainRequired: true,
+      hasDebugInfo: true
+    });
+    console.warn('[NO_DEBUG_WITHOUT_MAIN]', {
+      chatId: finalChatId || null,
+      titlePreview: cleanText(titlePreview).slice(0, 120) || null,
+      reason: 'Direkter Debugpost wurde in Hauptpost + Debug aufgeteilt.'
+    });
+
+    return await sendTelegramDealPost({
+      title: cleanText(titlePreview) || '⚠️ Deal erkannt',
+      price: 'n/a',
+      affiliateLink: extractFirstUrl(trimmedText),
+      debugInfo: trimmedText,
+      testMode: true,
+      chatId: finalChatId,
+      fallbackText: trimmedText
+    });
+  }
 
   console.info('[OUTPUT_CONFIG]', {
     configSource: 'telegram_sender',
@@ -404,19 +1401,22 @@ export async function sendTelegramPost({
     envChatId: envChatId || null,
     finalChatId: finalChatId || null,
     tokenConfigured: Boolean(token),
-    method: telegramMethod
+    method: telegramMethod,
+    postContext
   });
   console.info('[OUTPUT_PAYLOAD]', {
     configSource: 'telegram_sender',
-    textLength: typeof text === 'string' ? text.trim().length : 0,
-    textPreview: typeof text === 'string' ? text.trim().slice(0, 160) : '',
+    textLength: trimmedText.length,
+    textPreview: trimmedText.slice(0, 160),
     hasUploadedImage: Boolean(parsedUploadedImage),
     hasImageUrl: Boolean(effectiveImageUrl),
     disableWebPagePreview: resolvedDisableWebPagePreview,
-    hasCouponCode: Boolean(trimmedCouponCode)
+    hasCouponCode: Boolean(trimmedCouponCode),
+    titlePreview: cleanText(titlePreview).slice(0, 120) || null,
+    hasAffiliateLink: hasAffiliateLink === true
   });
 
-  if (!text || typeof text !== 'string' || text.trim().length === 0) {
+  if (!trimmedText) {
     console.warn('[NO_POST_REASON]', {
       reason: 'Telegram Send Fehler',
       detail: 'Text ist erforderlich',
@@ -426,7 +1426,12 @@ export async function sendTelegramPost({
     console.error('[TELEGRAM_SEND_ERROR]', {
       chatId: finalChatId || null,
       method: telegramMethod,
-      error: 'Text ist erforderlich'
+      errorCode: null,
+      errorMessage: 'Text ist erforderlich',
+      titlePreview: cleanText(titlePreview).slice(0, 120) || null,
+      captionLength: trimmedText.length,
+      hasImage: Boolean(parsedUploadedImage || effectiveImageUrl),
+      hasAffiliateLink: hasAffiliateLink === true
     });
     console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
       chatId: finalChatId || null,
@@ -446,7 +1451,12 @@ export async function sendTelegramPost({
     console.error('[TELEGRAM_SEND_ERROR]', {
       chatId: finalChatId || null,
       method: telegramMethod,
-      error: 'TELEGRAM_BOT_TOKEN fehlt im Backend'
+      errorCode: null,
+      errorMessage: 'TELEGRAM_BOT_TOKEN fehlt im Backend',
+      titlePreview: cleanText(titlePreview).slice(0, 120) || null,
+      captionLength: trimmedText.length,
+      hasImage: Boolean(parsedUploadedImage || effectiveImageUrl),
+      hasAffiliateLink: hasAffiliateLink === true
     });
     console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
       chatId: finalChatId || null,
@@ -466,7 +1476,12 @@ export async function sendTelegramPost({
     console.error('[TELEGRAM_SEND_ERROR]', {
       chatId: null,
       method: telegramMethod,
-      error: 'TELEGRAM_CHAT_ID fehlt im Backend'
+      errorCode: null,
+      errorMessage: 'TELEGRAM_CHAT_ID fehlt im Backend',
+      titlePreview: cleanText(titlePreview).slice(0, 120) || null,
+      captionLength: trimmedText.length,
+      hasImage: Boolean(parsedUploadedImage || effectiveImageUrl),
+      hasAffiliateLink: hasAffiliateLink === true
     });
     console.error('[TELEGRAM_FORCE_SEND_ERROR]', {
       chatId: null,
@@ -475,34 +1490,78 @@ export async function sendTelegramPost({
     });
     throw new Error('TELEGRAM_CHAT_ID fehlt im Backend');
   }
-  if ((parsedUploadedImage || effectiveImageUrl) && trimmedText.length > TELEGRAM_CAPTION_LIMIT) {
-    console.warn('[CAPTION_TOO_LONG]', {
+  if (parsedUploadedImage || effectiveImageUrl) {
+    const photoPostContent = splitTelegramPhotoPostText(trimmedText);
+    const captionResult = trimTelegramPhotoCaption(photoPostContent.mainText, TELEGRAM_SAFE_CAPTION_LIMIT);
+    const captionText = captionResult.text || photoPostContent.mainText || trimmedText;
+
+    if (captionResult.trimmed) {
+      console.info('[CAPTION_TRIMMED]', {
+        chatId: finalChatId,
+        method: telegramMethod,
+        originalTextLength: trimmedText.length,
+        mainContentLengthBeforeTrim: photoPostContent.mainText.length,
+        captionLengthBeforeTrim: captionResult.beforeLength,
+        captionLengthAfterTrim: captionResult.afterLength,
+        cutAt: captionResult.cutAt,
+        cutContext: captionResult.cutContext,
+        safeCaptionLimit: TELEGRAM_SAFE_CAPTION_LIMIT,
+        telegramHardLimit: TELEGRAM_CAPTION_LIMIT
+      });
+    }
+
+    console.info('[CAPTION_LENGTH_OK]', {
       chatId: finalChatId,
       method: telegramMethod,
-      captionLength: trimmedText.length,
-      captionLimit: TELEGRAM_CAPTION_LIMIT
+      originalTextLength: trimmedText.length,
+      mainContentLengthBeforeTrim: photoPostContent.mainText.length,
+      captionLengthBeforeTrim: captionResult.beforeLength,
+      captionLengthAfterTrim: captionResult.afterLength,
+      cutAt: captionResult.cutAt,
+      cutContext: captionResult.cutContext,
+      safeCaptionLimit: TELEGRAM_SAFE_CAPTION_LIMIT,
+      captionTrimmed: captionResult.trimmed
     });
 
     const photoResult = await sendSingleTelegramDelivery({
       token,
       finalChatId,
-      text: TELEGRAM_SHORT_CAPTION_FALLBACK,
+      text: captionText,
       parsedUploadedImage,
       effectiveImageUrl,
       resolvedDisableWebPagePreview: false,
-      replyMarkup
+      replyMarkup,
+      deliveryMeta: {
+        titlePreview,
+        captionLength: captionResult.afterLength,
+        hasAffiliateLink
+      }
     });
 
-    console.info('[PHOTO_SENT_WITH_SHORT_CAPTION]', {
+    console.info('[PHOTO_WITH_MAIN_CONTENT_SENT]', {
       chatId: photoResult.chatId,
       messageId: photoResult.messageId,
-      shortCaption: TELEGRAM_SHORT_CAPTION_FALLBACK
+      captionLengthBeforeTrim: captionResult.beforeLength,
+      captionLengthAfterTrim: captionResult.afterLength,
+      mainContentLength: photoPostContent.mainText.length,
+      extraInfoLength: photoPostContent.extraText.length,
+      splitMarker: photoPostContent.splitMarker || null,
+      captionTrimmed: captionResult.trimmed
+    });
+    console.info('[PHOTO_CAPTION_MAIN_POST]', {
+      chatId: photoResult.chatId,
+      messageId: photoResult.messageId,
+      captionLengthBeforeTrim: captionResult.beforeLength,
+      captionLengthAfterTrim: captionResult.afterLength,
+      cutAt: captionResult.cutAt,
+      splitMarker: photoPostContent.splitMarker || null,
+      hasExtraInfo: Boolean(photoPostContent.extraText)
     });
 
-    const textChunks = splitTelegramTextIntoChunks(trimmedText, TELEGRAM_MESSAGE_LIMIT);
-    const textResults = [];
+    const extraTextChunks = splitTelegramTextIntoChunks(photoPostContent.extraText, TELEGRAM_MESSAGE_LIMIT);
+    const extraTextResults = [];
 
-    for (const chunk of textChunks) {
+    for (const chunk of extraTextChunks) {
       const textResult = await sendSingleTelegramDelivery({
         token,
         finalChatId,
@@ -510,21 +1569,30 @@ export async function sendTelegramPost({
         parsedUploadedImage: null,
         effectiveImageUrl: '',
         resolvedDisableWebPagePreview: true,
-        replyMarkup: undefined
+        replyMarkup: undefined,
+        deliveryMeta: {
+          titlePreview,
+          captionLength: cleanText(chunk).length,
+          hasAffiliateLink: false
+        }
       });
-      textResults.push(textResult);
+      extraTextResults.push(textResult);
     }
 
-    if (textResults.length === 1) {
-      console.info('[TEXT_SENT_AFTER_PHOTO]', {
-        chatId: textResults[0].chatId,
-        messageId: textResults[0].messageId
-      });
-    } else if (textResults.length > 1) {
-      console.info('[TEXT_SPLIT_SENT]', {
+    if (extraTextResults.length) {
+      console.info('[DEBUG_INFO_SENT_SEPARATE]', {
         chatId: finalChatId,
-        parts: textResults.length,
-        messageIds: textResults.map((item) => item.messageId)
+        parts: extraTextResults.length,
+        messageIds: extraTextResults.map((item) => item.messageId),
+        extraInfoLength: photoPostContent.extraText.length,
+        splitMarker: photoPostContent.splitMarker || null
+      });
+      console.info('[DEBUG_SENT_SEPARATE]', {
+        chatId: finalChatId,
+        parts: extraTextResults.length,
+        messageIds: extraTextResults.map((item) => item.messageId),
+        extraInfoLength: photoPostContent.extraText.length,
+        splitMarker: photoPostContent.splitMarker || null
       });
     }
 
@@ -533,7 +1601,19 @@ export async function sendTelegramPost({
       messageId: photoResult.messageId,
       chatId: photoResult.chatId,
       imageUrl: photoResult.imageUrl,
-      extraMessageIds: textResults.map((item) => item.messageId)
+      extraMessageIds: extraTextResults.map((item) => item.messageId),
+      captionInfo: {
+        originalTextLength: trimmedText.length,
+        mainContentLength: photoPostContent.mainText.length,
+        extraInfoLength: photoPostContent.extraText.length,
+        beforeLength: captionResult.beforeLength,
+        afterLength: captionResult.afterLength,
+        cutAt: captionResult.cutAt,
+        cutContext: captionResult.cutContext,
+        trimmed: captionResult.trimmed,
+        limit: TELEGRAM_SAFE_CAPTION_LIMIT,
+        splitMarker: photoPostContent.splitMarker || null
+      }
     };
   }
 
@@ -549,7 +1629,12 @@ export async function sendTelegramPost({
         parsedUploadedImage: null,
         effectiveImageUrl: '',
         resolvedDisableWebPagePreview: true,
-        replyMarkup: index === 0 ? replyMarkup : undefined
+        replyMarkup: index === 0 ? replyMarkup : undefined,
+        deliveryMeta: {
+          titlePreview,
+          captionLength: cleanText(textChunks[index]).length,
+          hasAffiliateLink
+        }
       });
       textResults.push(textResult);
     }
@@ -576,6 +1661,18 @@ export async function sendTelegramPost({
     parsedUploadedImage,
     effectiveImageUrl,
     resolvedDisableWebPagePreview,
-    replyMarkup
+    replyMarkup,
+    deliveryMeta: {
+      titlePreview,
+      captionLength: trimmedText.length,
+      hasAffiliateLink
+    }
   });
 }
+
+export const __testablesTelegramSender = {
+  splitTelegramPhotoPostText,
+  trimTelegramPhotoCaption,
+  buildTelegramMainDealText,
+  resolveTelegramAffiliateLink
+};

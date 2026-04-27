@@ -1,0 +1,11 @@
+{
+  "watch": ["../backend/**"],
+  "ignore": ["node_modules/**"],
+  "ext": "js,json",
+  "env": {
+    "BACKEND_RESTART_MANAGER": "nodemon"
+  },
+  "events": {
+    "restart": "node scripts/nodemon-event-log.cjs restart"
+  }
+}
