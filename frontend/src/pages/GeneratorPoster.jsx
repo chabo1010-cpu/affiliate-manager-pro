@@ -207,6 +207,10 @@ function normalizeDirectPublishResponse(data = {}) {
   };
 }
 
+function isAmazonShortlinkInput(value) {
+  return /^(https?:\/\/)?(?:www\.)?(?:amzn\.to|amazon\.to)\//i.test(String(value || '').trim());
+}
+
 function decodeHtmlEntities(text) {
   if (typeof window === 'undefined' || !window.document) {
     return text;
@@ -243,6 +247,7 @@ function GeneratorPosterPage() {
   const [publishing, setPublishing] = useState(false);
   const [scraping, setScraping] = useState(false);
   const [hasScraped, setHasScraped] = useState(false);
+  const [manualShortlinkMode, setManualShortlinkMode] = useState(false);
   const [scrapedImageUrl, setScrapedImageUrl] = useState('');
   const [uploadedImageFile, setUploadedImageFile] = useState(null);
   const [uploadedImagePreviewUrl, setUploadedImagePreviewUrl] = useState('');
@@ -392,6 +397,14 @@ function GeneratorPosterPage() {
       return couponError;
     }
 
+    if (manualShortlinkMode && !stripHtmlForValidation(scrapedTitle || '')) {
+      return 'Bitte Produkttitel fuer den Shortlink eingeben.';
+    }
+
+    if (manualShortlinkMode && !formattedCurrentPrice) {
+      return 'Bitte Preis fuer den Shortlink eingeben.';
+    }
+
     if (!isFinalPostTextValid) {
       return 'Text ist erforderlich';
     }
@@ -412,6 +425,7 @@ function GeneratorPosterPage() {
     setShowOldPrice(false);
     setOldPrice('');
     setCurrentPrice('');
+    setManualShortlinkMode(false);
     setOldIcon(oldIconOptions[1]);
     setNewIcon(newIconOptions[0]);
     setExtraText(NORMALIZED_DEFAULT_FREE_TEXT);
@@ -523,6 +537,7 @@ function GeneratorPosterPage() {
 
     if (!finalAmazonLink) {
       setHasScraped(false);
+      setManualShortlinkMode(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
       setScrapeImageWarning('');
@@ -540,6 +555,7 @@ function GeneratorPosterPage() {
     setDealSnapshot(null);
     setBackgroundCheckPending(false);
     setBackgroundCheckMessage('');
+    setManualShortlinkMode(false);
     const scrapeRunId = scrapeRunRef.current + 1;
     scrapeRunRef.current = scrapeRunId;
 
@@ -560,21 +576,24 @@ function GeneratorPosterPage() {
         data = { error: rawResponse || 'Unbekannte Scrape-Antwort' };
       }
 
+      const scrapeErrorMessage =
+        data.error ||
+        data.message ||
+        (data.code === 'SHORTLINK_RESOLVE_FAILED' || data.code === 'MANUAL_GENERATOR_INPUT_NEEDS_DIRECT_LINK_OR_ASIN'
+          ? 'Shortlink konnte technisch nicht aufgeloest werden. Bitte Amazon-Direktlink oder ASIN einfuegen.'
+          : '') ||
+        `Scrape fehlgeschlagen (${response.status}). Bitte Backend pruefen.`;
+
       if (!response.ok) {
         setHasScraped(false);
         setScrapedImageUrl('');
         setScrapedTitle('');
         setScrapeImageWarning('');
-        setFormError('');
+        setFormError(scrapeErrorMessage);
         setDealSnapshot(null);
         setBackgroundCheckPending(false);
         setBackgroundCheckMessage('');
-        showToast(
-          data.error ||
-            data.message ||
-            data.code ||
-            `Scrape fehlgeschlagen (${response.status}). Bitte Backend pruefen.`
-        );
+        showToast(scrapeErrorMessage);
         return;
       }
 
@@ -582,6 +601,12 @@ function GeneratorPosterPage() {
       const normalizedDealImageUrl = resolveDealImageUrlFromScrape(data);
       const nextSelectedImageSource = normalizedDealImageUrl ? 'standard' : 'fallback';
       const nextPreviewImageUrl = normalizedDealImageUrl || (data.title || data.asin ? GENERATOR_PREVIEW_FALLBACK_IMAGE : '');
+      const preserveInputLink = data.preserveInputLink === true;
+      const needsShortlinkCompletion = data.manualCompletionNeeded === true || data.manualInputRequired === true;
+      const normalizedGeneratorLink = preserveInputLink
+        ? finalAmazonLink
+        : data.affiliateUrl || data.finalUrl || data.normalizedUrl || finalAmazonLink;
+      const shortlinkStatusMessage = data.message || 'Shortlink erkannt. Produktdaten werden vorbereitet.';
       logGeneratorImageDebug('generator.scrape.image_resolution', {
         imageFields: scrapeImageFields,
         normalizedImageUrl: normalizedDealImageUrl,
@@ -589,19 +614,35 @@ function GeneratorPosterPage() {
         previewImageUrl: nextPreviewImageUrl,
         selectedImageSource: nextSelectedImageSource
       });
-      const initialSnapshot = buildInitialDealSnapshot(data, finalAmazonLink);
 
       if (scrapeRunRef.current !== scrapeRunId) {
         return;
       }
 
-      setDealSnapshot(initialSnapshot);
+      setDealSnapshot(buildInitialDealSnapshot(data, normalizedGeneratorLink));
+      setAmazonLink(normalizedGeneratorLink);
       setScrapedImageUrl(normalizedDealImageUrl);
       setScrapedTitle(data.title || '');
       setOldPrice(formatPrice(data.oldPrice || ''));
       setCurrentPrice(formatPrice(data.price || ''));
       setSelectedPrimaryOptions([]);
+      setManualShortlinkMode(needsShortlinkCompletion);
       setHasScraped(true);
+      if (data.manualInputRequired === true) {
+        setBackgroundCheckPending(false);
+        setBackgroundCheckMessage(
+          'Shortlink erkannt. Der Link bleibt als Ausgabelink erhalten. Fehlende Produktdaten kannst du unten manuell ergaenzen.'
+        );
+        if (normalizedDealImageUrl) {
+          setScrapeImageWarning('');
+        } else {
+          setScrapeImageWarning('Kein Produktbild automatisch geladen. Du kannst den Shortlink trotzdem manuell posten oder ein Bild hochladen.');
+        }
+        showToast(shortlinkStatusMessage, 3200);
+        setScraping(false);
+        return;
+      }
+
       setBackgroundCheckPending(true);
       setBackgroundCheckMessage('Basisdaten geladen. Historie und Sperrcheck werden im Hintergrund aktualisiert.');
       if (normalizedDealImageUrl) {
@@ -611,9 +652,11 @@ function GeneratorPosterPage() {
         showToast('Kein Produktbild aus Scrape erhalten', 2800);
       }
       showToast(
-        normalizedDealImageUrl
-          ? 'Amazon Link erfolgreich gescrapt und Produktbild geladen'
-          : 'Amazon Link erfolgreich gescrapt, aber ohne Produktbild'
+        data.inputMode === 'shortlink'
+          ? shortlinkStatusMessage
+          : normalizedDealImageUrl
+            ? 'Amazon Link erfolgreich gescrapt und Produktbild geladen'
+            : 'Amazon Link erfolgreich gescrapt, aber ohne Produktbild'
       );
 
       if (!data.title) {
@@ -624,7 +667,7 @@ function GeneratorPosterPage() {
 
       const fastCheckPayload = {
         asin: data.asin || '',
-        url: data.finalUrl || data.normalizedUrl || finalAmazonLink,
+        url: normalizedGeneratorLink,
         normalizedUrl: data.normalizedUrl || '',
         sellerType: data.sellerType || '',
         sellerClass: data.sellerClass || '',
@@ -667,7 +710,7 @@ function GeneratorPosterPage() {
             return;
           }
 
-          const resolvedSnapshot = buildCheckedDealSnapshot(checkData, data, finalAmazonLink);
+          const resolvedSnapshot = buildCheckedDealSnapshot(checkData, data, normalizedGeneratorLink);
           setDealSnapshot(resolvedSnapshot);
 
           if (checkData.blocked === true) {
@@ -790,6 +833,7 @@ function GeneratorPosterPage() {
         ? `Backend nicht erreichbar unter ${amazonScrapeApiUrl}. Bitte Backend auf Port 4000 starten.`
         : rawErrorMessage;
       setHasScraped(false);
+      setManualShortlinkMode(false);
       setScrapedImageUrl('');
       setScrapedTitle('');
       setScrapeImageWarning('');
@@ -806,7 +850,11 @@ function GeneratorPosterPage() {
     if (publishing) return;
 
     if (!hasScraped) {
-      showToast('Bitte zuerst erfolgreich den Amazon Link scrapen');
+      showToast(
+        isAmazonShortlinkInput(amazonLink)
+          ? 'Bitte den Shortlink zuerst pruefen, damit der Generator die manuellen Felder freischaltet.'
+          : 'Bitte zuerst erfolgreich den Amazon Link scrapen'
+      );
       return;
     }
 
@@ -1002,6 +1050,7 @@ function GeneratorPosterPage() {
                     scrapeRunRef.current += 1;
                     setAmazonLink(e.target.value);
                     setHasScraped(false);
+                    setManualShortlinkMode(false);
                     setScrapedImageUrl('');
                     setScrapedTitle('');
                     setScrapeImageWarning('');
@@ -1011,7 +1060,7 @@ function GeneratorPosterPage() {
                     setBackgroundCheckPending(false);
                     setBackgroundCheckMessage('');
                   }}
-                  placeholder="https://amazon.de/..."
+                  placeholder="ASIN, Amazon-Direktlink oder amzn.to Shortlink"
                 />
               </label>
 
@@ -1035,7 +1084,7 @@ function GeneratorPosterPage() {
                 </label>
               </div>
 
-              {formError === 'Link vergessen.' && <p className="generator-form-error">{formError}</p>}
+              {formError && !hasScraped && <p className="generator-form-error">{formError}</p>}
 
               {dealSnapshot?.blocked && (
                 <p className="generator-history-alert">
@@ -1060,6 +1109,31 @@ function GeneratorPosterPage() {
 
           {hasScraped && (
             <>
+              <section className="generator-panel">
+                <div className="generator-panel-header">
+                  <h2>Produktdaten</h2>
+                </div>
+
+                <label className="generator-form-field">
+                  <span>Produkttitel</span>
+                  <input
+                    type="text"
+                    value={scrapedTitle}
+                    onChange={(e) => {
+                      setScrapedTitle(e.target.value);
+                      setFormError('');
+                    }}
+                    placeholder={manualShortlinkMode ? 'Produkttitel manuell eingeben' : 'Produkttitel anpassen'}
+                  />
+                </label>
+
+                {manualShortlinkMode && (
+                  <p className="generator-field-hint">
+                    Shortlink bleibt als Ausgabelink erhalten. Titel und Preis kannst du hier manuell ergaenzen.
+                  </p>
+                )}
+              </section>
+
               <section className="generator-panel">
                 <div className="generator-panel-header">
                   <h2>Textbausteine</h2>
@@ -1337,7 +1411,7 @@ function GeneratorPosterPage() {
               </section>
 
               <section className="generator-panel generator-submit-panel">
-                {formError && formError !== 'Rabattgutschein fehlt.' && <p className="generator-form-error">{formError}</p>}
+                {formError && hasScraped && formError !== 'Rabattgutschein fehlt.' && <p className="generator-form-error">{formError}</p>}
                 <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
                   <button
                     type="button"

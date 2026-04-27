@@ -73,8 +73,8 @@ const tasks = [
   {
     name: 'backend',
     cwd: backendRoot,
-    command: process.execPath,
-    args: ['index.js'],
+    command: process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : 'npm',
+    args: process.platform === 'win32' ? ['/d', '/s', '/c', 'npm run dev'] : ['run', 'dev'],
     env: {
       ...process.env,
       PORT: String(backendPort)
