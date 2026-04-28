@@ -12,6 +12,7 @@ import { buildAmazonAffiliateLinkRecord, extractAsin, isAmazonShortLink, normali
 import { upsertAppSession } from './databaseService.js';
 import { publishGeneratorPostDirect } from './directPublisher.js';
 import { buildGeneratorDealContext } from './generatorDealScoringService.js';
+import { loadKeepaClientByAsin } from './keepaClientService.js';
 import { createPublishingEntry, processPublishingQueueEntry } from './publisherService.js';
 import { extractSellerSignalsFromText, formatSellerBoolean, resolveSellerIdentity } from './sellerClassificationService.js';
 import { sendTelegramPost } from './telegramSenderService.js';
@@ -2190,6 +2191,34 @@ function buildReaderAmazonPriceCandidates(scrapedDeal = {}) {
   ].filter((candidate) => candidate.value);
 }
 
+function resolveReaderPaapiPriceCandidate(scrapedDeal = {}) {
+  const explicitPaapiPrice = normalizeReaderPriceCandidate(
+    scrapedDeal?.paapiPrice ||
+      scrapedDeal?.amazonPrice ||
+      scrapedDeal?.paapiCurrentPrice ||
+      scrapedDeal?.imageDebug?.paapiPrice
+  );
+
+  if (explicitPaapiPrice) {
+    return explicitPaapiPrice;
+  }
+
+  const dataSource = cleanText(scrapedDeal?.dataSource).toLowerCase();
+  const imageSource = cleanText(scrapedDeal?.imageDebug?.selectedSource).toLowerCase();
+  const paapiBackedPrice =
+    dataSource === 'paapi' || imageSource === 'paapi'
+      ? normalizeReaderPriceCandidate(scrapedDeal?.basePrice || scrapedDeal?.price)
+      : '';
+
+  return paapiBackedPrice || '';
+}
+
+function resolveReaderKeepaPriceCandidate(scrapedDeal = {}, pricing = {}) {
+  return normalizeReaderPriceCandidate(
+    scrapedDeal?.keepaPrice || scrapedDeal?.keepaCurrentPrice || pricing?.keepaPrice || pricing?.keepaCurrentPrice
+  );
+}
+
 function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pricing = {} } = {}) {
   const normalizedDealType = cleanText(dealType).toUpperCase() || 'AMAZON';
   const amazonPriceCandidates = buildReaderAmazonPriceCandidates(scrapedDeal);
@@ -2203,6 +2232,8 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
     pricing?.currentPrice !== null && pricing?.currentPrice !== undefined
       ? normalizeReaderPriceCandidate(String(pricing.currentPrice))
       : '';
+  const paapiPrice = resolveReaderPaapiPriceCandidate(scrapedDeal);
+  const keepaPrice = resolveReaderKeepaPriceCandidate(scrapedDeal, pricing);
   const distinctAmazonPrices = [];
 
   for (const candidate of amazonPriceCandidates) {
@@ -2216,7 +2247,12 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
   let rawPriceSource = 'unknown';
 
   if (normalizedDealType === 'AMAZON') {
-    const selectedAmazonCandidate = amazonPriceCandidates[0] || null;
+    const selectedAmazonCandidate =
+      [
+        { source: 'paapiPrice', value: paapiPrice },
+        { source: 'telegramPrice', value: telegramPrice },
+        { source: 'keepaPrice', value: keepaPrice }
+      ].find((candidate) => candidate.value) || null;
 
     if (distinctAmazonPrices.length > 1) {
       console.info('[PRICE_DEDUPED]', {
@@ -2230,11 +2266,16 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
 
     if (selectedAmazonCandidate?.value) {
       currentPrice = selectedAmazonCandidate.value;
-      priceSource = 'amazon';
+      priceSource =
+        selectedAmazonCandidate.source === 'telegramPrice'
+          ? 'telegram'
+          : selectedAmazonCandidate.source === 'keepaPrice'
+            ? 'keepa'
+            : 'amazon';
       rawPriceSource = selectedAmazonCandidate.source;
     }
 
-    if (telegramPrice && (!currentPrice || !readerPricesEqual(currentPrice, telegramPrice))) {
+    if (telegramPrice && rawPriceSource === 'paapiPrice' && !readerPricesEqual(currentPrice, telegramPrice)) {
       console.info('[SOURCE_VALUES_STRIPPED]', {
         dealType: normalizedDealType,
         strippedField: 'price',
@@ -2249,6 +2290,16 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
         blockedSource: 'telegram',
         keptPrice: currentPrice || null,
         blockedPrice: telegramPrice
+      });
+    }
+    if (scrapedPrice && rawPriceSource !== 'unknown' && !readerPricesEqual(currentPrice, scrapedPrice)) {
+      console.info('[SOURCE_VALUES_STRIPPED]', {
+        dealType: normalizedDealType,
+        strippedField: 'price',
+        blockedSource: 'amazon_scrape',
+        blockedValue: scrapedPrice,
+        keptSource: rawPriceSource,
+        keptValue: currentPrice || null
       });
     }
   } else if (scrapedPrice) {
@@ -2282,6 +2333,7 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
     amazonBuyBoxPrice,
     amazonDealPrice,
     telegramPrice,
+    keepaPrice,
     amazonPriceCandidates: distinctAmazonPrices
   };
 }
@@ -4448,20 +4500,24 @@ function resolveReaderImagePayload({ scrapedDeal = {}, structuredMessage = {}, d
   };
   const amazonImage = normalizedDealType === 'AMAZON' ? resolveDealImageUrlFromScrape(scrapedDeal || {}) : '';
   if (amazonImage) {
+    const resolvedAmazonImageSource =
+      cleanText(scrapedDeal?.imageDebug?.selectedSource).toLowerCase() === 'paapi' || cleanText(scrapedDeal?.dataSource).toLowerCase() === 'paapi'
+        ? 'paapi'
+        : 'scrape';
     console.info('[IMAGE_SOURCE_FOUND]', {
-      source: 'amazonProductImage',
+      source: resolvedAmazonImageSource === 'paapi' ? 'paapiImage' : 'scrapedAmazonImage',
       dealType: normalizedDealType,
       imageUrl: amazonImage
     });
     console.info('[IMAGE_SOURCE]', {
-      source: 'amazon',
+      source: resolvedAmazonImageSource,
       dealType: normalizedDealType,
       imageUrl: amazonImage
     });
     return {
       generatedImagePath: amazonImage,
       uploadedImagePath: '',
-      imageSource: 'amazon',
+      imageSource: resolvedAmazonImageSource,
       telegramImageSource: 'standard',
       whatsappImageSource: 'standard'
     };
@@ -4612,7 +4668,48 @@ function resolveReaderImagePayload({ scrapedDeal = {}, structuredMessage = {}, d
   };
 }
 
-function buildTelegramReaderGeneratorInput({
+async function loadReaderKeepaPriceFallback({
+  asin = '',
+  scrapedDeal = {},
+  affiliateUrl = '',
+  normalizedUrl = '',
+  title = ''
+} = {}) {
+  const normalizedAsin = cleanText(asin).toUpperCase();
+  if (!normalizedAsin) {
+    return '';
+  }
+
+  try {
+    const keepaContext = await loadKeepaClientByAsin({
+      asin: normalizedAsin,
+      currentPrice: null,
+      title: cleanText(title || scrapedDeal?.productTitle || scrapedDeal?.title),
+      productUrl: cleanText(normalizedUrl || affiliateUrl || scrapedDeal?.normalizedUrl || scrapedDeal?.finalUrl),
+      imageUrl: cleanText(scrapedDeal?.imageUrl || scrapedDeal?.previewImage || scrapedDeal?.ogImage),
+      source: 'telegram_reader_price_fallback',
+      maxAgeMinutes: 720
+    });
+    const keepaPrice = normalizeReaderPriceCandidate(keepaContext?.result?.currentPrice);
+
+    console.info('[PRICE_FALLBACK_KEEPA]', {
+      asin: normalizedAsin,
+      status: cleanText(keepaContext?.status) || 'unknown',
+      available: keepaContext?.available === true,
+      price: keepaPrice || null
+    });
+
+    return keepaPrice || '';
+  } catch (error) {
+    console.warn('[PRICE_FALLBACK_KEEPA_FAILED]', {
+      asin: normalizedAsin,
+      error: error instanceof Error ? error.message : 'Keepa-Preisfallback fehlgeschlagen.'
+    });
+    return '';
+  }
+}
+
+async function buildTelegramReaderGeneratorInput({
   structuredMessage,
   scrapedDeal,
   normalizedAsin,
@@ -4651,13 +4748,39 @@ function buildTelegramReaderGeneratorInput({
     scrapedDeal,
     structuredMessage
   });
+  const normalizedDealType = cleanText(dealType).toUpperCase() || 'AMAZON';
+  const paapiPriceCandidate = resolveReaderPaapiPriceCandidate(scrapedDeal);
+  const telegramPriceCandidate =
+    pricing?.currentPrice !== null && pricing?.currentPrice !== undefined
+      ? normalizeReaderPriceCandidate(String(pricing.currentPrice))
+      : '';
+  const keepaPriceCandidate =
+    normalizedDealType === 'AMAZON' && !paapiPriceCandidate && !telegramPriceCandidate
+      ? await loadReaderKeepaPriceFallback({
+          asin: normalizedAsin || scrapedDeal?.asin,
+          scrapedDeal,
+          affiliateUrl,
+          normalizedUrl,
+          title: titlePayload.title
+        })
+      : '';
+  const scrapedDealWithFallbacks =
+    keepaPriceCandidate && !resolveReaderKeepaPriceCandidate(scrapedDeal, pricing)
+      ? {
+          ...(scrapedDeal && typeof scrapedDeal === 'object' ? scrapedDeal : {}),
+          keepaPrice: keepaPriceCandidate
+        }
+      : scrapedDeal;
   const pricePayload = resolveReaderPricePayload({
     dealType,
-    scrapedDeal,
-    pricing
+    scrapedDeal: scrapedDealWithFallbacks,
+    pricing: {
+      ...(pricing && typeof pricing === 'object' ? pricing : {}),
+      keepaPrice: keepaPriceCandidate || pricing?.keepaPrice || ''
+    }
   });
   const productDescription = extractReaderProductDescription({
-    scrapedDeal,
+    scrapedDeal: scrapedDealWithFallbacks,
     structuredMessage
   });
   const rawCurrentPrice = cleanText(pricePayload.currentPrice);
@@ -4673,7 +4796,7 @@ function buildTelegramReaderGeneratorInput({
     extraOptions: []
   });
   const imagePayload = resolveReaderImagePayload({
-    scrapedDeal,
+    scrapedDeal: scrapedDealWithFallbacks,
     structuredMessage,
     dealType,
     title: titlePayload.title || template.productTitle || 'Deal',
@@ -5635,7 +5758,7 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       ogImage: cleanText(scrapedDeal?.ogImage || ''),
       imageUrl: cleanText(scrapedDeal?.imageUrl || '')
     };
-    const generatorInput = buildTelegramReaderGeneratorInput({
+    const generatorInput = await buildTelegramReaderGeneratorInput({
       structuredMessage,
       scrapedDeal: normalizedScrapedDeal,
       normalizedAsin,
@@ -5661,6 +5784,16 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       hasImage: Boolean(cleanText(generatorInput.generatedImagePath) || cleanText(generatorInput.uploadedImagePath)),
       hasAffiliateLink: Boolean(cleanText(generatorInput.link)),
       missingFields: missingGeneratorFields
+    });
+    console.info('[FINAL_POST_DATA_SOURCES]', {
+      sessionName,
+      sourceId: source.id,
+      messageId: structuredMessage.messageId,
+      asin: generatorInput.asin,
+      titleSource: cleanText(generatorInput.titleSource) || 'unknown',
+      priceSource: cleanText(generatorInput.priceSource) || 'unknown',
+      imageSource: cleanText(generatorInput.imageSource) || 'unknown',
+      affiliateLinkSource: cleanText(generatorInput.link) ? 'affiliate' : 'missing'
     });
     if (missingGeneratorFields.length) {
       const missingFieldsReason = `GeneratorInput unvollstaendig. Fehlende Felder: ${missingGeneratorFields.join(', ')}`;
