@@ -601,6 +601,27 @@ function applySellerPolicyToRouting(routing = {}, sellerDecisionPolicy = {}) {
   return routing;
 }
 
+function buildLearningUnknownSellerPayload({ input = {}, sellerDecisionPolicy = {}, runtimeConfig = {}, routing = null } = {}) {
+  const seller = sellerDecisionPolicy.seller || {};
+
+  return {
+    sourceType: cleanText(input.sourceType || 'unknown') || 'unknown',
+    sellerClass: seller.sellerClass || 'UNKNOWN',
+    sellerType: seller.sellerType || 'UNKNOWN',
+    readerTestMode: runtimeConfig.readerTestMode === true,
+    readerDebugMode: runtimeConfig.readerDebugMode === true,
+    marketComparisonAllowedBefore: sellerDecisionPolicy.marketComparison?.allowed === true,
+    aiAllowedBefore: sellerDecisionPolicy.ai?.allowed === true,
+    unknownSellerAction: cleanText(sellerDecisionPolicy.unknownSellerAction) || 'pass',
+    ...(routing && typeof routing === 'object'
+      ? {
+          routingDecisionBefore: cleanText(routing.decision) || 'unknown',
+          routingReason: cleanText(routing.reason) || ''
+        }
+      : {})
+  };
+}
+
 function isStrictReaderMode(runtimeConfig = {}) {
   return runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
 }
@@ -608,16 +629,76 @@ function isStrictReaderMode(runtimeConfig = {}) {
 function shouldAllowUnknownAmazonInTestMode({ input = {}, sellerDecisionPolicy = {}, runtimeConfig = {} }) {
   const seller = sellerDecisionPolicy.seller || {};
   const sellerDealType = cleanText(input.dealType || seller.details?.dealType).toUpperCase();
+  const sourceType = cleanText(input.sourceType || '').toLowerCase();
+  const sellerClass = cleanText(seller.sellerClass || input.sellerClass).toUpperCase();
+  const sellerType = cleanText(seller.sellerType || input.sellerType).toUpperCase();
   const isAmazonDeal =
     input.isAmazonDeal === false || seller.details?.isAmazonDeal === false || sellerDealType === 'NON_AMAZON' ? false : true;
+  const sellerUnknown =
+    seller.isUnknown === true || sellerClass === 'UNKNOWN' || sellerType === 'UNKNOWN';
 
-  return runtimeConfig.readerTestMode === true && seller.isUnknown === true && isAmazonDeal === true;
+  return isStrictReaderMode(runtimeConfig) === true && sourceType === 'generator' && sellerUnknown === true && isAmazonDeal === true;
 }
 
 function buildUnknownSellerTestModeReason(sellerDecisionPolicy = {}, stage = 'Marktvergleich') {
   const seller = sellerDecisionPolicy.seller || {};
   const unknownReason = cleanText(seller.details?.unknownReason) || 'seller_unclar';
   return `${stage} laeuft im Testmodus trotz UNKNOWN Seller (${unknownReason}).`;
+}
+
+function applyUnknownSellerReaderReviewCap({
+  routing = {},
+  input = {},
+  sellerDecisionPolicy = {},
+  runtimeConfig = {}
+} = {}) {
+  if (
+    shouldAllowUnknownAmazonInTestMode({
+      input,
+      sellerDecisionPolicy,
+      runtimeConfig
+    }) !== true
+  ) {
+    return routing;
+  }
+
+  const payload = buildLearningUnknownSellerPayload({
+    input,
+    sellerDecisionPolicy,
+    runtimeConfig,
+    routing
+  });
+
+  if (routing.decision === 'block') {
+    logDecisionFlow('LEARNING_UNKNOWN_NOT_BLOCKING', {
+      ...payload,
+      reason: 'UNKNOWN Seller fuehrt im Reader/Generator-Pfad nicht zu einer harten Blockade.'
+    });
+  }
+
+  if (routing.decision !== 'review') {
+    logDecisionFlow('LEARNING_UNKNOWN_REVIEW_ONLY', {
+      ...payload,
+      routingDecisionAfter: 'review',
+      reason: 'UNKNOWN Seller bleibt im Reader/Generator-Pfad hoechstens REVIEW.'
+    });
+
+    return {
+      ...routing,
+      decision: 'review',
+      reason: cleanText(routing.reason)
+        ? `${routing.reason} | UNKNOWN Seller bleibt im Reader/Generator-Pfad auf REVIEW.`
+        : 'UNKNOWN Seller bleibt im Reader/Generator-Pfad auf REVIEW.'
+    };
+  }
+
+  logDecisionFlow('LEARNING_UNKNOWN_REVIEW_ONLY', {
+    ...payload,
+    routingDecisionAfter: 'review',
+    reason: 'UNKNOWN Seller bleibt im Reader/Generator-Pfad auf REVIEW.'
+  });
+
+  return routing;
 }
 
 function resolveMarketComparisonExecutionState({
@@ -804,6 +885,18 @@ export function evaluateLearningRoute(input = {}) {
     sellerDecisionPolicy,
     runtimeConfig
   });
+  if (allowUnknownAmazonInTestMode === true) {
+    logDecisionFlow('LEARNING_UNKNOWN_SELLER_HANDLED', {
+      ...buildLearningUnknownSellerPayload({
+        input,
+        sellerDecisionPolicy,
+        runtimeConfig
+      }),
+      marketComparisonAllowedAfter: true,
+      aiAllowedAfter: true,
+      reason: 'UNKNOWN Seller wird im Reader/Generator-Pfad nicht hart geblockt.'
+    });
+  }
   const marketComparisonAllowed = sellerDecisionPolicy.marketComparison?.allowed === true || allowUnknownAmazonInTestMode === true;
   const marketComparisonReason =
     allowUnknownAmazonInTestMode === true
@@ -971,6 +1064,12 @@ export function evaluateLearningRoute(input = {}) {
   });
   let routing = buildRoutingDecision(input, internetPreview, keepaPreview, evaluation);
   routing = applySellerPolicyToRouting(routing, sellerDecisionPolicy);
+  routing = applyUnknownSellerReaderReviewCap({
+    routing,
+    input,
+    sellerDecisionPolicy,
+    runtimeConfig
+  });
   const aiExecution = resolveAiCheckExecutionState({
     input,
     settings: dealEngineSettings,

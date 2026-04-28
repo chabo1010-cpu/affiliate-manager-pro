@@ -35,6 +35,16 @@ function parseNumber(value, fallback = null) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function logUnknownSellerHandling(tag, payload = {}) {
+  try {
+    console.info(`[${tag}]`, payload);
+  } catch {
+    console.info(`[${tag}]`);
+  }
+
+  logGeneratorDebug(tag, payload);
+}
+
 function applyReaderRuntimeOverrides(settings = {}, sellerIdentity = {}, runtimeConfig = {}) {
   if (runtimeConfig.readerDebugMode !== true && runtimeConfig.readerTestMode !== true) {
     return settings;
@@ -66,19 +76,37 @@ function applyReaderDecisionPolicyBypass(policy = {}, runtimeConfig = {}) {
     return policy;
   }
 
+  const seller = policy.seller || {};
+  const unknownSellerInReaderMode = seller.isUnknown === true;
+  if (unknownSellerInReaderMode) {
+    logUnknownSellerHandling('UNKNOWN_SELLER_HANDLED', {
+      sellerClass: seller.sellerClass || 'UNKNOWN',
+      sellerType: seller.sellerType || 'UNKNOWN',
+      readerTestMode: runtimeConfig.readerTestMode === true,
+      readerDebugMode: runtimeConfig.readerDebugMode === true,
+      previousUnknownSellerAction: cleanText(policy.unknownSellerAction) || 'unknown',
+      marketComparisonAllowedBefore: policy.marketComparison?.allowed === true,
+      aiAllowedBefore: policy.ai?.allowed === true
+    });
+  }
+
   return {
     ...policy,
     marketComparison: {
       ...(policy.marketComparison || {}),
       allowed: true,
       code: 'reader_runtime_forced_market_compare',
-      reason: 'Reader-Test/Debugmodus erzwingt den Marktvergleich trotz Seller- oder Link-Unsicherheit.'
+      reason: unknownSellerInReaderMode
+        ? 'Reader-Test/Debugmodus blockiert UNKNOWN Seller nicht beim Marktvergleich.'
+        : 'Reader-Test/Debugmodus erzwingt den Marktvergleich trotz Seller- oder Link-Unsicherheit.'
     },
     ai: {
       ...(policy.ai || {}),
       allowed: true,
       code: 'reader_runtime_forced_ai',
-      reason: 'Reader-Test/Debugmodus erzwingt die KI-Pruefung trotz Seller- oder Link-Unsicherheit.'
+      reason: unknownSellerInReaderMode
+        ? 'Reader-Test/Debugmodus blockiert UNKNOWN Seller nicht bei der KI-Pruefung.'
+        : 'Reader-Test/Debugmodus erzwingt die KI-Pruefung trotz Seller- oder Link-Unsicherheit.'
     },
     unknownSellerAction: 'pass'
   };
@@ -353,6 +381,28 @@ export async function buildGeneratorDealContext(input = {}) {
     dealLockBlocked: dealLock.blocked,
     dealHash: dealLock.dealHash || null
   });
+
+  if (
+    (runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true) &&
+    sellerDecisionPolicy.seller?.isUnknown === true
+  ) {
+    logUnknownSellerHandling('UNKNOWN_NOT_BLOCKING', {
+      asin,
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      sellerType: sellerDecisionPolicy.seller?.sellerType || 'UNKNOWN',
+      readerTestMode: runtimeConfig.readerTestMode === true,
+      readerDebugMode: runtimeConfig.readerDebugMode === true,
+      marketComparisonAllowed: sellerDecisionPolicy.marketComparison?.allowed === true,
+      aiAllowed: sellerDecisionPolicy.ai?.allowed === true,
+      unknownSellerAction: cleanText(sellerDecisionPolicy.unknownSellerAction) || 'pass'
+    });
+    logUnknownSellerHandling('UNKNOWN_ALLOWED_FOR_REVIEW', {
+      asin,
+      sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
+      sellerType: sellerDecisionPolicy.seller?.sellerType || 'UNKNOWN',
+      reason: 'UNKNOWN Seller bleibt im Reader-Testbetrieb mindestens reviewfaehig und wird nicht hart blockiert.'
+    });
+  }
 
   if ((runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true) && sellerDecisionPolicy.seller?.isAmazonDirect === true) {
     const runtimeModeLabel =
