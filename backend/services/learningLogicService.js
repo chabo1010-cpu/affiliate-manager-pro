@@ -601,6 +601,25 @@ function applySellerPolicyToRouting(routing = {}, sellerDecisionPolicy = {}) {
   return routing;
 }
 
+function isStrictReaderMode(runtimeConfig = {}) {
+  return runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
+}
+
+function shouldAllowUnknownAmazonInTestMode({ input = {}, sellerDecisionPolicy = {}, runtimeConfig = {} }) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const sellerDealType = cleanText(input.dealType || seller.details?.dealType).toUpperCase();
+  const isAmazonDeal =
+    input.isAmazonDeal === false || seller.details?.isAmazonDeal === false || sellerDealType === 'NON_AMAZON' ? false : true;
+
+  return runtimeConfig.readerTestMode === true && seller.isUnknown === true && isAmazonDeal === true;
+}
+
+function buildUnknownSellerTestModeReason(sellerDecisionPolicy = {}, stage = 'Marktvergleich') {
+  const seller = sellerDecisionPolicy.seller || {};
+  const unknownReason = cleanText(seller.details?.unknownReason) || 'seller_unclar';
+  return `${stage} laeuft im Testmodus trotz UNKNOWN Seller (${unknownReason}).`;
+}
+
 function resolveMarketComparisonExecutionState({
   input = {},
   settings = {},
@@ -609,16 +628,29 @@ function resolveMarketComparisonExecutionState({
   runtimeConfig = {}
 }) {
   const seller = sellerDecisionPolicy.seller || {};
-  const strictReaderMode = runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
+  const strictReaderMode = isStrictReaderMode(runtimeConfig);
+  const allowUnknownAmazonInTestMode = shouldAllowUnknownAmazonInTestMode({
+    input,
+    sellerDecisionPolicy,
+    runtimeConfig
+  });
   const forceMarketCompare = strictReaderMode && seller.isAmazonDirect === true;
-  const required =
-    (sellerDecisionPolicy.marketComparison?.allowed === true || forceMarketCompare) &&
-    (seller.isAmazonDirect === true || sellerDecisionPolicy.marketComparison?.allowed === true);
+  const marketComparisonAllowed = sellerDecisionPolicy.marketComparison?.allowed === true || allowUnknownAmazonInTestMode === true;
+  const required = marketComparisonAllowed === true || forceMarketCompare === true;
   const started = required === true && cleanText(input.asin) !== '';
   let status = 'skipped';
   let reason = '';
 
-  if (sellerDecisionPolicy.marketComparison?.allowed !== true && forceMarketCompare !== true) {
+  if (allowUnknownAmazonInTestMode === true) {
+    logDecisionFlow('MARKET_COMPARE_ALLOWED_TESTMODE_UNKNOWN', {
+      sellerClass: seller.sellerClass || 'UNKNOWN',
+      reason: buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'Marktvergleich'),
+      sellerUnknownReason: cleanText(seller.details?.unknownReason) || 'unknown',
+      detectionSource: cleanText(seller.details?.detectionSource) || 'unknown'
+    });
+  }
+
+  if (marketComparisonAllowed !== true && forceMarketCompare !== true) {
     status = 'skipped';
     reason = sellerDecisionPolicy.marketComparison?.reason || 'Marktvergleich ist nicht freigegeben.';
   } else if (!cleanText(input.asin)) {
@@ -642,12 +674,14 @@ function resolveMarketComparisonExecutionState({
     success: internetPreview.available === true,
     error: status === 'error',
     forceMarketCompare,
+    allowedByTestModeUnknown: allowUnknownAmazonInTestMode,
     status,
     reason
   };
 }
 
 function resolveAiCheckExecutionState({
+  input = {},
   settings = {},
   sellerDecisionPolicy = {},
   runtimeConfig = {},
@@ -657,10 +691,17 @@ function resolveAiCheckExecutionState({
 }) {
   const seller = sellerDecisionPolicy.seller || {};
   const aiSettings = settings.ai || {};
-  const strictReaderMode = runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
+  const strictReaderMode = isStrictReaderMode(runtimeConfig);
+  const allowUnknownAmazonInTestMode = shouldAllowUnknownAmazonInTestMode({
+    input,
+    sellerDecisionPolicy,
+    runtimeConfig
+  });
   const forceAiCheck = strictReaderMode && seller.isAmazonDirect === true && aiSettings.alwaysInDebug !== false;
   const uncertaintyDetected = routing.decision === 'review';
-  const required = sellerDecisionPolicy.marketComparison?.allowed === true && (sellerDecisionPolicy.ai?.allowed === true || forceAiCheck);
+  const marketComparisonAllowed = sellerDecisionPolicy.marketComparison?.allowed === true || allowUnknownAmazonInTestMode === true;
+  const aiAllowed = sellerDecisionPolicy.ai?.allowed === true || allowUnknownAmazonInTestMode === true;
+  const required = marketComparisonAllowed === true && (aiAllowed === true || forceAiCheck === true);
   if (aiRuntimeContext && typeof aiRuntimeContext === 'object' && aiRuntimeContext.attempted === true) {
     return {
       required,
@@ -682,10 +723,19 @@ function resolveAiCheckExecutionState({
   let reason = '';
   let used = false;
 
-  if (sellerDecisionPolicy.marketComparison?.allowed !== true && forceAiCheck !== true) {
+  if (allowUnknownAmazonInTestMode === true) {
+    logDecisionFlow('AI_ALLOWED_TESTMODE_UNKNOWN', {
+      sellerClass: seller.sellerClass || 'UNKNOWN',
+      reason: buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'KI'),
+      sellerUnknownReason: cleanText(seller.details?.unknownReason) || 'unknown',
+      detectionSource: cleanText(seller.details?.detectionSource) || 'unknown'
+    });
+  }
+
+  if (marketComparisonAllowed !== true && forceAiCheck !== true) {
     status = 'skipped';
     reason = 'Kein Marktvergleichsergebnis fuer die KI-Pruefung freigegeben.';
-  } else if (sellerDecisionPolicy.ai?.allowed !== true && forceAiCheck !== true) {
+  } else if (aiAllowed !== true && forceAiCheck !== true) {
     status = 'skipped';
     reason = sellerDecisionPolicy.ai?.reason || 'KI ist fuer diesen Seller deaktiviert.';
   } else if (marketExecution.used !== true) {
@@ -723,6 +773,7 @@ function resolveAiCheckExecutionState({
     success: status === 'success',
     error: status === 'error',
     forceAiCheck,
+    allowedByTestModeUnknown: allowUnknownAmazonInTestMode,
     uncertaintyDetected,
     status,
     reason
@@ -748,9 +799,19 @@ export function evaluateLearningRoute(input = {}) {
   const runtimeConfig = input.runtimeConfig && typeof input.runtimeConfig === 'object' ? input.runtimeConfig : {};
   const keepaPreview = normalizeKeepaContext(input);
   const sellerDecisionPolicy = input.sellerDecisionPolicy || evaluateSellerDecisionPolicy(dealEngineSettings, sellerIdentity);
+  const allowUnknownAmazonInTestMode = shouldAllowUnknownAmazonInTestMode({
+    input,
+    sellerDecisionPolicy,
+    runtimeConfig
+  });
+  const marketComparisonAllowed = sellerDecisionPolicy.marketComparison?.allowed === true || allowUnknownAmazonInTestMode === true;
+  const marketComparisonReason =
+    allowUnknownAmazonInTestMode === true
+      ? buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'Marktvergleich')
+      : sellerDecisionPolicy.marketComparison?.reason || '';
   const rawInternetPreview = normalizeInternetContext(input, keepaPreview);
   const internetPreview =
-    sellerDecisionPolicy.marketComparison?.allowed === true
+    marketComparisonAllowed === true
       ? rawInternetPreview
       : {
           ...rawInternetPreview,
@@ -758,7 +819,7 @@ export function evaluateLearningRoute(input = {}) {
           marketAvailable: false,
           blocked: true,
           status: 'blocked_by_seller_policy',
-          reason: sellerDecisionPolicy.marketComparison?.reason || 'Marktvergleich blockiert.'
+          reason: marketComparisonReason || 'Marktvergleich blockiert.'
         };
   const amazonPreview = normalizeAmazonContext(input);
   const patternSupportEnabled = input.patternSupportEnabled !== false;
@@ -788,8 +849,8 @@ export function evaluateLearningRoute(input = {}) {
   });
   logDecisionFlow('MARKET_COMPARE_TRIGGER', {
     sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
-    allowed: sellerDecisionPolicy.marketComparison?.allowed === true,
-    reason: sellerDecisionPolicy.marketComparison?.reason || ''
+    allowed: marketComparisonAllowed,
+    reason: marketComparisonReason
   });
   if (marketExecution.forceMarketCompare === true && sellerDecisionPolicy.seller?.isAmazonDirect === true) {
     logDecisionFlow('AMAZON_DIRECT_FORCE_MARKET_COMPARE', {
@@ -814,10 +875,10 @@ export function evaluateLearningRoute(input = {}) {
     });
   }
   logDecisionFlow(
-    sellerDecisionPolicy.marketComparison?.allowed === true ? 'MARKET_COMPARE_ALLOWED' : 'MARKET_COMPARE_BLOCKED',
+    marketComparisonAllowed === true ? 'MARKET_COMPARE_ALLOWED' : 'MARKET_COMPARE_BLOCKED',
     {
       sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
-      reason: sellerDecisionPolicy.marketComparison?.reason || ''
+      reason: marketComparisonReason
     }
   );
 
@@ -911,6 +972,7 @@ export function evaluateLearningRoute(input = {}) {
   let routing = buildRoutingDecision(input, internetPreview, keepaPreview, evaluation);
   routing = applySellerPolicyToRouting(routing, sellerDecisionPolicy);
   const aiExecution = resolveAiCheckExecutionState({
+    input,
     settings: dealEngineSettings,
     sellerDecisionPolicy,
     runtimeConfig,
@@ -918,9 +980,11 @@ export function evaluateLearningRoute(input = {}) {
     marketExecution,
     aiRuntimeContext: input.aiRuntimeContext
   });
+  const aiAllowedForExecution = sellerDecisionPolicy.ai?.allowed === true || allowUnknownAmazonInTestMode === true;
+  const aiPolicyReason =
+    allowUnknownAmazonInTestMode === true ? buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'KI') : sellerDecisionPolicy.ai?.reason || '';
   const aiAllowedByPolicy =
-    sellerDecisionPolicy.marketComparison?.allowed === true &&
-    (sellerDecisionPolicy.ai?.allowed === true || aiExecution.forceAiCheck === true);
+    marketComparisonAllowed === true && (aiAllowedForExecution === true || aiExecution.forceAiCheck === true);
   const aiBlockedReason = aiAllowedByPolicy ? '' : aiExecution.reason || sellerDecisionPolicy.ai?.reason || '';
   const dealLock = buildDealLockPreview(input);
   const regler = buildReglerPreview(input, evaluation);
@@ -943,7 +1007,7 @@ export function evaluateLearningRoute(input = {}) {
   if (aiExecution.required === true) {
     logDecisionFlow('AI_CHECK_REQUIRED', {
       sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
-      reason: aiExecution.reason || sellerDecisionPolicy.ai?.reason || ''
+      reason: aiExecution.reason || aiPolicyReason
     });
   }
   if (aiExecution.started === true) {
@@ -954,7 +1018,7 @@ export function evaluateLearningRoute(input = {}) {
   }
   logDecisionFlow(aiAllowedByPolicy ? 'AI_ALLOWED' : 'AI_BLOCKED', {
     sellerClass: sellerDecisionPolicy.seller?.sellerClass || 'UNKNOWN',
-    reason: aiAllowedByPolicy ? sellerDecisionPolicy.ai?.reason || '' : aiBlockedReason
+    reason: aiAllowedByPolicy ? aiPolicyReason : aiBlockedReason
   });
   if (aiExecution.success === true) {
     logDecisionFlow('AI_CHECK_SUCCESS', {
@@ -1000,9 +1064,8 @@ export function evaluateLearningRoute(input = {}) {
     aiResolutionUsed: aiExecution.used,
     aiForcedInDebug: aiExecution.forceAiCheck === true,
     aiOnlyOnUncertainty: (dealEngineSettings.ai || {}).onlyOnUncertainty !== false,
-    marketComparisonAllowed: sellerDecisionPolicy.marketComparison?.allowed === true,
-    marketComparisonBlockedReason:
-      sellerDecisionPolicy.marketComparison?.allowed === true ? '' : sellerDecisionPolicy.marketComparison?.reason || '',
+    marketComparisonAllowed,
+    marketComparisonBlockedReason: marketComparisonAllowed === true ? '' : marketComparisonReason,
     marketComparisonRequired: marketExecution.required,
     marketComparisonStarted: marketExecution.started,
     marketComparisonStatus: marketExecution.status,

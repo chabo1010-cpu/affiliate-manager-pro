@@ -161,6 +161,7 @@ const SHIPPED_BY_THIRDPARTY_PATTERNS = [
 const SELLER_SOURCE_AMAZON_ONLY_ALLOWLIST = ['seller-profile', 'merchant-info', 'buybox', 'tabular-buybox', 'offer-display'];
 const COMBINED_SELLER_SHIPPING_SOURCE_HINTS = ['buybox', 'tabular-buybox', 'offer-display', 'desktop-buybox', 'fallback-text'];
 const COMBINED_SELLER_SHIPPING_DETECTION_SOURCE = 'combined-seller-shipping-text';
+const SELLER_LOG_TEXT_LIMIT = 160;
 
 function parseSellerBoolean(value) {
   if (value === true || value === false) {
@@ -203,6 +204,14 @@ function uniqueCleanValues(values = []) {
     .map((value) => cleanText(value))
     .filter(Boolean)
     .filter((value, index, allValues) => allValues.indexOf(value) === index);
+}
+
+function logSellerDetection(tag, payload = {}) {
+  try {
+    console.info(`[${tag}]`, payload);
+  } catch {
+    console.info(`[${tag}]`);
+  }
 }
 
 function sourceSupportsCombinedSellerShippingDetection(detectionSource = '') {
@@ -396,30 +405,42 @@ export function resolveSellerIdentity(input = {}) {
         : {};
   const sellerDetails = sellerDetailsSource;
   const primaryDetectionSource = cleanText(input.sellerDetectionSource || input.detectionSource || sellerDetails.detectionSource);
-  const rawSoldByAmazon = parseSellerBoolean(input.soldByAmazon);
-  const rawShippedByAmazon = parseSellerBoolean(input.shippedByAmazon);
+  const merchantText = cleanText(input.merchantText || input.sellerRawText || sellerDetails.merchantText);
+  const derivedSignals = merchantText
+    ? extractSellerSignalsFromText(merchantText, {
+        detectionSource: primaryDetectionSource || 'unknown'
+      })
+    : null;
+  const inputSoldByAmazon = parseSellerBoolean(input.soldByAmazon);
+  const inputShippedByAmazon = parseSellerBoolean(input.shippedByAmazon);
+  const rawSoldByAmazon = inputSoldByAmazon !== null ? inputSoldByAmazon : derivedSignals?.soldByAmazon ?? null;
+  const rawShippedByAmazon = inputShippedByAmazon !== null ? inputShippedByAmazon : derivedSignals?.shippedByAmazon ?? null;
   const detectionSources = uniqueCleanValues([
     ...(Array.isArray(input.detectionSources) ? input.detectionSources : []),
     ...(Array.isArray(sellerDetails.detectionSources) ? sellerDetails.detectionSources : []),
     input.sellerDetectionSource,
     input.detectionSource,
-    sellerDetails.detectionSource
+    sellerDetails.detectionSource,
+    derivedSignals?.rawDetectionSource,
+    derivedSignals?.detectionSource
   ]);
   const matchedPatterns = uniqueCleanValues([
     ...(Array.isArray(input.matchedPatterns) ? input.matchedPatterns : []),
-    ...(Array.isArray(sellerDetails.matchedPatterns) ? sellerDetails.matchedPatterns : [])
+    ...(Array.isArray(sellerDetails.matchedPatterns) ? sellerDetails.matchedPatterns : []),
+    ...(Array.isArray(derivedSignals?.matchedPatterns) ? derivedSignals.matchedPatterns : [])
   ]);
   const matchedDirectAmazonPatterns = uniqueCleanValues([
     ...(Array.isArray(input.matchedDirectAmazonPatterns) ? input.matchedDirectAmazonPatterns : []),
-    ...(Array.isArray(sellerDetails.matchedDirectAmazonPatterns) ? sellerDetails.matchedDirectAmazonPatterns : [])
+    ...(Array.isArray(sellerDetails.matchedDirectAmazonPatterns) ? sellerDetails.matchedDirectAmazonPatterns : []),
+    ...(Array.isArray(derivedSignals?.matchedDirectAmazonPatterns) ? derivedSignals.matchedDirectAmazonPatterns : [])
   ]);
-  const merchantText = cleanText(input.merchantText || input.sellerRawText || sellerDetails.merchantText);
   const dealType = cleanText(input.dealType || sellerDetails.dealType).toUpperCase();
   const isNonAmazonDeal = dealType === 'NON_AMAZON' || input.isAmazonDeal === false || sellerDetails.isAmazonDeal === false;
   const hasCombinedAmazonMatch =
     input.hasCombinedAmazonMatch === true ||
     sellerDetails.hasCombinedAmazonMatch === true ||
-    detectionSources.includes(COMBINED_SELLER_SHIPPING_DETECTION_SOURCE);
+    detectionSources.includes(COMBINED_SELLER_SHIPPING_DETECTION_SOURCE) ||
+    derivedSignals?.hasCombinedAmazonMatch === true;
   const sellerClassFromFlags =
     rawSoldByAmazon === true && rawShippedByAmazon === true
       ? SELLER_CLASS.AMAZON_DIRECT
@@ -456,6 +477,49 @@ export function resolveSellerIdentity(input = {}) {
         : sellerClass === SELLER_CLASS.FBM_THIRDPARTY
           ? false
           : null;
+  const unknownReason =
+    sellerClass !== SELLER_CLASS.UNKNOWN || isNonAmazonDeal === true
+      ? ''
+      : primaryDetectionSource.includes('paapi') && !merchantText
+        ? 'paapi_missing_merchant_text'
+        : !merchantText
+          ? 'missing_merchant_text'
+          : rawSoldByAmazon === true && rawShippedByAmazon === false
+            ? 'sold_by_amazon_but_shipping_unclear'
+            : rawSoldByAmazon === null && rawShippedByAmazon === true
+              ? 'shipped_by_amazon_but_seller_unclear'
+              : matchedPatterns.length === 0
+                ? 'merchant_text_without_known_patterns'
+                : 'insufficient_seller_signals';
+
+  logSellerDetection('SELLER_DETECTION_INPUTS', {
+    sellerClassInput: explicitSellerClass || '',
+    sellerTypeInput: explicitSellerType || '',
+    detectionSource: primaryDetectionSource || 'unknown',
+    detectionSources,
+    merchantTextPreview: merchantText ? merchantText.slice(0, SELLER_LOG_TEXT_LIMIT) : '',
+    soldByAmazonInput: inputSoldByAmazon,
+    shippedByAmazonInput: inputShippedByAmazon,
+    soldByAmazonDerived: derivedSignals?.soldByAmazon ?? null,
+    shippedByAmazonDerived: derivedSignals?.shippedByAmazon ?? null,
+    matchedPatterns,
+    matchedDirectAmazonPatterns,
+    hasCombinedAmazonMatch,
+    resolvedSellerClass: sellerClass,
+    resolvedSellerType: sellerType
+  });
+
+  if (unknownReason) {
+    logSellerDetection('SELLER_UNKNOWN_REASON', {
+      detectionSource: primaryDetectionSource || 'unknown',
+      detectionSources,
+      merchantTextPreview: merchantText ? merchantText.slice(0, SELLER_LOG_TEXT_LIMIT) : '',
+      soldByAmazon,
+      shippedByAmazon,
+      matchedPatterns,
+      reason: unknownReason
+    });
+  }
 
   return {
     sellerClass,
@@ -479,6 +543,7 @@ export function resolveSellerIdentity(input = {}) {
       matchedPatterns,
       matchedDirectAmazonPatterns,
       hasCombinedAmazonMatch,
+      unknownReason,
       recognitionMessage: sellerClass === SELLER_CLASS.UNKNOWN ? 'Seller konnte nicht erkannt werden.' : ''
     }
   };
