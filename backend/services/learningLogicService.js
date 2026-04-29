@@ -622,11 +622,15 @@ function buildLearningUnknownSellerPayload({ input = {}, sellerDecisionPolicy = 
   };
 }
 
+function isReaderGeneratorPath(sourceType = '') {
+  return ['generator', 'generator_direct'].includes(cleanText(sourceType).toLowerCase());
+}
+
 function isStrictReaderMode(runtimeConfig = {}) {
   return runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
 }
 
-function shouldAllowUnknownAmazonInTestMode({ input = {}, sellerDecisionPolicy = {}, runtimeConfig = {} }) {
+function shouldAllowUnknownAmazonInTestMode({ input = {}, sellerDecisionPolicy = {} } = {}) {
   const seller = sellerDecisionPolicy.seller || {};
   const sellerDealType = cleanText(input.dealType || seller.details?.dealType).toUpperCase();
   const sourceType = cleanText(input.sourceType || '').toLowerCase();
@@ -637,13 +641,15 @@ function shouldAllowUnknownAmazonInTestMode({ input = {}, sellerDecisionPolicy =
   const sellerUnknown =
     seller.isUnknown === true || sellerClass === 'UNKNOWN' || sellerType === 'UNKNOWN';
 
-  return isStrictReaderMode(runtimeConfig) === true && sourceType === 'generator' && sellerUnknown === true && isAmazonDeal === true;
+  return isReaderGeneratorPath(sourceType) === true && sellerUnknown === true && isAmazonDeal === true;
 }
 
-function buildUnknownSellerTestModeReason(sellerDecisionPolicy = {}, stage = 'Marktvergleich') {
+function buildUnknownSellerTestModeReason(sellerDecisionPolicy = {}, stage = 'Marktvergleich', runtimeConfig = {}) {
   const seller = sellerDecisionPolicy.seller || {};
   const unknownReason = cleanText(seller.details?.unknownReason) || 'seller_unclar';
-  return `${stage} laeuft im Testmodus trotz UNKNOWN Seller (${unknownReason}).`;
+  return isStrictReaderMode(runtimeConfig) === true
+    ? `${stage} laeuft im Testmodus trotz UNKNOWN Seller (${unknownReason}).`
+    : `${stage} bleibt im Reader/Generator-Pfad trotz UNKNOWN Seller aktiv (${unknownReason}).`;
 }
 
 function applyUnknownSellerReaderReviewCap({
@@ -725,7 +731,7 @@ function resolveMarketComparisonExecutionState({
   if (allowUnknownAmazonInTestMode === true) {
     logDecisionFlow('MARKET_COMPARE_ALLOWED_TESTMODE_UNKNOWN', {
       sellerClass: seller.sellerClass || 'UNKNOWN',
-      reason: buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'Marktvergleich'),
+      reason: buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'Marktvergleich', runtimeConfig),
       sellerUnknownReason: cleanText(seller.details?.unknownReason) || 'unknown',
       detectionSource: cleanText(seller.details?.detectionSource) || 'unknown'
     });
@@ -807,7 +813,7 @@ function resolveAiCheckExecutionState({
   if (allowUnknownAmazonInTestMode === true) {
     logDecisionFlow('AI_ALLOWED_TESTMODE_UNKNOWN', {
       sellerClass: seller.sellerClass || 'UNKNOWN',
-      reason: buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'KI'),
+      reason: buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'KI', runtimeConfig),
       sellerUnknownReason: cleanText(seller.details?.unknownReason) || 'unknown',
       detectionSource: cleanText(seller.details?.detectionSource) || 'unknown'
     });
@@ -900,7 +906,7 @@ export function evaluateLearningRoute(input = {}) {
   const marketComparisonAllowed = sellerDecisionPolicy.marketComparison?.allowed === true || allowUnknownAmazonInTestMode === true;
   const marketComparisonReason =
     allowUnknownAmazonInTestMode === true
-      ? buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'Marktvergleich')
+      ? buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'Marktvergleich', runtimeConfig)
       : sellerDecisionPolicy.marketComparison?.reason || '';
   const rawInternetPreview = normalizeInternetContext(input, keepaPreview);
   const internetPreview =
@@ -1081,7 +1087,9 @@ export function evaluateLearningRoute(input = {}) {
   });
   const aiAllowedForExecution = sellerDecisionPolicy.ai?.allowed === true || allowUnknownAmazonInTestMode === true;
   const aiPolicyReason =
-    allowUnknownAmazonInTestMode === true ? buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'KI') : sellerDecisionPolicy.ai?.reason || '';
+    allowUnknownAmazonInTestMode === true
+      ? buildUnknownSellerTestModeReason(sellerDecisionPolicy, 'KI', runtimeConfig)
+      : sellerDecisionPolicy.ai?.reason || '';
   const aiAllowedByPolicy =
     marketComparisonAllowed === true && (aiAllowedForExecution === true || aiExecution.forceAiCheck === true);
   const aiBlockedReason = aiAllowedByPolicy ? '' : aiExecution.reason || sellerDecisionPolicy.ai?.reason || '';

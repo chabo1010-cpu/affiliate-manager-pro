@@ -14,6 +14,18 @@ const TELEGRAM_SAFE_CAPTION_LIMIT = 900;
 const TELEGRAM_MESSAGE_LIMIT = 4096;
 const TELEGRAM_EXTRA_INFO_HEADER_PATTERN =
   /\n{2,}(?=[^\n]*<b>(?:TESTPOST(?: NICHT FREIGEGEBEN)?|Kurzinfo|DEAL STATUS|SELLER CHECK|VERGLEICH & KI|SYSTEM REGELN)<\/b>)/;
+const MAIN_POST_LABEL_PREFIX_PATTERN =
+  /^(?:[^a-zA-Z0-9]*)(TOP DEAL|MEGA DEAL|PREISFEHLER)\b(?:[^a-zA-Z0-9]+)?/i;
+const MAIN_POST_SOURCE_BADGE_PREFIX_PATTERN =
+  /^(?:[^a-zA-Z0-9]*)(?:\d{1,3}\s*%\s*(?:RABATT|COUPON|SPAR-ABO)?|RABATT(?:-BADGE)?|COUPON|SPAR-ABO|GUTSCHEIN)\b(?:[^a-zA-Z0-9]+)?/i;
+const MAIN_POST_BLOCKED_BADGE_LINE_PATTERN =
+  /^(?:[^a-zA-Z0-9]*)(?:TOP DEAL|MEGA DEAL|PREISFEHLER|\d{1,3}\s*%\s*(?:RABATT|COUPON|SPAR-ABO)?|RABATT(?:-BADGE)?|COUPON|SPAR-ABO|GUTSCHEIN)\b.*$/i;
+const MAIN_POST_SOURCE_PRICE_LINE_PATTERNS = [
+  /^(?:[^\p{L}\p{N}]*)?\d{1,4}(?:[.,]\d{2})\s*(?:\u20ac|EUR)\s+statt\s+\d{1,4}(?:[.,]\d{2})\s*(?:\u20ac|EUR)(?:\s*[-–]?\s*\d{1,3}\s*%)?\s*$/iu,
+  /^(?:[^\p{L}\p{N}]*)?jetzt\s+f(?:u|ue|\u00fc)r\s+nur\s*:?\s*\d{1,4}(?:[.,]\d{2})\s*(?:\u20ac|EUR)\s*$/iu,
+  /^(?:[^\p{L}\p{N}]*)?statt\s+\d{1,4}(?:[.,]\d{2})\s*(?:\u20ac|EUR)(?:\s*[-–]?\s*\d{1,3}\s*%)?\s*$/iu,
+  /^(?:[^\p{L}\p{N}]*)?[-–]?\s*\d{1,3}\s*%\s*$/u
+];
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -34,7 +46,7 @@ function buildTelegramMainDealText({ title = '', price = '', affiliateLink = '',
   const safeAffiliateLink = cleanText(affiliateLink);
 
   if (!safeTitle && !safePrice && !safeAffiliateLink) {
-    return cleanText(fallbackText);
+    return '';
   }
 
   const titleBlock = safeTitle ? `<b>${escapeTelegramHtml(safeTitle)}</b>` : '';
@@ -108,7 +120,7 @@ function buildTelegramFallbackMainPostText({
 } = {}) {
   const safeTitle = cleanText(title) || (diagnostic ? '⚠️ Deal erkannt' : 'Deal erkannt');
   const safePrice = cleanText(price) || 'n/a';
-  const safeLink = cleanText(affiliateLink) || cleanText(sourceLink) || 'Link nicht verfuegbar';
+  const safeLink = cleanText(affiliateLink) || 'Link nicht verfuegbar';
 
   return [
     `<b>${escapeTelegramHtml(safeTitle)}</b>`,
@@ -135,6 +147,117 @@ function normalizeFallbackLine(line = '') {
       .replace(/\s+/g, ' ')
       .replace(/\u00a0/g, ' ')
   );
+}
+
+function isMainPostSourcePriceLine(line = '') {
+  const normalized = normalizeFallbackLine(line);
+  if (!normalized) {
+    return false;
+  }
+
+  return MAIN_POST_SOURCE_PRICE_LINE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function sanitizeMainPostTitle(title = '') {
+  const normalizedLines = stripTelegramHtml(title)
+    .split('\n')
+    .map((line) => normalizeFallbackLine(line))
+    .filter(Boolean);
+  const removedLabels = [];
+  const blockedBadges = [];
+  const removedSourcePriceLines = [];
+
+  for (const line of normalizedLines) {
+    let candidate = line;
+    let changed = true;
+
+    while (candidate && changed) {
+      changed = false;
+
+      const labelMatch = candidate.match(MAIN_POST_LABEL_PREFIX_PATTERN);
+      if (labelMatch?.[1]) {
+        removedLabels.push(labelMatch[1].toUpperCase());
+        candidate = cleanText(candidate.replace(MAIN_POST_LABEL_PREFIX_PATTERN, ''));
+        changed = true;
+      }
+
+      const badgeMatch = candidate.match(MAIN_POST_SOURCE_BADGE_PREFIX_PATTERN);
+      if (badgeMatch?.[0]) {
+        blockedBadges.push(cleanText(badgeMatch[0]));
+        candidate = cleanText(candidate.replace(MAIN_POST_SOURCE_BADGE_PREFIX_PATTERN, ''));
+        changed = true;
+      }
+    }
+
+    if (!candidate) {
+      blockedBadges.push(line);
+      continue;
+    }
+
+    if (MAIN_POST_BLOCKED_BADGE_LINE_PATTERN.test(candidate)) {
+      blockedBadges.push(candidate);
+      continue;
+    }
+
+    if (isMainPostSourcePriceLine(candidate)) {
+      removedSourcePriceLines.push(candidate);
+      continue;
+    }
+
+    return {
+      value: candidate,
+      removedLabels: [...new Set(removedLabels)],
+      blockedBadges: [...new Set(blockedBadges)],
+      removedSourcePriceLines: [...new Set(removedSourcePriceLines)]
+    };
+  }
+
+  return {
+    value: '',
+    removedLabels: [...new Set(removedLabels)],
+    blockedBadges: [...new Set(blockedBadges)],
+    removedSourcePriceLines: [...new Set(removedSourcePriceLines)]
+  };
+}
+
+function sanitizeMainPostPrice(price = '') {
+  const normalizedLines = stripTelegramHtml(price)
+    .split('\n')
+    .map((line) => normalizeFallbackLine(line))
+    .filter(Boolean);
+  const firstLine = normalizedLines.find(Boolean);
+  const sourcePriceLines = normalizedLines.filter((line) => isMainPostSourcePriceLine(line));
+
+  if (!firstLine || /^n\/a$/i.test(firstLine)) {
+    return {
+      value: '',
+      normalized: false,
+      sourcePriceLines: [...new Set(sourcePriceLines)]
+    };
+  }
+
+  const extractedPrice = firstLine.match(
+    /(\d{1,4}(?:[.,]\d{2})\s*(?:€|EUR)|(?:€|EUR)\s*\d{1,4}(?:[.,]\d{2})?)/i
+  )?.[1];
+  if (extractedPrice) {
+    let normalizedPrice = cleanText(extractedPrice);
+    if (/^(?:€|EUR)\s*/i.test(normalizedPrice)) {
+      normalizedPrice = `${normalizedPrice.replace(/^(?:€|EUR)\s*/i, '').trim()} €`;
+    }
+
+    return {
+      value: normalizedPrice,
+      normalized: normalizedPrice !== firstLine,
+      sourcePriceLines: [...new Set(sourcePriceLines)]
+    };
+  }
+
+  const normalizedPrice = cleanText(firstLine.replace(/^(?:preis|jetzt(?:\s+fuer)?(?:\s+nur)?|nur)\s*:?\s*/i, ''));
+  return {
+    value: normalizedPrice,
+    normalized: normalizedPrice !== firstLine,
+    sourcePriceLines: [...new Set(sourcePriceLines)]
+  };
 }
 
 function isMeaningfulFallbackTitle(line = '') {
@@ -246,6 +369,23 @@ function extractAllUrls(text = '') {
   return [...String(text || '').matchAll(/https?:\/\/[^\s<>"']+/gi)].map((match) => cleanText(match[0])).filter(Boolean);
 }
 
+function collectUniqueUrls(...values) {
+  const uniqueUrls = new Set();
+
+  for (const value of values) {
+    for (const url of extractAllUrls(value)) {
+      uniqueUrls.add(url);
+    }
+
+    const directUrl = cleanText(value);
+    if (/^https?:\/\//i.test(directUrl)) {
+      uniqueUrls.add(directUrl);
+    }
+  }
+
+  return [...uniqueUrls];
+}
+
 function isAmazonDomainLink(url = '') {
   return /https?:\/\/(?:www\.)?amazon\.[^/\s]+/i.test(cleanText(url));
 }
@@ -265,7 +405,25 @@ function resolveMainFallbackSourceValues({
   const explicitTitle = cleanText(title);
   const explicitPrice = cleanText(price);
   const explicitAffiliateLink = cleanText(affiliateLink);
-  const safeSourceLink = cleanText(sourceLink);
+  const hasStructuredTitle = explicitTitle && !/^(?:âš ï¸\s*)?(Amazon Produkt|Deal erkannt)$/iu.test(explicitTitle);
+  const hasStructuredPrice = explicitPrice && !/^n\/a$/i.test(explicitPrice);
+  const resolvedImageSource = uploadedFile
+    ? 'uploadedFile'
+    : cleanText(uploadedImage)
+      ? 'screenshot'
+      : cleanText(imageUrl)
+        ? 'sourceImage'
+        : 'none';
+
+  return {
+    title: hasStructuredTitle ? explicitTitle : '',
+    titleSource: hasStructuredTitle ? 'extractedTitle' : 'defaultTitle',
+    price: hasStructuredPrice ? explicitPrice : '',
+    priceSource: hasStructuredPrice ? 'extractedPrice' : 'defaultPrice',
+    link: explicitAffiliateLink,
+    linkSource: explicitAffiliateLink ? 'ownAffiliateLink' : 'defaultLink',
+    imageSource: resolvedImageSource
+  };
   const texts = [cleanText(fallbackText), cleanText(debugInfo)].filter(Boolean);
   const titleSources = [];
   const priceSources = [];
@@ -370,6 +528,32 @@ function resolveMainPostFieldValues({
 function resolveTelegramAffiliateLink({ affiliateLink = '', asin = '' } = {}) {
   const rawAffiliateLink = cleanText(affiliateLink);
   const normalizedAsin = cleanText(asin).toUpperCase();
+  const rebuildCandidates = [];
+
+  if (rawAffiliateLink && isAmazonDomainLink(rawAffiliateLink)) {
+    rebuildCandidates.push(rawAffiliateLink);
+  }
+  if (normalizedAsin) {
+    rebuildCandidates.push(normalizedAsin);
+  }
+
+  for (const candidate of rebuildCandidates) {
+    const rebuiltRecord = buildAmazonAffiliateLinkRecord(candidate, { asin: normalizedAsin });
+    if (rebuiltRecord.valid && cleanText(rebuiltRecord.affiliateUrl)) {
+      const resolvedLink = cleanText(rebuiltRecord.affiliateUrl);
+      return {
+        affiliateLink: resolvedLink,
+        normalizedUrl: cleanText(rebuiltRecord.normalizedUrl),
+        strippedForeignLink: Boolean(rawAffiliateLink) && resolvedLink !== rawAffiliateLink
+      };
+    }
+  }
+
+  return {
+    affiliateLink: '',
+    normalizedUrl: '',
+    strippedForeignLink: Boolean(rawAffiliateLink)
+  };
 
   if (normalizedAsin) {
     const rebuiltRecord = buildAmazonAffiliateLinkRecord(rawAffiliateLink || normalizedAsin, { asin: normalizedAsin });
@@ -928,15 +1112,33 @@ export async function sendTelegramDealPost({
     affiliateLink,
     asin
   });
-  const fallbackSourceLink = extractFirstUrl(fallbackText) || cleanText(affiliateLink);
-  const fallbackTextLooksLikeDebug = looksLikeTelegramDebugText(fallbackText);
+  const sanitizedFallbackText = cleanText(fallbackText);
+  const fallbackTextLooksLikeDebug = looksLikeTelegramDebugText(sanitizedFallbackText);
   const directDebugInfo = testMode === true ? cleanText(debugInfo) : '';
-  const trimmedDebugInfo = directDebugInfo || (testMode === true && fallbackTextLooksLikeDebug ? cleanText(fallbackText) : '');
+  const trimmedDebugInfo = directDebugInfo || (testMode === true && fallbackTextLooksLikeDebug ? sanitizedFallbackText : '');
+  const blockedSourceLinks = new Set(collectUniqueUrls(sanitizedFallbackText, trimmedDebugInfo));
+  const originalAffiliateLink = cleanText(affiliateLink);
+
+  if (sanitizedFallbackText) {
+    console.info('[ORIGINAL_TEXT_BLOCKED_FROM_MAIN_POST]', {
+      sourceTextLength: sanitizedFallbackText.length,
+      sourceTextLooksLikeDebug: fallbackTextLooksLikeDebug
+    });
+  }
+  if (originalAffiliateLink && originalAffiliateLink !== cleanText(resolvedAffiliate.affiliateLink)) {
+    blockedSourceLinks.add(originalAffiliateLink);
+  }
+  if (blockedSourceLinks.size > 0) {
+    console.info('[FOREIGN_LINK_BLOCKED_FROM_MAIN_POST]', {
+      blockedLinks: [...blockedSourceLinks],
+      resolvedAffiliateLink: cleanText(resolvedAffiliate.affiliateLink) || null
+    });
+  }
   const fallbackSourceValues = resolveMainFallbackSourceValues({
     title,
     price,
     affiliateLink: resolvedAffiliate.affiliateLink || cleanText(affiliateLink),
-    sourceLink: fallbackSourceLink,
+    sourceLink: '',
     fallbackText,
     debugInfo: trimmedDebugInfo,
     testMode,
@@ -950,46 +1152,103 @@ export async function sendTelegramDealPost({
     resolvedAffiliateLink: resolvedAffiliate.affiliateLink,
     fallbackSourceValues
   });
-  const renderedGeneratorMainText = cleanText(fallbackText);
-  const useRenderedGeneratorMainText = looksLikeGeneratorRenderedText(renderedGeneratorMainText);
-  const buildRequiresFallback =
-    !useRenderedGeneratorMainText &&
-    (!cleanText(resolvedMainPostFields.title) ||
-      !cleanText(resolvedMainPostFields.price) ||
-      !cleanText(resolvedMainPostFields.link) ||
-      fallbackTextLooksLikeDebug);
-  fallbackSourceValues.title = resolvedMainPostFields.title;
-  fallbackSourceValues.titleSource = resolvedMainPostFields.titleSource;
-  fallbackSourceValues.price = resolvedMainPostFields.price;
-  fallbackSourceValues.priceSource = resolvedMainPostFields.priceSource;
-  fallbackSourceValues.link = resolvedMainPostFields.link;
-  fallbackSourceValues.linkSource = resolvedMainPostFields.linkSource;
-  console.info('[MAIN_POST_BUILD_START]', {
+  const sanitizedTitleResult = sanitizeMainPostTitle(resolvedMainPostFields.title);
+  const sanitizedPriceResult = sanitizeMainPostPrice(resolvedMainPostFields.price);
+  const removedSourcePriceLines = [
+    ...(Array.isArray(sanitizedTitleResult.removedSourcePriceLines) ? sanitizedTitleResult.removedSourcePriceLines : []),
+    ...(Array.isArray(sanitizedPriceResult.sourcePriceLines) ? sanitizedPriceResult.sourcePriceLines : [])
+  ].filter(Boolean);
+  const sanitizedMainPostFields = {
+    title: cleanText(sanitizedTitleResult.value),
     titleSource: resolvedMainPostFields.titleSource,
+    price: cleanText(sanitizedPriceResult.value),
     priceSource: resolvedMainPostFields.priceSource,
-    linkSource: resolvedMainPostFields.linkSource,
-    buildRequiresFallback,
-    hasFallbackText: Boolean(cleanText(fallbackText)),
-    usesGeneratorRenderedText: useRenderedGeneratorMainText
+    link: cleanText(resolvedMainPostFields.link),
+    linkSource: resolvedMainPostFields.linkSource
+  };
+  const buildRequiresFallback = false;
+  fallbackSourceValues.title = sanitizedMainPostFields.title;
+  fallbackSourceValues.titleSource = sanitizedMainPostFields.titleSource;
+  fallbackSourceValues.price = sanitizedMainPostFields.price;
+  fallbackSourceValues.priceSource = sanitizedMainPostFields.priceSource;
+  fallbackSourceValues.link = sanitizedMainPostFields.link;
+  fallbackSourceValues.linkSource = sanitizedMainPostFields.linkSource;
+  if (sanitizedTitleResult.removedLabels.length > 0) {
+    console.info('[MAIN_POST_LABELS_SANITIZED]', {
+      removedLabels: sanitizedTitleResult.removedLabels,
+      originalTitle: cleanText(resolvedMainPostFields.title) || null,
+      sanitizedTitle: sanitizedMainPostFields.title || null
+    });
+  }
+  if (sanitizedTitleResult.blockedBadges.length > 0) {
+    console.info('[SOURCE_BADGE_BLOCKED_FROM_MAIN_POST]', {
+      blockedBadges: sanitizedTitleResult.blockedBadges,
+      originalTitle: cleanText(resolvedMainPostFields.title) || null,
+      sanitizedTitle: sanitizedMainPostFields.title || null
+    });
+  }
+  if (removedSourcePriceLines.length > 0) {
+    console.info('[SOURCE_PRICE_LINE_REMOVED_FROM_MAIN_POST]', {
+      removedLines: [...new Set(removedSourcePriceLines)],
+      originalTitle: cleanText(resolvedMainPostFields.title) || null,
+      originalPrice: cleanText(resolvedMainPostFields.price) || null,
+      sanitizedTitle: sanitizedMainPostFields.title || null,
+      sanitizedPrice: sanitizedMainPostFields.price || null
+    });
+    console.info('[SOURCE_SPECIFIC_SANITIZER_APPLIED]', {
+      sourcePriceLineCount: [...new Set(removedSourcePriceLines)].length,
+      titleAffected: (sanitizedTitleResult.removedSourcePriceLines || []).length > 0,
+      priceAffected: (sanitizedPriceResult.sourcePriceLines || []).length > 0
+    });
+  }
+  console.info('[MAIN_POST_SOURCE_SANITIZED]', {
+    titleSource: sanitizedMainPostFields.titleSource,
+    priceSource: sanitizedMainPostFields.priceSource,
+    linkSource: sanitizedMainPostFields.linkSource,
+    hasOriginalText: Boolean(sanitizedFallbackText),
+    blockedSourceLinkCount: blockedSourceLinks.size
   });
-  const initialMainPostText = useRenderedGeneratorMainText
-    ? renderedGeneratorMainText
-    : buildTelegramMainDealText({
-        title: resolvedMainPostFields.title,
-        price: resolvedMainPostFields.price,
-        affiliateLink: resolvedMainPostFields.link,
-        fallbackText: buildRequiresFallback ? '' : fallbackTextLooksLikeDebug ? '' : fallbackText
-      });
-  const fallbackMainRequired =
-    (!useRenderedGeneratorMainText &&
-      (buildRequiresFallback || !cleanText(initialMainPostText) || looksLikeTelegramDebugText(initialMainPostText))) ||
-    (useRenderedGeneratorMainText && !cleanText(initialMainPostText));
+  console.info('[MAIN_POST_CAPTION_SANITIZED]', {
+    titleSanitized: cleanText(resolvedMainPostFields.title) !== sanitizedMainPostFields.title,
+    priceSanitized: cleanText(resolvedMainPostFields.price) !== sanitizedMainPostFields.price,
+    sourcePriceLineRemoved: removedSourcePriceLines.length > 0
+  });
+  console.info('[MAIN_POST_FINAL_ONLY]', {
+    titleSource: sanitizedMainPostFields.titleSource,
+    priceSource: sanitizedMainPostFields.priceSource,
+    linkSource: sanitizedMainPostFields.linkSource,
+    titleSanitized: cleanText(resolvedMainPostFields.title) !== sanitizedMainPostFields.title,
+    priceSanitized: cleanText(resolvedMainPostFields.price) !== sanitizedMainPostFields.price,
+    usesFallbackText: false
+  });
+  if (!resolvedAffiliate.affiliateLink) {
+    console.warn('[MAIN_POST_SKIPPED_REASON]', {
+      reason: 'own_affiliate_link_missing_review',
+      titleSource: sanitizedMainPostFields.titleSource,
+      priceSource: sanitizedMainPostFields.priceSource,
+      linkSource: sanitizedMainPostFields.linkSource
+    });
+    throw new Error('REVIEW_REQUIRED: Eigener Affiliate-Link fehlt. Hauptpost wird ohne Quelllink nicht gesendet.');
+  }
+  console.info('[MAIN_POST_BUILD_START]', {
+    titleSource: sanitizedMainPostFields.titleSource,
+    priceSource: sanitizedMainPostFields.priceSource,
+    linkSource: sanitizedMainPostFields.linkSource,
+    buildRequiresFallback,
+    hasFallbackText: Boolean(sanitizedFallbackText),
+    usesGeneratorRenderedText: false
+  });
+  const initialMainPostText = buildTelegramMainDealText({
+    title: sanitizedMainPostFields.title,
+    price: sanitizedMainPostFields.price,
+    affiliateLink: sanitizedMainPostFields.link
+  });
+  const fallbackMainRequired = !cleanText(initialMainPostText);
   const mainPostText = fallbackMainRequired
     ? buildTelegramFallbackMainPostText({
-        title: resolvedMainPostFields.title,
-        price: resolvedMainPostFields.price,
-        affiliateLink: resolvedMainPostFields.linkSource === 'ownAffiliateLink' ? resolvedMainPostFields.link : '',
-        sourceLink: resolvedMainPostFields.link,
+        title: sanitizedMainPostFields.title,
+        price: sanitizedMainPostFields.price,
+        affiliateLink: sanitizedMainPostFields.link,
         diagnostic: Boolean(trimmedDebugInfo) || fallbackTextLooksLikeDebug
       })
     : initialMainPostText;
@@ -1008,17 +1267,17 @@ export async function sendTelegramDealPost({
   });
   if (trimmedMainPostText) {
     console.info('[MAIN_POST_BUILD_SUCCESS]', {
-      titleSource: resolvedMainPostFields.titleSource,
-      priceSource: resolvedMainPostFields.priceSource,
-      linkSource: resolvedMainPostFields.linkSource,
+      titleSource: sanitizedMainPostFields.titleSource,
+      priceSource: sanitizedMainPostFields.priceSource,
+      linkSource: sanitizedMainPostFields.linkSource,
       textLength: trimmedMainPostText.length,
       fallbackUsed: fallbackMainRequired
     });
   } else {
     console.error('[MAIN_POST_BUILD_FAILED]', {
-      titleSource: resolvedMainPostFields.titleSource,
-      priceSource: resolvedMainPostFields.priceSource,
-      linkSource: resolvedMainPostFields.linkSource,
+      titleSource: sanitizedMainPostFields.titleSource,
+      priceSource: sanitizedMainPostFields.priceSource,
+      linkSource: sanitizedMainPostFields.linkSource,
       fallbackUsed: fallbackMainRequired
     });
   }

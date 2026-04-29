@@ -106,6 +106,10 @@ const SHIPPED_BY_AMAZON_PATTERNS = [
     regex: /ships from amazon(?:\.de)?/
   },
   {
+    key: 'shipped_by_amazon',
+    regex: /shipped by amazon(?:\.de)?/
+  },
+  {
     key: 'dispatched_from_amazon',
     regex: /dispatched from amazon(?:\.de)?/
   },
@@ -148,6 +152,10 @@ const SHIPPED_BY_THIRDPARTY_PATTERNS = [
   {
     key: 'ships_from_drittanbieter',
     regex: /ships from\s+(?!amazon(?:\.de)?(?:\s|$))[^.,;\n]+/
+  },
+  {
+    key: 'shipped_by_drittanbieter',
+    regex: /shipped by\s+(?!amazon(?:\.de)?(?:\s|$))[^.,;\n]+/
   },
   {
     key: 'dispatched_from_drittanbieter',
@@ -212,6 +220,277 @@ function logSellerDetection(tag, payload = {}) {
   } catch {
     console.info(`[${tag}]`);
   }
+}
+
+function buildSellerSourceAvailability({ input = {}, sellerDetails = {}, detectionSources = [], primaryDetectionSource = '' } = {}) {
+  const normalizedDetectionSources = uniqueCleanValues([primaryDetectionSource, ...(Array.isArray(detectionSources) ? detectionSources : [])]).map(
+    (value) => cleanText(value).toLowerCase()
+  );
+  const hasDetectionSource = (patterns = []) =>
+    normalizedDetectionSources.some((entry) => patterns.some((pattern) => entry.includes(pattern)));
+  const sellerDetailsMerchantText = cleanText(sellerDetails.merchantText);
+  const sellerDetailsRawText = cleanText(
+    sellerDetails.rawText ||
+      sellerDetails.scrapeText ||
+      sellerDetails.buyboxText ||
+      sellerDetails.offerText ||
+      sellerDetails.offerDisplayText
+  );
+  const sellerRawText = cleanText(input.sellerRawText);
+  const explicitTelegramText = cleanText(input.telegramText || sellerDetails.telegramText);
+
+  return {
+    paapiMerchantInfo: {
+      checked: hasDetectionSource(['paapi']) || Boolean(cleanText(input.paapiMerchantInfo || sellerDetails.paapiMerchantInfo)),
+      source: 'paapi',
+      value: cleanText(
+        input.paapiMerchantInfo ||
+          sellerDetails.paapiMerchantInfo ||
+          sellerDetails.paapiMerchant ||
+          sellerDetails.paapiMerchantName ||
+          (hasDetectionSource(['paapi']) ? sellerDetailsMerchantText : '')
+      )
+    },
+    offerMerchantInfo: {
+      checked:
+        hasDetectionSource(['offer-display', 'buybox', 'tabular-buybox', 'desktop-buybox']) ||
+        Boolean(cleanText(input.offerMerchantInfo || sellerDetails.offerMerchantInfo)),
+      source: 'offer_merchant_info',
+      value: cleanText(
+        input.offerMerchantInfo ||
+          sellerDetails.offerMerchantInfo ||
+          sellerDetails.offerMerchant ||
+          sellerDetails.offerMerchantName ||
+          (hasDetectionSource(['offer-display', 'buybox', 'tabular-buybox', 'desktop-buybox'])
+            ? sellerDetailsMerchantText
+            : '')
+      )
+    },
+    keepaSellerInfo: {
+      checked: hasDetectionSource(['keepa']) || Boolean(cleanText(input.keepaSellerInfo || sellerDetails.keepaSellerInfo)),
+      source: 'keepa_seller_info',
+      value: cleanText(
+        input.keepaSellerInfo || sellerDetails.keepaSellerInfo || sellerDetails.keepaSeller || sellerDetails.keepaMerchant
+      )
+    },
+    scrapeText: {
+      checked:
+        hasDetectionSource(['scrape', 'buybox', 'offer-display', 'tabular-buybox', 'desktop-buybox']) ||
+        Boolean(cleanText(input.scrapeText || sellerDetailsRawText)),
+      source: 'scrape_text',
+      value: cleanText(input.scrapeText || sellerDetailsRawText)
+    },
+    telegramText: {
+      checked: hasDetectionSource(['telegram']) || Boolean(explicitTelegramText),
+      source: 'telegram_text',
+      value: cleanText(explicitTelegramText || (hasDetectionSource(['telegram']) ? sellerRawText : ''))
+    },
+    sellerRawText: {
+      checked: Boolean(sellerRawText),
+      source: cleanText(primaryDetectionSource) || 'seller_raw_text',
+      value: sellerRawText
+    },
+    merchantText: {
+      checked: Boolean(cleanText(input.merchantText || sellerDetailsMerchantText)),
+      source: cleanText(primaryDetectionSource || sellerDetails.detectionSource) || 'merchant_text',
+      value: cleanText(input.merchantText || sellerDetailsMerchantText)
+    }
+  };
+}
+
+function buildSellerTextCandidates({ input = {}, sellerDetails = {}, primaryDetectionSource = '', sourceAvailability = {} } = {}) {
+  const rawCandidates = [
+    {
+      field: 'paapiMerchantInfo',
+      detectionSource: sourceAvailability.paapiMerchantInfo?.source || 'paapi',
+      value: sourceAvailability.paapiMerchantInfo?.value || ''
+    },
+    {
+      field: 'offerMerchantInfo',
+      detectionSource: sourceAvailability.offerMerchantInfo?.source || 'offer_merchant_info',
+      value: sourceAvailability.offerMerchantInfo?.value || ''
+    },
+    {
+      field: 'keepaSellerInfo',
+      detectionSource: sourceAvailability.keepaSellerInfo?.source || 'keepa_seller_info',
+      value: sourceAvailability.keepaSellerInfo?.value || ''
+    },
+    {
+      field: 'scrapeText',
+      detectionSource: sourceAvailability.scrapeText?.source || 'scrape_text',
+      value: sourceAvailability.scrapeText?.value || ''
+    },
+    {
+      field: 'telegramText',
+      detectionSource: sourceAvailability.telegramText?.source || 'telegram_text',
+      value: sourceAvailability.telegramText?.value || ''
+    },
+    {
+      field: 'merchantText',
+      detectionSource: cleanText(primaryDetectionSource || sellerDetails.detectionSource) || 'merchant_text',
+      value: cleanText(input.merchantText || sellerDetails.merchantText)
+    },
+    {
+      field: 'sellerRawText',
+      detectionSource: cleanText(primaryDetectionSource).includes('telegram')
+        ? 'telegram_message'
+        : cleanText(primaryDetectionSource) || 'seller_raw_text',
+      value: cleanText(input.sellerRawText)
+    }
+  ];
+  const seen = new Set();
+
+  return rawCandidates
+    .map((candidate) => ({
+      field: cleanText(candidate.field) || 'merchantText',
+      detectionSource: cleanText(candidate.detectionSource) || 'unknown',
+      value: cleanText(candidate.value)
+    }))
+    .filter((candidate) => candidate.value)
+    .filter((candidate) => {
+      const key = `${candidate.detectionSource}::${candidate.value}`;
+      if (seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    });
+}
+
+function mergeSellerSignalCandidates(candidateAnalyses = []) {
+  const soldByAmazon = candidateAnalyses.some(
+    (candidate) => candidate.signals?.hasCombinedAmazonMatch === true || candidate.signals?.soldByAmazon === true
+  )
+    ? true
+    : candidateAnalyses.some((candidate) => candidate.signals?.soldByAmazon === false)
+      ? false
+      : null;
+  const shippedByAmazon = candidateAnalyses.some(
+    (candidate) => candidate.signals?.hasCombinedAmazonMatch === true || candidate.signals?.shippedByAmazon === true
+  )
+    ? true
+    : candidateAnalyses.some((candidate) => candidate.signals?.shippedByAmazon === false)
+      ? false
+      : null;
+  const matchedPatterns = uniqueCleanValues(candidateAnalyses.flatMap((candidate) => candidate.signals?.matchedPatterns || []));
+  const matchedDirectAmazonPatterns = uniqueCleanValues(
+    candidateAnalyses.flatMap((candidate) => candidate.signals?.matchedDirectAmazonPatterns || [])
+  );
+  const selectedCandidate =
+    candidateAnalyses.find(
+      (candidate) =>
+        candidate.signals?.hasCombinedAmazonMatch === true ||
+        candidate.signals?.soldByAmazon !== null ||
+        candidate.signals?.shippedByAmazon !== null ||
+        (candidate.signals?.matchedPatterns || []).length > 0
+    ) ||
+    candidateAnalyses[0] ||
+    null;
+
+  return {
+    soldByAmazon,
+    shippedByAmazon,
+    matchedPatterns,
+    matchedDirectAmazonPatterns,
+    hasCombinedAmazonMatch: candidateAnalyses.some((candidate) => candidate.signals?.hasCombinedAmazonMatch === true),
+    merchantText: selectedCandidate?.signals?.merchantText || '',
+    detectionSource: selectedCandidate?.signals?.detectionSource || '',
+    rawDetectionSource: selectedCandidate?.signals?.rawDetectionSource || ''
+  };
+}
+
+function collectCheckedSellerSources(sourceAvailability = {}) {
+  return Object.entries(sourceAvailability)
+    .filter(([, entry]) => entry && entry.checked === true)
+    .map(([field, entry]) => ({
+      field,
+      source: cleanText(entry.source) || field,
+      hasValue: Boolean(cleanText(entry.value)),
+      valuePreview: cleanText(entry.value).slice(0, SELLER_LOG_TEXT_LIMIT)
+    }));
+}
+
+function collectMissingSellerFields({
+  sourceAvailability = {},
+  inputSoldByAmazon = null,
+  inputShippedByAmazon = null,
+  derivedSoldByAmazon = null,
+  derivedShippedByAmazon = null
+} = {}) {
+  const missingFields = [];
+
+  if (inputSoldByAmazon === null && derivedSoldByAmazon === null) {
+    missingFields.push('soldByAmazon');
+  }
+  if (inputShippedByAmazon === null && derivedShippedByAmazon === null) {
+    missingFields.push('shippedByAmazon');
+  }
+
+  for (const [field, entry] of Object.entries(sourceAvailability)) {
+    if (entry?.checked === true && !cleanText(entry.value)) {
+      missingFields.push(field);
+    }
+  }
+
+  return uniqueCleanValues(missingFields);
+}
+
+function resolveUnknownSellerReason({
+  sellerClass = '',
+  isNonAmazonDeal = false,
+  sourceAvailability = {},
+  candidateAnalyses = [],
+  matchedPatterns = [],
+  rawSoldByAmazon = null,
+  rawShippedByAmazon = null,
+  missingFields = []
+} = {}) {
+  if (sellerClass !== SELLER_CLASS.UNKNOWN || isNonAmazonDeal === true) {
+    return '';
+  }
+
+  if (candidateAnalyses.length === 0 && rawSoldByAmazon === null && rawShippedByAmazon === null) {
+    return 'no_seller_inputs_available';
+  }
+  if (sourceAvailability.paapiMerchantInfo?.checked === true && !cleanText(sourceAvailability.paapiMerchantInfo?.value)) {
+    return 'paapi_merchant_info_missing';
+  }
+  if (sourceAvailability.offerMerchantInfo?.checked === true && !cleanText(sourceAvailability.offerMerchantInfo?.value)) {
+    return 'offer_merchant_info_missing';
+  }
+  if (sourceAvailability.keepaSellerInfo?.checked === true && !cleanText(sourceAvailability.keepaSellerInfo?.value)) {
+    return 'keepa_seller_info_missing';
+  }
+  if (sourceAvailability.scrapeText?.checked === true && !cleanText(sourceAvailability.scrapeText?.value)) {
+    return 'scrape_text_missing';
+  }
+  if (sourceAvailability.telegramText?.checked === true && !cleanText(sourceAvailability.telegramText?.value)) {
+    return 'telegram_text_missing';
+  }
+  if (rawSoldByAmazon === true && rawShippedByAmazon === false) {
+    return 'sold_by_amazon_with_third_party_shipping_conflict';
+  }
+  if (rawSoldByAmazon === true && rawShippedByAmazon === null) {
+    return 'amazon_seller_detected_shipping_missing';
+  }
+  if (rawSoldByAmazon === false && rawShippedByAmazon === null) {
+    return 'third_party_seller_detected_shipping_missing';
+  }
+  if (rawSoldByAmazon === null && rawShippedByAmazon === true) {
+    return 'shipping_amazon_detected_seller_missing';
+  }
+  if (rawSoldByAmazon === null && rawShippedByAmazon === false) {
+    return 'shipping_third_party_detected_seller_missing';
+  }
+  if ((matchedPatterns || []).length === 0) {
+    return 'seller_text_without_supported_patterns';
+  }
+  if (missingFields.length > 0) {
+    return `missing_fields:${missingFields.join(',')}`;
+  }
+
+  return 'insufficient_seller_signals';
 }
 
 function sourceSupportsCombinedSellerShippingDetection(detectionSource = '') {
@@ -405,34 +684,75 @@ export function resolveSellerIdentity(input = {}) {
         : {};
   const sellerDetails = sellerDetailsSource;
   const primaryDetectionSource = cleanText(input.sellerDetectionSource || input.detectionSource || sellerDetails.detectionSource);
-  const merchantText = cleanText(input.merchantText || input.sellerRawText || sellerDetails.merchantText);
-  const derivedSignals = merchantText
-    ? extractSellerSignalsFromText(merchantText, {
-        detectionSource: primaryDetectionSource || 'unknown'
-      })
-    : null;
   const inputSoldByAmazon = parseSellerBoolean(input.soldByAmazon);
   const inputShippedByAmazon = parseSellerBoolean(input.shippedByAmazon);
-  const rawSoldByAmazon = inputSoldByAmazon !== null ? inputSoldByAmazon : derivedSignals?.soldByAmazon ?? null;
-  const rawShippedByAmazon = inputShippedByAmazon !== null ? inputShippedByAmazon : derivedSignals?.shippedByAmazon ?? null;
+  const sourceAvailability = buildSellerSourceAvailability({
+    input,
+    sellerDetails,
+    detectionSources: [
+      ...(Array.isArray(input.detectionSources) ? input.detectionSources : []),
+      ...(Array.isArray(sellerDetails.detectionSources) ? sellerDetails.detectionSources : [])
+    ],
+    primaryDetectionSource
+  });
+  const textCandidateAnalyses = buildSellerTextCandidates({
+    input,
+    sellerDetails,
+    primaryDetectionSource,
+    sourceAvailability
+  }).map((candidate) => {
+    const signals = extractSellerSignalsFromText(candidate.value, {
+      detectionSource: candidate.detectionSource || 'unknown'
+    });
+
+    if (
+      signals.hasCombinedAmazonMatch === true ||
+      signals.soldByAmazon !== null ||
+      signals.shippedByAmazon !== null ||
+      (signals.matchedPatterns || []).length > 0
+    ) {
+      logSellerDetection('SELLER_TEXT_MATCH', {
+        field: candidate.field,
+        detectionSource: candidate.detectionSource || 'unknown',
+        soldByAmazon: signals.soldByAmazon,
+        shippedByAmazon: signals.shippedByAmazon,
+        soldSignal: signals.soldSignal,
+        shippedSignal: signals.shippedSignal,
+        matchedPatterns: signals.matchedPatterns || [],
+        textPreview: signals.merchantText.slice(0, SELLER_LOG_TEXT_LIMIT)
+      });
+    }
+
+    return {
+      ...candidate,
+      signals
+    };
+  });
+  const derivedSignals = mergeSellerSignalCandidates(textCandidateAnalyses);
+  const merchantText = cleanText(
+    derivedSignals.merchantText || input.merchantText || input.sellerRawText || sellerDetails.merchantText || sourceAvailability.scrapeText?.value
+  );
+  const rawSoldByAmazon = inputSoldByAmazon !== null ? inputSoldByAmazon : derivedSignals.soldByAmazon ?? null;
+  const rawShippedByAmazon = inputShippedByAmazon !== null ? inputShippedByAmazon : derivedSignals.shippedByAmazon ?? null;
   const detectionSources = uniqueCleanValues([
     ...(Array.isArray(input.detectionSources) ? input.detectionSources : []),
     ...(Array.isArray(sellerDetails.detectionSources) ? sellerDetails.detectionSources : []),
     input.sellerDetectionSource,
     input.detectionSource,
     sellerDetails.detectionSource,
-    derivedSignals?.rawDetectionSource,
-    derivedSignals?.detectionSource
+    derivedSignals.rawDetectionSource,
+    derivedSignals.detectionSource,
+    ...textCandidateAnalyses.map((candidate) => candidate.detectionSource)
   ]);
   const matchedPatterns = uniqueCleanValues([
     ...(Array.isArray(input.matchedPatterns) ? input.matchedPatterns : []),
     ...(Array.isArray(sellerDetails.matchedPatterns) ? sellerDetails.matchedPatterns : []),
-    ...(Array.isArray(derivedSignals?.matchedPatterns) ? derivedSignals.matchedPatterns : [])
+    ...(Array.isArray(derivedSignals.matchedPatterns) ? derivedSignals.matchedPatterns : [])
   ]);
   const matchedDirectAmazonPatterns = uniqueCleanValues([
     ...(Array.isArray(input.matchedDirectAmazonPatterns) ? input.matchedDirectAmazonPatterns : []),
     ...(Array.isArray(sellerDetails.matchedDirectAmazonPatterns) ? sellerDetails.matchedDirectAmazonPatterns : []),
-    ...(Array.isArray(derivedSignals?.matchedDirectAmazonPatterns) ? derivedSignals.matchedDirectAmazonPatterns : [])
+    ...(Array.isArray(derivedSignals.matchedDirectAmazonPatterns) ? derivedSignals.matchedDirectAmazonPatterns : [])
   ]);
   const dealType = cleanText(input.dealType || sellerDetails.dealType).toUpperCase();
   const isNonAmazonDeal = dealType === 'NON_AMAZON' || input.isAmazonDeal === false || sellerDetails.isAmazonDeal === false;
@@ -440,7 +760,7 @@ export function resolveSellerIdentity(input = {}) {
     input.hasCombinedAmazonMatch === true ||
     sellerDetails.hasCombinedAmazonMatch === true ||
     detectionSources.includes(COMBINED_SELLER_SHIPPING_DETECTION_SOURCE) ||
-    derivedSignals?.hasCombinedAmazonMatch === true;
+    derivedSignals.hasCombinedAmazonMatch === true;
   const sellerClassFromFlags =
     rawSoldByAmazon === true && rawShippedByAmazon === true
       ? SELLER_CLASS.AMAZON_DIRECT
@@ -477,20 +797,24 @@ export function resolveSellerIdentity(input = {}) {
         : sellerClass === SELLER_CLASS.FBM_THIRDPARTY
           ? false
           : null;
-  const unknownReason =
-    sellerClass !== SELLER_CLASS.UNKNOWN || isNonAmazonDeal === true
-      ? ''
-      : primaryDetectionSource.includes('paapi') && !merchantText
-        ? 'paapi_missing_merchant_text'
-        : !merchantText
-          ? 'missing_merchant_text'
-          : rawSoldByAmazon === true && rawShippedByAmazon === false
-            ? 'sold_by_amazon_but_shipping_unclear'
-            : rawSoldByAmazon === null && rawShippedByAmazon === true
-              ? 'shipped_by_amazon_but_seller_unclear'
-              : matchedPatterns.length === 0
-                ? 'merchant_text_without_known_patterns'
-                : 'insufficient_seller_signals';
+  const checkedSources = collectCheckedSellerSources(sourceAvailability);
+  const missingFields = collectMissingSellerFields({
+    sourceAvailability,
+    inputSoldByAmazon,
+    inputShippedByAmazon,
+    derivedSoldByAmazon: derivedSignals.soldByAmazon,
+    derivedShippedByAmazon: derivedSignals.shippedByAmazon
+  });
+  const unknownReason = resolveUnknownSellerReason({
+    sellerClass,
+    isNonAmazonDeal,
+    sourceAvailability,
+    candidateAnalyses: textCandidateAnalyses,
+    matchedPatterns,
+    rawSoldByAmazon,
+    rawShippedByAmazon,
+    missingFields
+  });
 
   logSellerDetection('SELLER_DETECTION_INPUTS', {
     sellerClassInput: explicitSellerClass || '',
@@ -500,13 +824,42 @@ export function resolveSellerIdentity(input = {}) {
     merchantTextPreview: merchantText ? merchantText.slice(0, SELLER_LOG_TEXT_LIMIT) : '',
     soldByAmazonInput: inputSoldByAmazon,
     shippedByAmazonInput: inputShippedByAmazon,
-    soldByAmazonDerived: derivedSignals?.soldByAmazon ?? null,
-    shippedByAmazonDerived: derivedSignals?.shippedByAmazon ?? null,
+    soldByAmazonDerived: derivedSignals.soldByAmazon ?? null,
+    shippedByAmazonDerived: derivedSignals.shippedByAmazon ?? null,
     matchedPatterns,
     matchedDirectAmazonPatterns,
     hasCombinedAmazonMatch,
+    checkedSources,
+    textCandidateCount: textCandidateAnalyses.length,
     resolvedSellerClass: sellerClass,
     resolvedSellerType: sellerType
+  });
+
+  if (missingFields.length > 0) {
+    logSellerDetection('SELLER_FIELD_MISSING', {
+      detectionSource: primaryDetectionSource || 'unknown',
+      detectionSources,
+      checkedSources,
+      missingFields,
+      reason:
+        sellerClass === SELLER_CLASS.UNKNOWN
+          ? 'Seller-Erkennung hat nicht alle benoetigten Felder gefunden.'
+          : 'Seller-Erkennung konnte den Seller trotz fehlender Einzelfelder aufloesen.'
+    });
+  }
+
+  logSellerDetection('SELLER_CLASS_RESOLVED', {
+    detectionSource: primaryDetectionSource || 'unknown',
+    detectionSources,
+    sellerClass,
+    sellerType,
+    soldByAmazon,
+    shippedByAmazon,
+    matchedPatterns,
+    matchedDirectAmazonPatterns,
+    hasCombinedAmazonMatch,
+    checkedSources,
+    unknownReason: unknownReason || ''
   });
 
   if (unknownReason) {
@@ -517,6 +870,8 @@ export function resolveSellerIdentity(input = {}) {
       soldByAmazon,
       shippedByAmazon,
       matchedPatterns,
+      missingFields,
+      checkedSources,
       reason: unknownReason
     });
   }
@@ -543,6 +898,8 @@ export function resolveSellerIdentity(input = {}) {
       matchedPatterns,
       matchedDirectAmazonPatterns,
       hasCombinedAmazonMatch,
+      checkedSources,
+      missingFields,
       unknownReason,
       recognitionMessage: sellerClass === SELLER_CLASS.UNKNOWN ? 'Seller konnte nicht erkannt werden.' : ''
     }
