@@ -52,15 +52,58 @@ const PROTECTED_SOURCE_PATTERNS = [
   { key: 'cf_ray', regex: /cf-ray/i }
 ];
 const READER_SHORTLINK_HOSTS = new Set(['amzn.to', 'bit.ly', 'tidd.ly']);
-const BLOCKED_MAIN_POST_SOURCE_IMAGE_KEYS = new Set(['@codeundcoupondeals', 'codeundcoupondeals']);
+const BLOCKED_MAIN_POST_SOURCE_IMAGE_KEYS = new Set([
+  '@codeundcoupondeals',
+  'codeundcoupondeals',
+  'codecoupon',
+  'codecoupondeals',
+  '@piratdeals',
+  '@piratedeals',
+  'piratdeals',
+  'piratedeals'
+]);
+const PROTECTED_DEAL_SOURCE_RULES = [
+  {
+    sourceKey: 'code_coupon',
+    sourceLabel: 'Code&Coupon',
+    sourceGroupKeys: new Set(['@codeundcoupondeals', 'codeundcoupondeals', 'codecoupon', 'codecoupondeals']),
+    hostPatterns: [/(?:^|\.)code-coupon\.de$/i],
+    textPatterns: [/\bcode\s*(?:&|und)?\s*coupon\b/i, /\bcodeundcoupon\b/i, /@codeundcoupondeals/i]
+  },
+  {
+    sourceKey: 'pirate_deals',
+    sourceLabel: 'Pirate Deals',
+    sourceGroupKeys: new Set(['@piratdeals', '@piratedeals', 'piratdeals', 'piratedeals']),
+    hostPatterns: [/(?:^|\.)s\.pirat\.deals$/i, /(?:^|\.)pirat\.deals$/i],
+    textPatterns: [/\bpirate\s+deals\b/i, /\bpirat\s+deals\b/i, /\bs\.pirat\.deals\b/i]
+  }
+];
 const PROTECTED_SOURCE_HOST_PATTERNS = [
   /(?:^|\.)amzn\.to$/i,
   /(?:^|\.)amzlink\.to$/i,
   /(?:^|\.)bit\.ly$/i,
   /(?:^|\.)tidd\.ly$/i,
+  /(?:^|\.)code-coupon\.de$/i,
+  /(?:^|\.)s\.pirat\.deals$/i,
+  /(?:^|\.)pirat\.deals$/i,
   /(?:^|\.)awin(?:1)?\.[a-z.]+$/i,
   /(?:^|\.)adcell\.[a-z.]+$/i
 ];
+const ALLOWED_MAIN_POST_TITLE_SOURCES = new Set(['paapi', 'amazon', 'keepa_verified']);
+const ALLOWED_MAIN_POST_IMAGE_SOURCES = new Set(['paapi', 'amazon', 'keepa_verified', 'manual_upload']);
+const ALLOWED_MAIN_POST_LINK_SOURCES = new Set(['own_affiliate']);
+const BLOCKED_MAIN_POST_SOURCE_VALUES = new Set([
+  'telegram',
+  'source',
+  'originaltext',
+  'originalimage',
+  'preview',
+  'fallback_source',
+  'unknown',
+  'missing',
+  'og',
+  'scraped'
+]);
 const SOURCE_BRAND_STOPWORDS = new Set([
   'amazon',
   'angebot',
@@ -653,15 +696,127 @@ function normalizeReaderImagePolicySourceKey(value = '') {
     .replace(/[^a-z0-9@]+/g, '');
 }
 
+function resolveProtectedDealSourceContext({
+  source = {},
+  structuredMessage = {},
+  originalLink = '',
+  originalText = ''
+} = {}) {
+  const channelRef = cleanText(source?.channelRef) || cleanText(structuredMessage?.channelRef);
+  const channelTitle = cleanText(source?.channelTitle) || cleanText(structuredMessage?.channelTitle);
+  const group = cleanText(structuredMessage?.group);
+  const originalLinkHost = normalizeUrlHost(
+    originalLink || structuredMessage?.externalLink || structuredMessage?.previewUrl || structuredMessage?.link
+  );
+  const originalTextValue = cleanText(originalText || structuredMessage?.text);
+  const groupedCandidates = [
+    {
+      field: 'channelRef',
+      value: channelRef,
+      normalizedKeys: [normalizeChannelMatchKey(channelRef), normalizeReaderImagePolicySourceKey(channelRef)].filter(Boolean)
+    },
+    {
+      field: 'channelTitle',
+      value: channelTitle,
+      normalizedKeys: [normalizeReaderImagePolicySourceKey(channelTitle)].filter(Boolean)
+    },
+    {
+      field: 'group',
+      value: group,
+      normalizedKeys: [normalizeReaderImagePolicySourceKey(group)].filter(Boolean)
+    }
+  ];
+
+  for (const rule of PROTECTED_DEAL_SOURCE_RULES) {
+    for (const candidate of groupedCandidates) {
+      if (candidate.normalizedKeys.some((value) => rule.sourceGroupKeys.has(value))) {
+        return {
+          matched: true,
+          sourceKey: rule.sourceKey,
+          sourceLabel: rule.sourceLabel,
+          matchedField: candidate.field,
+          matchedValue: candidate.value,
+          channelRef,
+          channelTitle,
+          group,
+          originalLinkHost
+        };
+      }
+
+      if (candidate.value && rule.textPatterns.some((pattern) => pattern.test(candidate.value))) {
+        return {
+          matched: true,
+          sourceKey: rule.sourceKey,
+          sourceLabel: rule.sourceLabel,
+          matchedField: candidate.field,
+          matchedValue: candidate.value,
+          channelRef,
+          channelTitle,
+          group,
+          originalLinkHost
+        };
+      }
+    }
+
+    if (originalLinkHost && rule.hostPatterns.some((pattern) => pattern.test(originalLinkHost))) {
+      return {
+        matched: true,
+        sourceKey: rule.sourceKey,
+        sourceLabel: rule.sourceLabel,
+        matchedField: 'originalLinkHost',
+        matchedValue: originalLinkHost,
+        channelRef,
+        channelTitle,
+        group,
+        originalLinkHost
+      };
+    }
+
+    if (originalTextValue && rule.textPatterns.some((pattern) => pattern.test(originalTextValue))) {
+      return {
+        matched: true,
+        sourceKey: rule.sourceKey,
+        sourceLabel: rule.sourceLabel,
+        matchedField: 'originalText',
+        matchedValue: originalTextValue.slice(0, 180),
+        channelRef,
+        channelTitle,
+        group,
+        originalLinkHost
+      };
+    }
+  }
+
+  return {
+    matched: false,
+    sourceKey: '',
+    sourceLabel: '',
+    matchedField: '',
+    matchedValue: '',
+    channelRef,
+    channelTitle,
+    group,
+    originalLinkHost
+  };
+}
+
 function resolveBlockedMainPostSourceImageContext(structuredMessage = {}) {
   const sourceGroupRef = cleanText(structuredMessage?.channelRef);
   const sourceGroupTitle = cleanText(structuredMessage?.channelTitle || structuredMessage?.group) || 'Unbekannt';
+  const protectedSourceContext = resolveProtectedDealSourceContext({
+    structuredMessage,
+    originalLink: cleanText(structuredMessage?.externalLink) || cleanText(structuredMessage?.previewUrl) || cleanText(structuredMessage?.link),
+    originalText: cleanText(structuredMessage?.text)
+  });
   const candidateKeys = [
     normalizeChannelMatchKey(sourceGroupRef),
     normalizeReaderImagePolicySourceKey(sourceGroupRef),
     normalizeReaderImagePolicySourceKey(sourceGroupTitle)
   ].filter(Boolean);
-  const matchedPolicyKey = candidateKeys.find((value) => BLOCKED_MAIN_POST_SOURCE_IMAGE_KEYS.has(value)) || '';
+  const matchedPolicyKey =
+    protectedSourceContext.matched === true
+      ? protectedSourceContext.sourceKey
+      : candidateKeys.find((value) => BLOCKED_MAIN_POST_SOURCE_IMAGE_KEYS.has(value)) || '';
 
   if (!matchedPolicyKey) {
     return null;
@@ -1773,14 +1928,15 @@ function buildSourceMatchReasonSummary(sourceFacts = {}, candidate = {}) {
   if (sourceFacts.priceValue !== null && candidate.priceValue !== null) {
     parts.push('Preis');
   }
-  if (cleanText(sourceFacts.imageUrl) && cleanText(candidate.imageUrl)) {
-    parts.push('Bild');
-  }
 
   return Array.from(new Set(parts)).join(' / ') || resolveSourceMatchReasonLabel(sourceFacts.matchBasis);
 }
 
 function buildAmazonSearchQuery(sourceFacts = {}) {
+  if (sourceFacts.matchBasis === 'asin') {
+    return cleanText(sourceFacts.asinCandidate || sourceFacts.query || '');
+  }
+
   if (sourceFacts.matchBasis === 'brand_model') {
     return [sourceFacts.brandCandidate, sourceFacts.modelCandidate].filter(Boolean).join(' ').trim();
   }
@@ -1837,6 +1993,96 @@ function sanitizeAmazonFallbackQueryLine(value = '') {
     .replace(/[^\p{L}\p{N}\s/-]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function cleanSourceTitleCandidateLine(value = '') {
+  return sanitizeReaderDescriptionValue(value)
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, ' ')
+    .replace(/\b(?:top|mega|hot|super|blitz)\s+deal\b/gi, ' ')
+    .replace(/\bpreisfehler\b/gi, ' ')
+    .replace(/\b(?:jetzt|heute)\b/gi, ' ')
+    .replace(/\b(?:anzeige|partnerlink)\b/gi, ' ')
+    .replace(/\b(?:coupon|couponcode|gutschein|gutscheincode|rabattcode|rabatt|spar-?abo)\b[:\s-]*[A-Z0-9-]{0,20}/gi, ' ')
+    .replace(/\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*â‚¬\s*(?:statt|von)\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*â‚¬\s*-?\d{1,3}(?:[.,]\d{1,2})?\s*%?/gi, ' ')
+    .replace(/\b(?:nur|statt)\s+\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*â‚¬\b/gi, ' ')
+    .replace(/-?\d{1,3}(?:[.,]\d{1,2})?\s*%/g, ' ')
+    .replace(/[|•]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s/+().,-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+}
+
+function isSourceTitleNoiseLine(value = '') {
+  const line = cleanText(value);
+  if (!line) {
+    return true;
+  }
+
+  if (isAmazonFallbackNoiseLine(line)) {
+    return true;
+  }
+
+  if (/\b(?:anzeige|partnerlink)\b/i.test(line) && !/[a-z0-9]{4,}/i.test(line.replace(/\b(?:anzeige|partnerlink)\b/gi, ''))) {
+    return true;
+  }
+
+  if (/\b(?:coupon|couponcode|gutschein|gutscheincode|rabattcode|spar-?abo)\b/i.test(line) && !/[a-z]{3,}.*\d|[a-z]{4,}/i.test(line)) {
+    return true;
+  }
+
+  return false;
+}
+
+function selectSourceTitleCandidate({ previewTitle = '', scrapedTitle = '', originalText = '', fallback = '' } = {}) {
+  const lineCandidates = [];
+  const rawLines = String(originalText || '')
+    .split(/\r?\n/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  if (cleanText(previewTitle)) {
+    lineCandidates.push({ source: 'previewTitle', rawValue: cleanText(previewTitle) });
+  }
+  if (cleanText(scrapedTitle)) {
+    lineCandidates.push({ source: 'scrapedTitle', rawValue: cleanText(scrapedTitle) });
+  }
+  for (const line of rawLines) {
+    lineCandidates.push({ source: 'originalText', rawValue: line });
+  }
+  if (cleanText(fallback)) {
+    lineCandidates.push({ source: 'fallback', rawValue: cleanText(fallback) });
+  }
+
+  for (const candidate of lineCandidates) {
+    if (isSourceTitleNoiseLine(candidate.rawValue)) {
+      continue;
+    }
+
+    const cleanedValue = cleanSourceTitleCandidateLine(candidate.rawValue);
+    if (!cleanedValue || isSourceTitleNoiseLine(cleanedValue)) {
+      continue;
+    }
+
+    const tokenCount = tokenizeMatchText(cleanedValue).length;
+    if (cleanedValue.length < 8 && tokenCount < 2) {
+      continue;
+    }
+
+    return {
+      source: candidate.source,
+      rawValue: candidate.rawValue,
+      cleanedValue
+    };
+  }
+
+  const cleanedFallback = cleanSourceTitleCandidateLine(fallback || previewTitle || scrapedTitle || '');
+  return {
+    source: cleanedFallback ? 'fallback' : 'missing',
+    rawValue: cleanText(fallback || previewTitle || scrapedTitle || ''),
+    cleanedValue: cleanedFallback
+  };
 }
 
 function buildAmazonFallbackSearchQuery(sourceFacts = {}) {
@@ -1956,12 +2202,7 @@ function extractSourceProductFacts({
   const originalText = cleanText(structuredMessage?.text);
   const sourceGroupRef = cleanText(source?.channelRef) || cleanText(structuredMessage?.channelRef);
   const sourceGroupTitle =
-    cleanText(source?.channelTitle) || cleanText(source?.name) || cleanText(structuredMessage?.channelTitle || structuredMessage?.group) || 'Unbekannt';
-  const titleCandidate = [
-    sanitizeProtectedSourceValue(structuredMessage?.previewTitle, 'previewTitle'),
-    sanitizeProtectedSourceValue(scrapedDeal?.title, 'scrapedTitle'),
-    sanitizeProtectedSourceValue(extractTelegramTitle(structuredMessage?.text, structuredMessage?.group), 'telegramTitle')
-  ].find(Boolean) || '';
+    cleanText(source?.channelTitle) || cleanText(structuredMessage?.channelTitle || structuredMessage?.group) || 'Unbekannt';
   const priceValue =
     pricing?.currentPrice !== null && pricing?.currentPrice !== undefined
       ? Number(pricing.currentPrice)
@@ -1983,6 +2224,19 @@ function extractSourceProductFacts({
   ]
     .map((value) => cleanText(value))
     .filter(Boolean);
+  const protectedSourceContext = resolveProtectedDealSourceContext({
+    source,
+    structuredMessage,
+    originalLink: cleanText(allLinks[0] || ''),
+    originalText
+  });
+  const titleSelection = selectSourceTitleCandidate({
+    previewTitle: sanitizeProtectedSourceValue(structuredMessage?.previewTitle, 'previewTitle'),
+    scrapedTitle: sanitizeProtectedSourceValue(scrapedDeal?.title, 'scrapedTitle'),
+    originalText,
+    fallback: sanitizeProtectedSourceValue(extractTelegramTitle(structuredMessage?.text, structuredMessage?.group), 'telegramTitle')
+  });
+  const titleCandidate = cleanText(titleSelection.cleanedValue);
   const asinCandidate = cleanText(detectedAsin || allLinks.map((value) => extractAsin(value)).find(Boolean) || extractAsin(originalText)).toUpperCase();
   const brandCandidate = resolveSourceBrandCandidate(titleCandidate);
   const modelCandidate = resolveSourceModelCandidate(titleCandidate);
@@ -2018,6 +2272,9 @@ function extractSourceProductFacts({
   const sourceFacts = {
     sourceGroupRef,
     sourceGroupTitle,
+    protectedDealSourceKey: protectedSourceContext.sourceKey || '',
+    protectedDealSourceLabel: protectedSourceContext.sourceLabel || '',
+    protectedDealSourceMatched: protectedSourceContext.matched === true,
     originalText,
     originalLink: cleanText(allLinks[0] || ''),
     messageId: cleanText(structuredMessage?.messageId),
@@ -2050,13 +2307,35 @@ function extractSourceProductFacts({
     sourceGroupTitle: sourceFacts.sourceGroupTitle || 'Unbekannt',
     originalLink: sourceFacts.originalLink || null,
     matchBasis: sourceFacts.matchBasis,
-    hasImage: Boolean(sourceFacts.imageUrl)
+    hasImage: Boolean(sourceFacts.imageUrl),
+    brandCandidate: sourceFacts.brandCandidate || null,
+    modelCandidate: sourceFacts.modelCandidate || null,
+    asinCandidate: sourceFacts.asinCandidate || null,
+    protectedDealSource: sourceFacts.protectedDealSourceLabel || null
+  });
+  console.info('[SOURCE_TITLE_CANDIDATE_CLEANED]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: sourceFacts.messageId || '',
+    source: titleSelection.source || 'missing',
+    rawTitleCandidate: cleanText(titleSelection.rawValue || '').slice(0, 180) || null,
+    cleanedTitleCandidate: sourceFacts.titleCandidate || null
   });
   console.info('[SOURCE_TITLE_CANDIDATE]', {
     sessionName,
     sourceId: source?.id ?? null,
     messageId: sourceFacts.messageId || '',
     titleCandidate: sourceFacts.titleCandidate || null
+  });
+  console.info('[SOURCE_PRICE_CANDIDATE_FOUND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: sourceFacts.messageId || '',
+    priceCandidate: sourceFacts.priceCandidate || null,
+    oldPriceCandidate: sourceFacts.oldPriceCandidate || null,
+    discountCandidate: sourceFacts.discountCandidate,
+    couponCandidate: sourceFacts.couponCandidate || null,
+    sparAboCandidate: sourceFacts.sparAboCandidate === true
   });
   console.info('[SOURCE_PRICE_CANDIDATE]', {
     sessionName,
@@ -2180,7 +2459,7 @@ function computeAmazonProductMatchScore(sourceFacts = {}, candidate = {}) {
     }
   }
 
-  if (cleanText(sourceFacts.imageUrl) && cleanText(candidate.imageUrl)) {
+  if (cleanText(candidate.imageUrl)) {
     score += 10;
   }
 
@@ -2260,6 +2539,15 @@ function logAmazonSearchCandidates({
   const bestCandidate = scoredCandidates[0] || null;
 
   for (const candidate of scoredCandidates.slice(0, 3)) {
+    console.info('[AMAZON_MATCH_CANDIDATE_FOUND]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: candidate.asin || '',
+      matchScore: candidate.matchScore ?? 0,
+      candidateSource: candidate.candidateSource || 'amazon_search',
+      title: cleanText(candidate.title).slice(0, 160) || null
+    });
     console.info('[AMAZON_MATCH_CANDIDATE]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -2313,6 +2601,13 @@ async function fetchAmazonSearchCandidatesForQuery({
   }
 
   if (searchMode === 'brand_model') {
+    console.info('[AMAZON_MATCH_BY_TITLE]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      query: normalizedQuery,
+      matchBasis: 'brand_model'
+    });
     console.info('[AMAZON_SEARCH_BY_BRAND_MODEL]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -2320,6 +2615,13 @@ async function fetchAmazonSearchCandidatesForQuery({
       query: normalizedQuery
     });
   } else {
+    console.info('[AMAZON_MATCH_BY_TITLE]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      query: normalizedQuery,
+      matchBasis: 'title'
+    });
     console.info('[AMAZON_SEARCH_BY_TITLE]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -2439,7 +2741,9 @@ function buildMatchedAmazonRecoveryDeal({ sourceFacts = {}, candidate = {}, link
     asin: normalizedAsin,
     title: sanitizeReaderPostTitle(candidate?.title),
     productTitle: sanitizeReaderPostTitle(candidate?.title),
+    titleDataSource: dataSource === 'paapi' ? 'paapi' : 'amazon',
     imageUrl: cleanText(candidate?.imageUrl),
+    imageDataSource: selectedSource === 'paapi' ? 'paapi' : 'amazon',
     price: resolvedPrice,
     basePrice: resolvedPrice,
     paapiPrice: cleanText(candidate?.priceSource).toLowerCase() === 'paapi' ? candidatePriceDisplay : '',
@@ -2504,6 +2808,13 @@ async function searchAmazonProductBySourceData({
   });
 
   if (!searchQuery && !cleanText(sourceFacts.asinCandidate)) {
+    console.info('[PRODUCT_MATCH_REJECTED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      matchScore: 0,
+      reason: 'Zu wenig Quelldaten fuer eine Amazon-Suche.'
+    });
     console.warn('[AMAZON_MATCH_FAILED]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -2521,6 +2832,12 @@ async function searchAmazonProductBySourceData({
 
   try {
     if (cleanText(sourceFacts.asinCandidate)) {
+      console.info('[AMAZON_MATCH_BY_ASIN]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: sourceFacts.asinCandidate
+      });
       console.info('[AMAZON_SEARCH_BY_ASIN]', {
         sessionName,
         sourceId: source?.id ?? null,
@@ -2532,7 +2849,10 @@ async function searchAmazonProductBySourceData({
       const paapiCandidate = paapiContext?.available === true ? buildAmazonMatchCandidateFromPaapi(paapiContext?.result, sourceFacts.asinCandidate) : null;
       let bestDirectCandidate = paapiCandidate;
 
-      if (!bestDirectCandidate || !cleanText(bestDirectCandidate.title)) {
+      if (
+        (!bestDirectCandidate || !cleanText(bestDirectCandidate.title)) &&
+        sourceFacts.protectedDealSourceMatched !== true
+      ) {
         const linkRecord = buildAmazonAffiliateLinkRecord(sourceFacts.asinCandidate, { asin: sourceFacts.asinCandidate });
         if (linkRecord.valid && cleanText(linkRecord.normalizedUrl)) {
           try {
@@ -2550,6 +2870,15 @@ async function searchAmazonProductBySourceData({
             });
           }
         }
+      } else if ((!bestDirectCandidate || !cleanText(bestDirectCandidate.title)) && sourceFacts.protectedDealSourceMatched === true) {
+        console.info('[PROTECTED_SOURCE_NO_BYPASS]', {
+          sessionName,
+          sourceId: source?.id ?? null,
+          messageId: structuredMessage?.messageId || '',
+          sourceLabel: sourceFacts.protectedDealSourceLabel || null,
+          sourceHost: sourceFacts.host || null,
+          reason: 'ASIN vorhanden, aber Direkt-Scrape fuer geschuetzte Quelle uebersprungen.'
+        });
       }
 
       if (bestDirectCandidate && cleanText(bestDirectCandidate.asin)) {
@@ -2637,6 +2966,13 @@ async function searchAmazonProductBySourceData({
     });
 
     if (searchResult.blocked) {
+      console.info('[PRODUCT_MATCH_REJECTED]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        matchScore: 0,
+        reason: searchResult.blockedReason || 'Amazon-Suche wurde durch Schutzseite blockiert.'
+      });
       console.warn('[AMAZON_MATCH_FAILED]', {
         sessionName,
         sourceId: source?.id ?? null,
@@ -2760,6 +3096,13 @@ async function searchAmazonProductBySourceData({
     const bestCandidate = searchResult.bestCandidate || null;
 
     if (!bestCandidate) {
+      console.info('[PRODUCT_MATCH_REJECTED]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        matchScore: 0,
+        reason: 'Keine Amazon-Kandidaten gefunden.'
+      });
       console.warn('[AMAZON_MATCH_FAILED]', {
         sessionName,
         sourceId: source?.id ?? null,
@@ -2867,6 +3210,13 @@ async function searchAmazonProductBySourceData({
       reviewReasons: relaxedMatch.reviewReasons || []
     };
   } catch (error) {
+    console.info('[PRODUCT_MATCH_REJECTED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      matchScore: 0,
+      reason: error instanceof Error ? error.message : 'Amazon-Suche aus Quellendaten fehlgeschlagen.'
+    });
     console.warn('[AMAZON_MATCH_FAILED]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -3100,7 +3450,14 @@ function buildReaderDiagnosticPostTextV2({
   sourceHost = '',
   blockedCode = '',
   liveAllowed = false,
-  testGroupPosted = false
+  testGroupPosted = false,
+  channelRef = '',
+  channelTitle = '',
+  group = '',
+  mainPostBlocked = false,
+  titleSource = '',
+  imageSource = '',
+  affiliateLinkSource = ''
 } = {}) {
   console.info('[READER_DIAGNOSIS_MERGED_INTO_DEBUG]', {
     source: 'reader_diagnostic',
@@ -3118,6 +3475,13 @@ function buildReaderDiagnosticPostTextV2({
       reason,
       blockedCode,
       sourceHost,
+      channelRef,
+      channelTitle,
+      group,
+      mainPostBlocked,
+      titleSource,
+      imageSource,
+      affiliateLinkSource,
       liveAllowed,
       testGroupPosted,
       marketComparisonStatus: 'blocked'
@@ -4710,7 +5074,8 @@ function collectReaderDebugValues({
   const debugValues = {
     source: 'Telegram Reader / Copybot',
     channelRef: cleanText(source?.channelRef) || cleanText(structuredMessage?.channelRef),
-    channelTitle: cleanText(source?.channelTitle) || cleanText(source?.name) || cleanText(structuredMessage?.group),
+    channelTitle: cleanText(source?.channelTitle) || cleanText(structuredMessage?.channelTitle),
+    group: cleanText(structuredMessage?.group),
     messageLink: cleanText(structuredMessage?.link),
     sellerType,
     sellerClass,
@@ -4770,6 +5135,11 @@ function collectReaderDebugValues({
     sourceStatus: cleanText(generatorInput?.sourceStatus || ''),
     shortlinkResolved: generatorInput?.shortlinkResolved === true,
     shortlinkFallback: generatorInput?.shortlinkFallback === true,
+    mainPostBlocked: generatorInput?.mainPostBlocked === true,
+    mainPostBlockReason: cleanText(generatorInput?.mainPostBlockReason),
+    mainPostTitleSource: cleanText(generatorInput?.mainPostTitleSource || generatorInput?.titleSource || ''),
+    mainPostImageSource: cleanText(generatorInput?.mainPostImageSource || generatorInput?.imageSource || ''),
+    affiliateLinkSource: cleanText(generatorInput?.affiliateLinkSource || ''),
     imageSource: cleanText(generatorInput?.imageSource || ''),
     productVerificationWarning: cleanText(generatorInput?.productVerificationWarning),
     decision,
@@ -4832,17 +5202,22 @@ function collectReaderDebugValues({
 
   const comparisonUsage = resolveReaderComparisonUsage(debugValues);
   const aiUsageMode = resolveReaderAiUsageMode(debugValues);
+  const debugSourceGroupMeta = resolveTelegramDebugSourceMeta(debugValues);
   debugValues.comparisonUsageLabel = comparisonUsage.usedLabel;
   debugValues.comparisonNotUsedLabel = comparisonUsage.notUsedLabel;
   debugValues.comparisonSourceLabel = comparisonUsage.comparisonSourceLabel;
   debugValues.aiUsageMode = aiUsageMode;
+  debugValues.sourceGroupRef = debugSourceGroupMeta.sourceGroupRef;
+  debugValues.sourceGroupField = debugSourceGroupMeta.sourceField;
   console.info('[DEBUG_SOURCE_VALUE]', {
     sessionName,
     sourceId: source?.id || null,
     messageId: structuredMessage.messageId,
     channelRef: cleanText(debugValues.channelRef) || null,
     channelTitle: cleanText(debugValues.channelTitle) || null,
-    resolvedSourceValue: resolveTelegramDebugSourceValue(debugValues)
+    group: cleanText(debugValues.group) || null,
+    resolvedSourceValue: debugSourceGroupMeta.sourceGroupRef,
+    resolvedSourceField: debugSourceGroupMeta.sourceField
   });
 
   console.info('[MARKET_COMPARE_STATUS]', {
@@ -5309,6 +5684,13 @@ function buildTelegramDiagnosticDebugValues({
   blockedCode = '',
   sourceHost = '',
   sourceLabel = '',
+  channelRef = '',
+  channelTitle = '',
+  group = '',
+  mainPostBlocked = false,
+  titleSource = '',
+  imageSource = '',
+  affiliateLinkSource = '',
   warningLines = [],
   liveAllowed = false,
   testGroupPosted = true,
@@ -5327,12 +5709,18 @@ function buildTelegramDiagnosticDebugValues({
   couponDetected = null,
   subscribeDetected = null
 } = {}) {
-  return {
+  const debugValues = {
     decisionDisplay: 'REVIEW',
     wouldPostNormally: liveAllowed === true,
     testGroupPosted: testGroupPosted !== false,
-    channelRef: cleanText(sourceLabel).startsWith('@') ? cleanText(sourceLabel) : '',
-    channelTitle: cleanText(sourceLabel) || cleanText(sourceHost) || 'Unbekannt',
+    channelRef: cleanText(channelRef),
+    channelTitle: cleanText(channelTitle),
+    group: cleanText(group),
+    mainPostBlocked: mainPostBlocked === true,
+    mainPostBlockReason: cleanText(reason),
+    mainPostTitleSource: cleanText(titleSource),
+    mainPostImageSource: cleanText(imageSource),
+    affiliateLinkSource: cleanText(affiliateLinkSource),
     reason: buildTelegramDiagnosticReason({
       reason,
       blockedCode,
@@ -5359,21 +5747,77 @@ function buildTelegramDiagnosticDebugValues({
     couponDetected,
     subscribeDetected
   };
+
+  const sourceGroupMeta = resolveTelegramDebugSourceMeta(debugValues);
+  debugValues.sourceGroupRef = sourceGroupMeta.sourceGroupRef;
+  debugValues.sourceGroupField = sourceGroupMeta.sourceField;
+
+  return debugValues;
 }
 
-function extractTelegramChannelRefFromMessageLink(messageLink = '') {
-  const normalizedLink = cleanText(messageLink);
-  const match = normalizedLink.match(/^https?:\/\/t\.me\/([^/]+)\/\d+\/?$/i);
-  return match?.[1] ? `@${match[1]}` : '';
+function looksLikeTelegramDebugSourceHost(value = '') {
+  const normalizedValue = cleanText(value);
+  if (!normalizedValue || normalizedValue.startsWith('@') || /\s/.test(normalizedValue)) {
+    return false;
+  }
+
+  if (normalizeUrlHost(normalizedValue)) {
+    return true;
+  }
+
+  return /^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[/?#:].*)?$/i.test(normalizedValue);
+}
+
+function resolveTelegramDebugSourceMeta(debugValues = {}, options = {}) {
+  const shouldLog = options.log !== false;
+  const candidates = [
+    { field: 'channelRef', value: cleanText(debugValues.channelRef) },
+    { field: 'channelTitle', value: cleanText(debugValues.channelTitle) },
+    { field: 'group', value: cleanText(debugValues.group) }
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.value) {
+      continue;
+    }
+
+    if (looksLikeTelegramDebugSourceHost(candidate.value)) {
+      if (shouldLog) {
+        console.info('[DEBUG_SOURCE_HOST_REJECTED]', {
+          field: candidate.field,
+          rejectedValue: candidate.value,
+          normalizedHost: normalizeUrlHost(candidate.value) || candidate.value.toLowerCase()
+        });
+      }
+      continue;
+    }
+
+    const resolved = {
+      sourceGroupRef: candidate.value,
+      sourceField: candidate.field
+    };
+
+    if (shouldLog) {
+      console.info('[DEBUG_SOURCE_GROUP_RESOLVED]', resolved);
+    }
+
+    return resolved;
+  }
+
+  const fallback = {
+    sourceGroupRef: 'Unbekannt',
+    sourceField: 'fallback'
+  };
+
+  if (shouldLog) {
+    console.info('[DEBUG_SOURCE_GROUP_RESOLVED]', fallback);
+  }
+
+  return fallback;
 }
 
 function resolveTelegramDebugSourceValue(debugValues = {}) {
-  return (
-    cleanText(debugValues.channelRef) ||
-    extractTelegramChannelRefFromMessageLink(debugValues.messageLink) ||
-    cleanText(debugValues.channelTitle) ||
-    'Unbekannt'
-  );
+  return resolveTelegramDebugSourceMeta(debugValues, { log: false }).sourceGroupRef;
 }
 
 function translateTelegramDebugDecisionToGerman(decision = '') {
@@ -5459,7 +5903,8 @@ function buildTelegramDealDebugInfoExtended(debugValues = {}) {
   const aiStatus = resolveTelegramDebugAiStatus(debugValues);
   const keepaStatus = resolveTelegramDebugKeepaStatus(debugValues);
   const sellerLabel = resolveTelegramDebugSellerLabel(debugValues);
-  const sourceGroupValue = resolveTelegramDebugSourceValue(debugValues);
+  const sourceGroupValue = cleanText(debugValues.sourceGroupRef) || resolveTelegramDebugSourceValue(debugValues);
+  const sourceGroupField = cleanText(debugValues.sourceGroupField) || 'fallback';
   const decisionGermanLabel = translateTelegramDebugDecisionToGerman(debugValues.decisionDisplay || debugValues.decision);
   const priceLabel =
     debugValues.invalidPrice === true ? 'n/a' : formatCompactPostPrice(debugValues.detectedPrice) || 'n/a';
@@ -5468,6 +5913,13 @@ function buildTelegramDealDebugInfoExtended(debugValues = {}) {
   const matchScoreLabel =
     Number.isFinite(Number(debugValues.sourceMatchScore)) ? `${Math.round(Number(debugValues.sourceMatchScore))}/100` : 'n/a';
   const matchReasonLabel = cleanText(debugValues.sourceMatchReason) || 'n/a';
+  const mainPostBlocked = debugValues.mainPostBlocked === true;
+  const mainPostBlockReasonLabel = shortenDebugReason(
+    debugValues.mainPostBlockReason || 'Titel/Bild stammt aus ungesicherter Quelle.',
+    'Titel/Bild stammt aus ungesicherter Quelle.'
+  );
+  const mainPostImageSourceLabel = cleanText(debugValues.mainPostImageSource || debugValues.imageSource) || 'unknown';
+  const mainPostTitleSourceLabel = cleanText(debugValues.mainPostTitleSource) || 'unknown';
   const lines = [
     '\u26A0\uFE0F <b>TESTPOST</b>',
     '',
@@ -5506,6 +5958,17 @@ function buildTelegramDealDebugInfoExtended(debugValues = {}) {
     '\u26A0\uFE0F Fake-Schwelle \u2192 Entscheidungslogik'
   ];
 
+  if (mainPostBlocked) {
+    lines.splice(
+      13,
+      0,
+      `\u{1F6AB} Hauptpost blockiert: ${escapeTelegramHtml('JA')}`,
+      `\u{1F4CC} Grund: ${escapeTelegramHtml(mainPostBlockReasonLabel)}`,
+      `\u{1F5BC} Bildquelle: ${escapeTelegramHtml(mainPostImageSourceLabel)}`,
+      `\u{1F4DD} Titelquelle: ${escapeTelegramHtml(mainPostTitleSourceLabel)}`
+    );
+  }
+
   console.info('[DEBUG_POST_NORMALIZED]', {
     decisionDisplay: debugValues.decisionDisplay || 'REVIEW',
     marketStatus,
@@ -5517,7 +5980,15 @@ function buildTelegramDealDebugInfoExtended(debugValues = {}) {
   console.info('[DEBUG_SOURCE_ADDED]', {
     sourceGroupValue,
     channelRef: cleanText(debugValues.channelRef) || null,
-    channelTitle: cleanText(debugValues.channelTitle) || null
+    channelTitle: cleanText(debugValues.channelTitle) || null,
+    group: cleanText(debugValues.group) || null
+  });
+  console.info('[DEBUG_SOURCE_GROUP_RENDERED]', {
+    sourceGroupRef: sourceGroupValue,
+    sourceField: sourceGroupField,
+    channelRef: cleanText(debugValues.channelRef) || null,
+    channelTitle: cleanText(debugValues.channelTitle) || null,
+    group: cleanText(debugValues.group) || null
   });
   console.info('[DEBUG_MATCH_INFO_ADDED]', {
     sourceProtected: debugValues.sourceProtected === true,
@@ -5615,6 +6086,235 @@ function buildReaderLinkRecord({ dealType = 'AMAZON', amazonLink = '', fallbackL
     normalizedUrl: resolvedLink,
     originalUrl: resolvedLink,
     asin: syntheticAsin
+  };
+}
+
+function resolveReaderMainPostTitleSource({ dealType = 'AMAZON', titlePayload = {}, scrapedDeal = {} } = {}) {
+  const normalizedDealType = cleanText(dealType).toUpperCase() || 'AMAZON';
+  const normalizedTitle = cleanText(titlePayload?.title);
+  const rawTitleSource = cleanText(titlePayload?.rawTitleSource).toLowerCase();
+  const titleDataSource = cleanText(scrapedDeal?.titleDataSource).toLowerCase();
+  const scrapedDataSource = cleanText(scrapedDeal?.dataSource).toLowerCase();
+  const detectionSource = cleanText(scrapedDeal?.sellerDetails?.detectionSource).toLowerCase();
+
+  if (!normalizedTitle || rawTitleSource === 'amazonmissingtitle' || titleDataSource === 'missing') {
+    return 'unknown';
+  }
+  if (titleDataSource === 'telegram' || detectionSource === 'protected_source_no_bypass') {
+    return 'telegram';
+  }
+  if (['preview', 'source', 'originaltext', 'fallback_source'].includes(titleDataSource)) {
+    return titleDataSource;
+  }
+  if (titleDataSource === 'paapi' || rawTitleSource === 'paapi' || scrapedDataSource === 'paapi') {
+    return 'paapi';
+  }
+  if (titleDataSource === 'keepa_verified' || rawTitleSource === 'keepa_verified') {
+    return 'keepa_verified';
+  }
+  if (normalizedDealType === 'AMAZON' && (titleDataSource === 'amazon' || ['amazonproducttitle', 'amazonscrapedtitle'].includes(rawTitleSource))) {
+    return 'amazon';
+  }
+  return titleDataSource || cleanText(titlePayload?.titleSource).toLowerCase() || 'unknown';
+}
+
+function resolveReaderMainPostImageSource({ dealType = 'AMAZON', imagePayload = {}, scrapedDeal = {} } = {}) {
+  const normalizedDealType = cleanText(dealType).toUpperCase() || 'AMAZON';
+  const rawImageSource = cleanText(imagePayload?.imageSource).toLowerCase();
+  const imageDataSource = cleanText(scrapedDeal?.imageDataSource).toLowerCase();
+  const hasFinalImage = Boolean(cleanText(imagePayload?.generatedImagePath || imagePayload?.uploadedImagePath));
+
+  if (!hasFinalImage || imageDataSource === 'missing') {
+    return 'unknown';
+  }
+  if (rawImageSource === 'manual_upload' || imageDataSource === 'manual_upload') {
+    return 'manual_upload';
+  }
+  if (rawImageSource === 'paapi' || imageDataSource === 'paapi') {
+    return 'paapi';
+  }
+  if (rawImageSource === 'keepa_verified' || imageDataSource === 'keepa_verified') {
+    return 'keepa_verified';
+  }
+  if (['telegram', 'source', 'originalimage', 'preview', 'fallback_source', 'og', 'scraped'].includes(imageDataSource)) {
+    return imageDataSource;
+  }
+  if (normalizedDealType === 'AMAZON' && (rawImageSource === 'scrape' || imageDataSource === 'amazon')) {
+    return 'amazon';
+  }
+  if (rawImageSource === 'telegram') {
+    return 'telegram';
+  }
+  if (rawImageSource === 'og') {
+    return 'originalimage';
+  }
+  if (rawImageSource === 'fallback') {
+    return 'fallback_source';
+  }
+  if (rawImageSource === 'scraped' && normalizedDealType !== 'AMAZON') {
+    return 'scraped';
+  }
+  return imageDataSource || rawImageSource || 'unknown';
+}
+
+function resolveReaderAffiliateLinkSource({
+  affiliateUrl = '',
+  asin = '',
+  inputSource = '',
+  manualOriginalUrl = '',
+  preserveInputLink = false,
+  productVerified = false
+} = {}) {
+  const normalizedAffiliateUrl = cleanText(affiliateUrl);
+  const normalizedAsin = cleanText(asin).toUpperCase();
+  const normalizedInputSource = cleanText(inputSource).toLowerCase();
+
+  if (isOwnAmazonAffiliateLink(normalizedAffiliateUrl, normalizedAsin)) {
+    return 'own_affiliate';
+  }
+
+  if (
+    normalizedInputSource === 'manual_generator' &&
+    preserveInputLink === true &&
+    productVerified === true &&
+    cleanText(manualOriginalUrl) &&
+    normalizedAffiliateUrl === cleanText(manualOriginalUrl)
+  ) {
+    return 'manual_original_link';
+  }
+
+  if (!normalizedAffiliateUrl) {
+    return 'missing';
+  }
+
+  return 'source';
+}
+
+function validateMainPostSources(postData = {}) {
+  const titleSource = cleanText(postData?.mainPostTitleSource || postData?.titleSource).toLowerCase() || 'unknown';
+  const imageSource = cleanText(postData?.mainPostImageSource || postData?.imageSource).toLowerCase() || 'unknown';
+  const affiliateLinkSource = cleanText(postData?.affiliateLinkSource || postData?.linkSource).toLowerCase() || 'unknown';
+  const priceSource = cleanText(postData?.priceSource).toLowerCase() || 'unknown';
+  const title = cleanText(postData?.title);
+  const hasImage = Boolean(cleanText(postData?.generatedImagePath || postData?.uploadedImagePath));
+  const issues = [];
+  const blockedFields = [];
+  let manualLinkAllowed = false;
+
+  if (
+    affiliateLinkSource === 'manual_original_link' &&
+    cleanText(postData?.inputSource).toLowerCase() === 'manual_generator' &&
+    postData?.productVerified === true
+  ) {
+    manualLinkAllowed = true;
+  }
+
+  console.info('[MAIN_POST_SOURCE_GUARD_START]', {
+    asin: cleanText(postData?.asin).toUpperCase() || '',
+    inputSource: cleanText(postData?.inputSource) || 'unknown',
+    titleSource,
+    imageSource,
+    affiliateLinkSource,
+    priceSource
+  });
+
+  if (!ALLOWED_MAIN_POST_TITLE_SOURCES.has(titleSource) || !title) {
+    blockedFields.push('title');
+    issues.push(
+      !title
+        ? 'Kein verifizierter Amazon-Titel.'
+        : titleSource === 'telegram' || BLOCKED_MAIN_POST_SOURCE_VALUES.has(titleSource)
+          ? 'Titel stammt aus ungesicherter Quelle.'
+          : 'Kein verifizierter Amazon-Titel.'
+    );
+    console.warn('[MAIN_POST_TITLE_SOURCE_BLOCKED]', {
+      asin: cleanText(postData?.asin).toUpperCase() || '',
+      titleSource,
+      rawTitleSource: cleanText(postData?.rawTitleSource) || null,
+      title: title ? title.slice(0, 180) : null
+    });
+  }
+
+  if (!ALLOWED_MAIN_POST_IMAGE_SOURCES.has(imageSource) || !hasImage) {
+    blockedFields.push('image');
+    issues.push(
+      !hasImage
+        ? 'Kein verifiziertes Amazon-Bild.'
+        : imageSource === 'telegram' || BLOCKED_MAIN_POST_SOURCE_VALUES.has(imageSource)
+          ? 'Bild stammt aus ungesicherter Quelle.'
+          : 'Kein verifiziertes Amazon-Bild.'
+    );
+    console.warn('[MAIN_POST_IMAGE_SOURCE_BLOCKED]', {
+      asin: cleanText(postData?.asin).toUpperCase() || '',
+      imageSource,
+      rawImageSource: cleanText(postData?.imageSource) || null,
+      hasImage
+    });
+  }
+
+  if (!(ALLOWED_MAIN_POST_LINK_SOURCES.has(affiliateLinkSource) || manualLinkAllowed === true)) {
+    blockedFields.push('link');
+    issues.push('Link stammt aus ungesicherter Quelle.');
+  }
+
+  if (!priceSource || ['unknown', 'missing', 'fallback_source'].includes(priceSource)) {
+    blockedFields.push('price');
+    issues.push('Preisquelle ist nicht nachvollziehbar.');
+  }
+
+  if (
+    ['title', 'image', 'link'].some((field) => blockedFields.includes(field)) &&
+    [titleSource, imageSource, affiliateLinkSource].some((value) => BLOCKED_MAIN_POST_SOURCE_VALUES.has(value) || value === 'telegram' || value === 'source')
+  ) {
+    console.warn('[MAIN_POST_FOREIGN_DATA_BLOCKED]', {
+      asin: cleanText(postData?.asin).toUpperCase() || '',
+      blockedFields,
+      titleSource,
+      imageSource,
+      affiliateLinkSource
+    });
+  }
+
+  if (issues.length) {
+    const uniqueIssues = Array.from(new Set(issues));
+    const reason = uniqueIssues.join(' ');
+    console.error('[MAIN_POST_BLOCKED_UNVERIFIED_SOURCE]', {
+      asin: cleanText(postData?.asin).toUpperCase() || '',
+      blockedFields,
+      titleSource,
+      imageSource,
+      affiliateLinkSource,
+      priceSource,
+      reason
+    });
+    return {
+      valid: false,
+      titleSource,
+      imageSource,
+      affiliateLinkSource,
+      priceSource,
+      blockedFields,
+      issues: uniqueIssues,
+      reason
+    };
+  }
+
+  console.info('[MAIN_POST_SOURCE_GUARD_PASSED]', {
+    asin: cleanText(postData?.asin).toUpperCase() || '',
+    titleSource,
+    imageSource,
+    affiliateLinkSource,
+    priceSource
+  });
+  return {
+    valid: true,
+    titleSource,
+    imageSource,
+    affiliateLinkSource,
+    priceSource,
+    blockedFields: [],
+    issues: [],
+    reason: ''
   };
 }
 
@@ -6019,6 +6719,25 @@ async function buildTelegramReaderGeneratorInput({
     title: titlePayload.title || template.productTitle || 'Deal',
     currentPrice: invalidPriceState.invalid ? '' : rawCurrentPrice
   });
+  const mainPostTitleSource = resolveReaderMainPostTitleSource({
+    dealType,
+    titlePayload,
+    scrapedDeal: scrapedDealWithFallbacks
+  });
+  const mainPostImageSource = resolveReaderMainPostImageSource({
+    dealType,
+    imagePayload: {
+      ...imagePayload,
+      generatedImagePath: imagePayload.generatedImagePath,
+      uploadedImagePath: imagePayload.uploadedImagePath
+    },
+    scrapedDeal: scrapedDealWithFallbacks
+  });
+  const affiliateLinkSource = resolveReaderAffiliateLinkSource({
+    affiliateUrl,
+    asin: normalizedAsin || scrapedDeal?.asin,
+    inputSource: 'telegram_reader'
+  });
 
   if (imagePayload.generatedImagePath) {
     console.info('[GENERATOR_SCREENSHOT_REUSED]', {
@@ -6052,7 +6771,10 @@ async function buildTelegramReaderGeneratorInput({
   return {
     title: titlePayload.title || template.productTitle || 'Deal',
     titleSource: titlePayload.titleSource || 'fallback',
+    rawTitleSource: titlePayload.rawTitleSource || 'unknown',
+    mainPostTitleSource,
     link: cleanText(affiliateUrl),
+    affiliateLinkSource,
     normalizedUrl: cleanText(normalizedUrl),
     asin: cleanText(normalizedAsin || scrapedDeal?.asin).toUpperCase(),
     sellerType: sellerIdentity.sellerType || 'UNKNOWN',
@@ -6107,6 +6829,7 @@ async function buildTelegramReaderGeneratorInput({
     generatedImagePath: imagePayload.generatedImagePath,
     uploadedImagePath: imagePayload.uploadedImagePath,
     imageSource: imagePayload.imageSource || 'unknown',
+    mainPostImageSource,
     imageBlockReason: cleanText(imagePayload.imageBlockReason),
     uploadedImageFile: null,
     telegramImageSource: imagePayload.telegramImageSource || 'none',
@@ -6116,6 +6839,7 @@ async function buildTelegramReaderGeneratorInput({
     enableWhatsapp: false,
     enableFacebook: false,
     queueSourceType: 'generator_direct',
+    inputSource: 'telegram_reader',
     originOverride: 'automatic',
     contextSource: 'telegram_reader_polling',
     testMode: false
@@ -6368,10 +7092,15 @@ async function handleBlockedReaderDiagnostic({
   trigger = 'reader',
   blockedCode = '',
   blockedReason = '',
-  sourceHost = ''
+  sourceHost = '',
+  forceDiagnosticPost = false,
+  mainPostBlocked = false,
+  titleSource = '',
+  imageSource = '',
+  affiliateLinkSource = ''
 } = {}) {
   const reason = cleanText(blockedReason) || 'Produkt nicht verifiziert.';
-  if (!isReaderTestGroupAllMode(readerConfig)) {
+  if (!isReaderTestGroupAllMode(readerConfig) || forceDiagnosticPost === true) {
     console.error('[RAW_SOURCE_POST_BLOCKED]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -6381,7 +7110,10 @@ async function handleBlockedReaderDiagnostic({
       sourceHost: sourceHost || 'unknown'
     });
   }
-  if (blockedCode === 'UNVERIFIED_PRODUCT_BLOCKED' && !isReaderTestGroupAllMode(readerConfig)) {
+  if (
+    ['UNVERIFIED_PRODUCT_BLOCKED', 'MAIN_POST_BLOCKED_UNVERIFIED_SOURCE'].includes(blockedCode) &&
+    (!isReaderTestGroupAllMode(readerConfig) || forceDiagnosticPost === true)
+  ) {
     console.error('[UNVERIFIED_PRODUCT_BLOCKED]', {
       sessionName,
       sourceId: source?.id ?? null,
@@ -6391,13 +7123,20 @@ async function handleBlockedReaderDiagnostic({
     });
   }
 
-  if (readerConfig.readerDebugMode === true || readerConfig.readerTestMode === true) {
+  if (readerConfig.readerDebugMode === true || readerConfig.readerTestMode === true || forceDiagnosticPost === true) {
     const diagnosticText = buildReaderDiagnosticPostTextV2({
       reason,
       sourceHost,
       blockedCode,
       liveAllowed: false,
-      testGroupPosted: true
+      testGroupPosted: true,
+      channelRef: cleanText(source?.channelRef) || cleanText(structuredMessage?.channelRef),
+      channelTitle: cleanText(source?.channelTitle) || cleanText(structuredMessage?.channelTitle),
+      group: cleanText(structuredMessage?.group),
+      mainPostBlocked,
+      titleSource,
+      imageSource,
+      affiliateLinkSource
     });
     const diagnosticResult = await enqueueTelegramReaderDiagnosticPost({
       source,
@@ -6638,6 +7377,12 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
   const testGroupModeActive = isReaderTestGroupModeActive(readerConfig);
   const relaxedTestMode = isReaderTestGroupAllMode(readerConfig);
   const trigger = cleanText(options.trigger) || 'reader';
+  const protectedDealSource = resolveProtectedDealSourceContext({
+    source,
+    structuredMessage,
+    originalLink,
+    originalText: cleanText(structuredMessage?.text)
+  });
   const shortlinkCandidate = resolveReaderShortlinkCandidate({
     explicitAmazonLink: amazonLink,
     structuredMessage,
@@ -6662,52 +7407,64 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       sourceHost: normalizeUrlHost(shortlinkCandidate) || 'unknown'
     });
 
-    const shortlinkResolution = await resolveReaderShortlink(shortlinkCandidate);
-    if (shortlinkResolution.resolved === true) {
-      shortlinkState.resolved = true;
-      shortlinkState.finalUrl = cleanText(shortlinkResolution.finalUrl);
-      shortlinkState.asin = cleanText(shortlinkResolution.asin).toUpperCase();
-      amazonLink = shortlinkState.finalUrl;
-      detectedAsin = shortlinkState.asin || detectedAsin;
-      originalLink = shortlinkState.finalUrl || originalLink;
-
-      console.info('[SHORTLINK_RESOLVED]', {
-        sessionName,
-        sourceId: source?.id || null,
-        messageId: structuredMessage.messageId,
-        shortlinkUrl: shortlinkCandidate,
-        finalUrl: shortlinkState.finalUrl,
-        asin: shortlinkState.asin,
-        method: shortlinkResolution.method || 'follow'
-      });
-    } else {
-      const shortlinkFailureReason =
-        cleanText(shortlinkResolution.errorMessage) ||
-        'Shortlink konnte nicht zu einer gueltigen Amazon-Produkt-URL aufgeloest werden.';
-      shortlinkState.failed = true;
-      shortlinkState.errorMessage = shortlinkFailureReason;
-      shortlinkState.finalUrl = cleanText(shortlinkResolution.finalUrl);
-      shortlinkState.asin = cleanText(shortlinkResolution.asin).toUpperCase();
-      originalLink = shortlinkState.finalUrl || shortlinkCandidate || originalLink;
-      amazonLink = shortlinkState.asin ? `https://www.amazon.de/dp/${shortlinkState.asin}` : '';
-      detectedAsin = shortlinkState.asin || detectedAsin;
-
-      console.warn('[SHORTLINK_RESOLVE_FAILED]', {
-        sessionName,
-        sourceId: source?.id || null,
-        messageId: structuredMessage.messageId,
-        shortlinkUrl: shortlinkCandidate,
-        finalUrl: cleanText(shortlinkResolution.finalUrl) || null,
-        asin: cleanText(shortlinkResolution.asin).toUpperCase() || null,
-        reason: shortlinkFailureReason
-      });
+    if (protectedDealSource.matched === true) {
       console.info('[PROTECTED_SOURCE_NO_BYPASS]', {
         sessionName,
         sourceId: source?.id || null,
         messageId: structuredMessage.messageId,
+        sourceLabel: protectedDealSource.sourceLabel || null,
+        sourceField: protectedDealSource.matchedField || null,
         sourceHost: normalizeUrlHost(shortlinkCandidate) || 'unknown',
-        reason: shortlinkFailureReason
+        reason: 'Shortlink-Aufloesung fuer geschuetzte Quelle uebersprungen.'
       });
+    } else {
+      const shortlinkResolution = await resolveReaderShortlink(shortlinkCandidate);
+      if (shortlinkResolution.resolved === true) {
+        shortlinkState.resolved = true;
+        shortlinkState.finalUrl = cleanText(shortlinkResolution.finalUrl);
+        shortlinkState.asin = cleanText(shortlinkResolution.asin).toUpperCase();
+        amazonLink = shortlinkState.finalUrl;
+        detectedAsin = shortlinkState.asin || detectedAsin;
+        originalLink = shortlinkState.finalUrl || originalLink;
+
+        console.info('[SHORTLINK_RESOLVED]', {
+          sessionName,
+          sourceId: source?.id || null,
+          messageId: structuredMessage.messageId,
+          shortlinkUrl: shortlinkCandidate,
+          finalUrl: shortlinkState.finalUrl,
+          asin: shortlinkState.asin,
+          method: shortlinkResolution.method || 'follow'
+        });
+      } else {
+        const shortlinkFailureReason =
+          cleanText(shortlinkResolution.errorMessage) ||
+          'Shortlink konnte nicht zu einer gueltigen Amazon-Produkt-URL aufgeloest werden.';
+        shortlinkState.failed = true;
+        shortlinkState.errorMessage = shortlinkFailureReason;
+        shortlinkState.finalUrl = cleanText(shortlinkResolution.finalUrl);
+        shortlinkState.asin = cleanText(shortlinkResolution.asin).toUpperCase();
+        originalLink = shortlinkState.finalUrl || shortlinkCandidate || originalLink;
+        amazonLink = shortlinkState.asin ? `https://www.amazon.de/dp/${shortlinkState.asin}` : '';
+        detectedAsin = shortlinkState.asin || detectedAsin;
+
+        console.warn('[SHORTLINK_RESOLVE_FAILED]', {
+          sessionName,
+          sourceId: source?.id || null,
+          messageId: structuredMessage.messageId,
+          shortlinkUrl: shortlinkCandidate,
+          finalUrl: cleanText(shortlinkResolution.finalUrl) || null,
+          asin: cleanText(shortlinkResolution.asin).toUpperCase() || null,
+          reason: shortlinkFailureReason
+        });
+        console.info('[PROTECTED_SOURCE_NO_BYPASS]', {
+          sessionName,
+          sourceId: source?.id || null,
+          messageId: structuredMessage.messageId,
+          sourceHost: normalizeUrlHost(shortlinkCandidate) || 'unknown',
+          reason: shortlinkFailureReason
+        });
+      }
     }
   }
 
@@ -6727,12 +7484,37 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
     !/amazon\./i.test(normalizeUrlHost(originalLink)) &&
     /^(?:amzn\.to|s\.[a-z0-9.-]+|[a-z0-9-]+\.[a-z0-9-]+\.[a-z0-9.-]+)$/i.test(sourceHost || '');
   const protectedSourceDetected =
+    protectedDealSource.matched === true ||
     sourceProtectionMatches.length > 0 ||
     shortlinkState.failed === true ||
     foreignShortlinkDetected === true ||
     isProtectedSourceHost(originalLink) ||
     isProtectedSourceHost(amazonLink);
   const sourceStatus = protectedSourceDetected ? 'PROTECTED_SOURCE' : 'NORMAL_SOURCE';
+
+  if (protectedDealSource.matched === true) {
+    console.warn('[PROTECTED_DEAL_SOURCE_DETECTED]', {
+      sessionName,
+      sourceId: source?.id || null,
+      messageId: structuredMessage.messageId,
+      sourceKey: protectedDealSource.sourceKey,
+      sourceLabel: protectedDealSource.sourceLabel,
+      matchedField: protectedDealSource.matchedField,
+      matchedValue: protectedDealSource.matchedValue || null,
+      sourceHost: protectedDealSource.originalLinkHost || null
+    });
+    if (['channelRef', 'channelTitle', 'group'].includes(protectedDealSource.matchedField)) {
+      console.info('[PROTECTED_SOURCE_CHANNEL_MATCHED]', {
+        sessionName,
+        sourceId: source?.id || null,
+        messageId: structuredMessage.messageId,
+        sourceKey: protectedDealSource.sourceKey,
+        sourceLabel: protectedDealSource.sourceLabel,
+        matchedField: protectedDealSource.matchedField,
+        matchedValue: protectedDealSource.matchedValue || null
+      });
+    }
+  }
 
   console.info('[READER_INPUT_RECEIVED]', {
     sessionName,
@@ -6883,7 +7665,67 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       });
     }
     let scrapedDeal;
-    if (dealType === 'AMAZON') {
+    if (protectedDealSource.matched === true) {
+      const protectedTitleSelection = selectSourceTitleCandidate({
+        previewTitle: sanitizeProtectedSourceValue(structuredMessage?.previewTitle, 'previewTitle'),
+        scrapedTitle: '',
+        originalText: cleanText(structuredMessage?.text),
+        fallback: sanitizeProtectedSourceValue(extractTelegramTitle(structuredMessage?.text, structuredMessage?.group), 'telegramTitle')
+      });
+      console.info('[PROTECTED_SOURCE_NO_BYPASS]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        sourceLabel: protectedDealSource.sourceLabel,
+        sourceField: protectedDealSource.matchedField || null,
+        originalLink: originalLink || null,
+        amazonLink: amazonLink || null,
+        reason: 'Geschuetzte Quelle wird nur ueber sichtbare Telegram-Post-Daten verarbeitet.'
+      });
+      scrapedDeal = {
+        success: false,
+        blockedByProtection: true,
+        protectedMatches: [
+          {
+            source: 'protected_deal_source',
+            key: protectedDealSource.sourceKey || 'protected_source',
+            value: protectedDealSource.sourceLabel || 'Geschuetzte Quelle'
+          }
+        ],
+        title: cleanText(protectedTitleSelection.cleanedValue || ''),
+        productTitle: cleanText(protectedTitleSelection.cleanedValue || ''),
+        titleDataSource: 'telegram',
+        productDescription: cleanText(structuredMessage?.previewDescription) || '',
+        price:
+          pricing?.currentPrice !== null && pricing?.currentPrice !== undefined ? formatPrice(pricing.currentPrice) : '',
+        oldPrice:
+          pricing?.oldPrice !== null && pricing?.oldPrice !== undefined ? formatPrice(pricing.oldPrice) : '',
+        imageUrl: '',
+        imageDataSource: 'missing',
+        previewImage: '',
+        ogImage: '',
+        asin: detectedAsin || '',
+        finalUrl: '',
+        resolvedUrl: '',
+        originalUrl: originalLink || amazonLink || '',
+        normalizedUrl: '',
+        sellerType: 'UNKNOWN',
+        sellerClass: 'UNKNOWN',
+        soldByAmazon: null,
+        shippedByAmazon: null,
+        sellerDetails: {
+          detectionSource: 'protected_source_no_bypass',
+          detectionSources: ['protected_source_no_bypass'],
+          merchantText: '',
+          matchedPatterns: [],
+          dealType: dealType === 'AMAZON' ? 'AMAZON' : 'NON_AMAZON',
+          isAmazonDeal: dealType === 'AMAZON'
+        },
+        imageDebug: {
+          paapiStatus: 'protected_source_no_bypass'
+        }
+      };
+    } else if (dealType === 'AMAZON') {
       try {
         scrapedDeal = await scrapeAmazonProduct(amazonLink);
         const paapiStatus = cleanText(scrapedDeal?.imageDebug?.paapiStatus || '');
@@ -6924,7 +7766,9 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
           success: false,
           title: '',
           productTitle: '',
+          titleDataSource: 'missing',
           imageUrl: '',
+          imageDataSource: 'missing',
           price:
             pricing?.currentPrice !== null && pricing?.currentPrice !== undefined ? String(pricing.currentPrice) : '',
           oldPrice:
@@ -7082,7 +7926,10 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       !cleanText(linkRecord.affiliateUrl) ||
       !cleanText(linkRecord.asin);
     const requiresVerifiedAmazonFinalPost =
-      dealType === 'AMAZON' || Boolean(cleanText(amazonLink)) || foreignShortlinkDetected === true;
+      dealType === 'AMAZON' ||
+      Boolean(cleanText(amazonLink)) ||
+      foreignShortlinkDetected === true ||
+      protectedDealSource.matched === true;
 
     if (needsAmazonRecovery) {
       if (sourceMeta.protectedSource === true && !relaxedTestMode) {
@@ -7198,12 +8045,14 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
             success: true,
             asin: '',
             title: fallbackTitle || 'Deal',
+            titleDataSource: 'source',
             productDescription: cleanText(scrapedDeal?.productDescription) || cleanText(structuredMessage.previewDescription) || '',
             price: fallbackPrice || '',
             basePrice: '',
             finalPrice: '',
             finalPriceCalculated: false,
             imageUrl: fallbackImage || '',
+            imageDataSource: fallbackImage ? 'source' : 'missing',
             previewImage: cleanText(scrapedDeal?.previewImage) || cleanText(structuredMessage.previewImage) || fallbackImage || '',
             ogImage: cleanText(scrapedDeal?.ogImage) || fallbackImage || '',
             finalUrl: resolvedAmazonUrl || originalLink,
@@ -7294,6 +8143,29 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
         dealType,
         isAmazonDeal: dealType === 'AMAZON'
       },
+      titleDataSource:
+        cleanText(scrapedDeal?.titleDataSource) ||
+        (dealType === 'AMAZON'
+          ? cleanText(scrapedDeal?.dataSource).toLowerCase() === 'paapi'
+            ? 'paapi'
+            : cleanText(scrapedDeal?.productTitle || scrapedDeal?.title)
+              ? 'amazon'
+              : 'missing'
+          : cleanText(scrapedDeal?.title)
+            ? 'source'
+            : 'missing'),
+      imageDataSource:
+        cleanText(scrapedDeal?.imageDataSource) ||
+        (dealType === 'AMAZON'
+          ? cleanText(scrapedDeal?.imageUrl)
+            ? cleanText(scrapedDeal?.imageDebug?.selectedSource).toLowerCase() === 'paapi' ||
+              cleanText(scrapedDeal?.dataSource).toLowerCase() === 'paapi'
+              ? 'paapi'
+              : 'amazon'
+            : 'missing'
+          : cleanText(scrapedDeal?.imageUrl || scrapedDeal?.previewImage || scrapedDeal?.ogImage)
+            ? 'source'
+            : 'missing'),
       title:
         dealType === 'AMAZON'
           ? cleanText(scrapedDeal?.productTitle || scrapedDeal?.title)
@@ -7350,10 +8222,12 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       sourceId: source.id,
       messageId: structuredMessage.messageId,
       asin: generatorInput.asin,
-      titleSource: cleanText(generatorInput.titleSource) || 'unknown',
+      titleSource: cleanText(generatorInput.mainPostTitleSource || generatorInput.titleSource) || 'unknown',
+      rawTitleSource: cleanText(generatorInput.rawTitleSource) || 'unknown',
       priceSource: cleanText(generatorInput.priceSource) || 'unknown',
-      imageSource: cleanText(generatorInput.imageSource) || 'unknown',
-      affiliateLinkSource: cleanText(generatorInput.link) ? 'affiliate' : 'missing'
+      imageSource: cleanText(generatorInput.mainPostImageSource || generatorInput.imageSource) || 'unknown',
+      rawImageSource: cleanText(generatorInput.imageSource) || 'unknown',
+      affiliateLinkSource: cleanText(generatorInput.affiliateLinkSource) || 'missing'
     });
     if (sourceMeta.matchedBySource === true) {
       console.info('[GENERATOR_INPUT_FROM_MATCHING_BUILT]', {
@@ -7401,7 +8275,10 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
           sourceHost: sourceHost || 'unknown',
           blockedCode: 'GENERATOR_INPUT_MISSING_FIELDS',
           liveAllowed: false,
-          testGroupPosted: true
+          testGroupPosted: true,
+          channelRef: cleanText(source?.channelRef) || cleanText(structuredMessage?.channelRef),
+          channelTitle: cleanText(source?.channelTitle) || cleanText(structuredMessage?.channelTitle),
+          group: cleanText(structuredMessage?.group)
         });
         const diagnosticResult = await enqueueTelegramReaderDiagnosticPost({
           source,
@@ -7463,6 +8340,32 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
         blockedCode: sourceMeta.blockedCode || 'UNVERIFIED_PRODUCT_BLOCKED',
         blockedReason: productVerification.reason,
         sourceHost: sourceHost || 'unknown'
+      });
+    }
+    const mainPostSourceValidation = validateMainPostSources({
+      ...generatorInput,
+      productVerified: productVerification.verified === true
+    });
+    generatorInput.mainPostBlocked = mainPostSourceValidation.valid !== true;
+    generatorInput.mainPostBlockReason = cleanText(mainPostSourceValidation.reason);
+    generatorInput.mainPostTitleSource = mainPostSourceValidation.titleSource || generatorInput.mainPostTitleSource || 'unknown';
+    generatorInput.mainPostImageSource = mainPostSourceValidation.imageSource || generatorInput.mainPostImageSource || 'unknown';
+    generatorInput.affiliateLinkSource = mainPostSourceValidation.affiliateLinkSource || generatorInput.affiliateLinkSource || 'unknown';
+    if (mainPostSourceValidation.valid !== true) {
+      return await handleBlockedReaderDiagnostic({
+        sessionName,
+        source,
+        structuredMessage,
+        readerConfig,
+        trigger,
+        blockedCode: 'MAIN_POST_BLOCKED_UNVERIFIED_SOURCE',
+        blockedReason: mainPostSourceValidation.reason,
+        sourceHost: sourceHost || 'unknown',
+        forceDiagnosticPost: true,
+        mainPostBlocked: true,
+        titleSource: generatorInput.mainPostTitleSource,
+        imageSource: generatorInput.mainPostImageSource,
+        affiliateLinkSource: generatorInput.affiliateLinkSource
       });
     }
     const debugPostEnabled = readerConfig.readerDebugMode === true || readerConfig.readerTestMode === true;
@@ -10234,6 +11137,9 @@ function buildForceTestgroupDiagnosticText({
   reason = '',
   sourceHost = '',
   sourceLabel = '',
+  channelRef = '',
+  channelTitle = '',
+  group = '',
   warningLines = []
 } = {}) {
   console.info('[READER_DIAGNOSIS_MERGED_INTO_DEBUG]', {
@@ -10252,6 +11158,9 @@ function buildForceTestgroupDiagnosticText({
       reason,
       sourceHost,
       sourceLabel,
+      channelRef,
+      channelTitle,
+      group,
       warningLines,
       liveAllowed: false,
       testGroupPosted: true,
@@ -10278,6 +11187,9 @@ async function sendForceTestgroupDiagnosticPost({
     reason,
     sourceHost,
     sourceLabel,
+    channelRef: cleanText(source?.channelRef) || cleanText(structuredMessage?.channelRef),
+    channelTitle: cleanText(source?.channelTitle) || cleanText(structuredMessage?.channelTitle),
+    group: cleanText(structuredMessage?.group),
     warningLines
   });
 

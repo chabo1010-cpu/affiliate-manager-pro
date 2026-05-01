@@ -809,6 +809,17 @@ export async function processImportedDeal(sourceId, input = {}) {
   const affiliateUrl = linkRecord.valid ? linkRecord.affiliateUrl : '';
   const asin =
     cleanText(input.asin).toUpperCase() || linkRecord.asin || extractAsin(normalizedUrl || resolvedOriginalUrl || originalUrl);
+  if (affiliateUrl) {
+    console.info('[COPYBOT_OWN_AFFILIATE_LINK_ENFORCED]', {
+      sourceId,
+      sourceName: cleanText(source.name),
+      originalUrl: originalUrl || null,
+      resolvedUrl: resolvedOriginalUrl || null,
+      normalizedUrl: normalizedUrl || null,
+      ownAffiliateUrl: affiliateUrl,
+      asin: asin || null
+    });
+  }
   const sellerType = detectSellerType(input);
   const title = cleanText(input.title) || asin || normalizedUrl || originalUrl || 'Unbenannter Deal';
   const currentPrice = parseNumber(input.currentPrice ?? input.price);

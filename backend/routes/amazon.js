@@ -10,7 +10,7 @@ const AMAZON_FETCH_HEADERS = {
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
 };
-const AMAZON_SHORT_HOSTS = new Set(['amzn.to', 'amazon.to']);
+const MANUAL_GENERATOR_SHORT_HOSTS = new Set(['amzn.to', 'amzlink.to', 'amazon.to']);
 const AMAZON_REDIRECT_LIMIT = 6;
 
 function safeUrl(value) {
@@ -23,7 +23,7 @@ function safeUrl(value) {
 
 function isAmazonShortLink(value = '') {
   const hostname = safeUrl(value)?.hostname?.toLowerCase().replace(/^www\./, '') || '';
-  return AMAZON_SHORT_HOSTS.has(hostname);
+  return Boolean(hostname && (MANUAL_GENERATOR_SHORT_HOSTS.has(hostname) || hostname.endsWith('.to')));
 }
 
 function isAmazonHostname(value = '') {
@@ -45,6 +45,55 @@ function buildManualGeneratorInputError(message, code, statusCode = 400) {
   error.code = code;
   error.statusCode = statusCode;
   return error;
+}
+
+function cleanString(value = '') {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function hasVerifiedManualShortlinkProductData(result = {}) {
+  const finalTitle = cleanString(result.title || result.productTitle);
+  const finalPrice = cleanString(result.finalPrice || result.price);
+  const finalImageUrl = cleanString(
+    normalizeDealImageUrl(
+      result.imageUrl ||
+        result.image ||
+        result.productImage ||
+        result.previewImage ||
+        result.thumbnail ||
+        result.product?.imageUrl ||
+        ''
+    )
+  );
+
+  return Boolean(finalTitle && finalPrice && finalImageUrl);
+}
+
+function finalizeManualGeneratorScrapeResponse(inputUrl = '', result = {}) {
+  const manualOriginalUrl = cleanString(inputUrl);
+
+  if (!manualOriginalUrl || !result || typeof result !== 'object' || result.inputMode !== 'shortlink') {
+    return result;
+  }
+
+  const manualProductDataVerified = hasVerifiedManualShortlinkProductData(result);
+  const finalizedResult = {
+    ...result,
+    manualOriginalUrl,
+    manualProductDataVerified,
+    preserveInputLink: manualProductDataVerified
+  };
+
+  if (manualProductDataVerified) {
+    console.info('[MANUAL_OUTPUT_LINK_PRESERVED]', {
+      manualOriginalUrl,
+      resolvedUrl: cleanString(result.resolvedUrl || result.normalizedUrl || result.finalUrl) || null,
+      outputLink: manualOriginalUrl,
+      asin: cleanString(result.asin).toUpperCase() || null
+    });
+  }
+
+  return finalizedResult;
 }
 
 function decodeHtml(value) {
@@ -565,6 +614,10 @@ async function resolveManualGeneratorAmazonInput(inputValue = '') {
   }
 
   if (isAmazonShortLink(trimmedInput)) {
+    console.info('[MANUAL_SHORTLINK_INPUT_DETECTED]', {
+      manualOriginalUrl: trimmedInput,
+      hostname: safeUrl(trimmedInput)?.hostname?.toLowerCase().replace(/^www\./, '') || null
+    });
     console.info('[SHORTLINK_DETECTED]', {
       originalUrl: trimmedInput
     });
@@ -615,6 +668,11 @@ async function resolveManualGeneratorAmazonInput(inputValue = '') {
             resolvedUrl: nextUrl,
             source: 'shortlink_resolved_url'
           });
+          console.info('[MANUAL_SHORTLINK_RESOLVED_FOR_DATA]', {
+            manualOriginalUrl: trimmedInput,
+            resolvedUrl: nextUrl,
+            asin: nextAsin
+          });
           console.info('[AFFILIATE_LINK_BUILT]', {
             asin: nextAsin,
             affiliateUrl: linkRecord.affiliateUrl || null
@@ -653,6 +711,11 @@ async function resolveManualGeneratorAmazonInput(inputValue = '') {
           asin: currentAsin,
           resolvedUrl: currentUrl,
           source: 'shortlink_current_url'
+        });
+        console.info('[MANUAL_SHORTLINK_RESOLVED_FOR_DATA]', {
+          manualOriginalUrl: trimmedInput,
+          resolvedUrl: currentUrl,
+          asin: currentAsin
         });
         console.info('[AFFILIATE_LINK_BUILT]', {
           asin: currentAsin,
@@ -2219,11 +2282,14 @@ export async function scrapeAmazonProduct(inputUrl = '') {
 }
 
 async function handleScrape(req, res) {
+  const inputUrl = typeof req.body?.url === 'string' ? req.body.url : '';
+
   try {
-    return res.status(200).json(await scrapeAmazonProduct(req.body?.url));
+    const scrapeResult = await scrapeAmazonProduct(inputUrl);
+    return res.status(200).json(finalizeManualGeneratorScrapeResponse(inputUrl, scrapeResult));
   } catch (error) {
     console.error('[PRODUCT_DATA_FAILED]', {
-      inputUrl: typeof req.body?.url === 'string' ? req.body.url : null,
+      inputUrl: inputUrl || null,
       errorCode: error instanceof Error ? error.code || 'SCRAPE_FAILED' : 'SCRAPE_FAILED',
       errorMessage: error instanceof Error ? error.message : 'Scrape failed'
     });
