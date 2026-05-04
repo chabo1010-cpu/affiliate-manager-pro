@@ -401,7 +401,7 @@ function buildQueuePreview(input = {}, routing = {}) {
     routeType: cleanText(context.routeType) || (cleanText(input.sourceType).toLowerCase() === 'generator' ? 'manual' : 'automatic'),
     channels,
     nextStep:
-      routing.decision === 'test_group'
+      routing.decision === 'test_group' || routing.decision === 'approve'
         ? 'enqueue_before_send'
         : routing.decision === 'block'
           ? 'skip_send'
@@ -473,12 +473,12 @@ function getSourceLabel(sourceType) {
 }
 
 function getRoutingLabel(decision) {
-  if (decision === 'test_group') {
-    return 'Testgruppe';
+  if (decision === 'test_group' || decision === 'approve') {
+    return 'Ver\u00F6ffentlicht Test';
   }
 
   if (decision === 'block') {
-    return 'Blockieren';
+    return 'Geblockt Test';
   }
 
   return 'Review';
@@ -628,6 +628,499 @@ function isReaderGeneratorPath(sourceType = '') {
 
 function isStrictReaderMode(runtimeConfig = {}) {
   return runtimeConfig.readerDebugMode === true || runtimeConfig.readerTestMode === true;
+}
+
+function isTestFiltersZeroActive(runtimeConfig = {}) {
+  return runtimeConfig.readerTestMode === true;
+}
+
+function normalizeTestSellerRoutingClass(sellerDecisionPolicy = {}, input = {}) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const sellerClass = cleanText(seller.sellerClass || input.sellerClass).toUpperCase();
+  const sellerType = cleanText(seller.sellerType || input.sellerType).toUpperCase();
+
+  if (sellerClass === 'FBA_OR_AMAZON_UNKNOWN' || sellerType === 'AMAZON_VERIFIED') {
+    return 'FBA_OR_AMAZON_UNKNOWN';
+  }
+
+  if (sellerClass === 'AMAZON_DIRECT' || sellerType === 'AMAZON') {
+    return 'AMAZON_DIRECT';
+  }
+
+  if (sellerClass === 'FBA_THIRDPARTY' || sellerClass === 'FBA' || sellerType === 'FBA') {
+    return 'FBA';
+  }
+
+  if (sellerClass === 'FBM_THIRDPARTY' || sellerClass === 'FBM' || sellerType === 'FBM') {
+    return 'FBM';
+  }
+
+  return 'UNKNOWN';
+}
+
+function buildTestSellerFallbackText(input = {}, sellerDecisionPolicy = {}) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const details = seller.details || {};
+  const inputDetails = input.sellerDetails && typeof input.sellerDetails === 'object' ? input.sellerDetails : {};
+
+  return [
+    input.sellerRawText,
+    inputDetails.merchantText,
+    inputDetails.rawText,
+    inputDetails.scrapeText,
+    inputDetails.buyboxText,
+    inputDetails.offerText,
+    details.merchantText,
+    details.rawText,
+    details.scrapeText,
+    details.buyboxText,
+    details.offerText
+  ]
+    .map((value) => cleanText(value))
+    .filter(Boolean)
+    .join(' | ');
+}
+
+function normalizeTestSellerFallbackText(value = '') {
+  return cleanText(value)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\u00df/g, 'ss')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function hasAmazonDirectTestSignal(normalizedText = '') {
+  return /verkauf(?:t)?\s+(?:durch|von)\s+amazon(?:\.de)?/.test(normalizedText) || /sold by amazon(?:\.de)?/.test(normalizedText);
+}
+
+function hasFbaTestSignal(normalizedText = '') {
+  return (
+    /versand(?:et)?\s+(?:durch|von)\s+amazon(?:\.de)?/.test(normalizedText) ||
+    /fulfilled by amazon(?:\.de)?/.test(normalizedText) ||
+    /ships from amazon(?:\.de)?/.test(normalizedText)
+  );
+}
+
+function hasFbmTestSignal(normalizedText = '') {
+  return (
+    /versand(?:et)?\s+(?:durch|von)\s+(?:verkaufer|verkaeufer|seller)/.test(normalizedText) ||
+    /ships from seller/.test(normalizedText) ||
+    /shipped by seller/.test(normalizedText) ||
+    (/verkauf(?:t)?\s+(?:durch|von)\s+(?!amazon(?:\.de)?(?:\s|$))[^|.,;\n]+/.test(normalizedText) &&
+      !hasFbaTestSignal(normalizedText)) ||
+    (/sold by\s+(?!amazon(?:\.de)?(?:\s|$))[^|.,;\n]+/.test(normalizedText) && !hasFbaTestSignal(normalizedText))
+  );
+}
+
+function resolveAmazonDatasetUrl(input = {}, amazonPreview = {}) {
+  const sellerDetails = input.sellerDetails && typeof input.sellerDetails === 'object' ? input.sellerDetails : {};
+  const amazonDataset = sellerDetails.amazonDataset && typeof sellerDetails.amazonDataset === 'object' ? sellerDetails.amazonDataset : {};
+
+  return cleanText(
+    input.normalizedUrl ||
+      input.productUrl ||
+      input.amazonUrl ||
+      input.url ||
+      input.link ||
+      amazonDataset.normalizedUrl ||
+      amazonDataset.productUrl ||
+      amazonDataset.detailPageUrl ||
+      amazonPreview.normalizedUrl ||
+      amazonPreview.detailPageUrl ||
+      amazonPreview.affiliateUrl
+  );
+}
+
+function cleanAmazonDatasetValue(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return cleanText(value);
+}
+
+function firstAmazonDatasetValue(...values) {
+  return values.map((value) => cleanAmazonDatasetValue(value)).find(Boolean) || '';
+}
+
+function hasVerifiedAmazonDataset({ input = {}, amazonPreview = {} } = {}) {
+  const sellerDetails = input.sellerDetails && typeof input.sellerDetails === 'object' ? input.sellerDetails : {};
+  const amazonDataset = sellerDetails.amazonDataset && typeof sellerDetails.amazonDataset === 'object' ? sellerDetails.amazonDataset : {};
+  const asin = firstAmazonDatasetValue(input.asin, amazonPreview.asin, amazonDataset.asin).toUpperCase();
+  const title = firstAmazonDatasetValue(amazonPreview.title, input.title, input.productTitle, amazonDataset.title);
+  const price = firstAmazonDatasetValue(amazonPreview.priceDisplay, amazonDataset.price, input.currentPrice, input.price);
+  const imageUrl = firstAmazonDatasetValue(
+    amazonPreview.imageUrl,
+    input.imageUrl,
+    input.generatedImagePath,
+    input.uploadedImagePath,
+    amazonDataset.imageUrl
+  );
+  const affiliateLink = firstAmazonDatasetValue(
+    input.affiliateUrl,
+    input.affiliateLink,
+    input.link,
+    amazonPreview.affiliateUrl,
+    amazonDataset.affiliateUrl
+  );
+  const normalizedUrl = resolveAmazonDatasetUrl(input, amazonPreview).toLowerCase();
+  const asinPath = asin ? `/dp/${asin.toLowerCase()}` : '';
+  const hasAmazonDpUrl = Boolean(asinPath && normalizedUrl.includes('amazon.de') && normalizedUrl.includes(asinPath));
+
+  return {
+    verified: Boolean(asin && title && price && imageUrl && affiliateLink && hasAmazonDpUrl),
+    asin,
+    titleLoaded: Boolean(title),
+    priceLoaded: Boolean(price),
+    imageLoaded: Boolean(imageUrl),
+    affiliateLinkLoaded: Boolean(affiliateLink),
+    normalizedUrl,
+    hasAmazonDpUrl
+  };
+}
+
+function buildTestModeSellerPolicyOverride({
+  sellerDecisionPolicy = {},
+  sellerClass = 'UNKNOWN',
+  sellerType = 'UNKNOWN',
+  soldByAmazon = null,
+  shippedByAmazon = null,
+  detectionSource = 'text_fallback',
+  reason = ''
+} = {}) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const details = seller.details || {};
+  const isAmazonDirect = sellerClass === 'AMAZON_DIRECT';
+  const isFba = sellerClass === 'FBA' || sellerClass === 'FBA_OR_AMAZON_UNKNOWN';
+  const isFbm = sellerClass === 'FBM';
+
+  return {
+    ...sellerDecisionPolicy,
+    seller: {
+      ...seller,
+      sellerClass,
+      sellerType,
+      soldByAmazon,
+      shippedByAmazon,
+      isAmazonDirect,
+      isFbaThirdParty: isFba,
+      isFbmThirdParty: isFbm,
+      isUnknown: false,
+      details: {
+        ...details,
+        sellerClass,
+        sellerType,
+        soldByAmazonLabel: soldByAmazon === true ? 'ja' : soldByAmazon === false ? 'nein' : 'unbekannt',
+        shippedByAmazonLabel: shippedByAmazon === true ? 'ja' : shippedByAmazon === false ? 'nein' : 'unbekannt',
+        detectionSource,
+        detectionSources: [detectionSource, ...(Array.isArray(details.detectionSources) ? details.detectionSources : [])],
+        unknownReason: '',
+        recognitionMessage: reason,
+        sellerRecognitionMessage: reason
+      }
+    },
+    marketComparison: {
+      ...(sellerDecisionPolicy.marketComparison || {}),
+      allowed: isFbm !== true,
+      reason
+    },
+    ai: {
+      ...(sellerDecisionPolicy.ai || {}),
+      allowed: isFbm !== true,
+      reason
+    },
+    unknownSellerAction: 'pass'
+  };
+}
+
+function applyTestModeUnknownSellerFallback({
+  sellerDecisionPolicy = {},
+  input = {},
+  runtimeConfig = {},
+  amazonPreview = {}
+} = {}) {
+  const seller = sellerDecisionPolicy.seller || {};
+  const sellerClass = cleanText(seller.sellerClass || input.sellerClass).toUpperCase();
+  const sellerType = cleanText(seller.sellerType || input.sellerType).toUpperCase();
+  const isUnknown = seller.isUnknown === true || sellerClass === 'UNKNOWN' || sellerType === 'UNKNOWN';
+
+  if (runtimeConfig.readerTestMode !== true || isUnknown !== true) {
+    return sellerDecisionPolicy;
+  }
+
+  const text = buildTestSellerFallbackText(input, sellerDecisionPolicy);
+  const normalizedText = normalizeTestSellerFallbackText(text);
+  const basePayload = {
+    asin: cleanText(input.asin || amazonPreview.asin).toUpperCase() || '',
+    sellerClass: sellerClass || 'UNKNOWN',
+    sellerType: sellerType || 'UNKNOWN',
+    textPreview: text.slice(0, 160)
+  };
+
+  logDecisionFlow('SELLER_UNKNOWN_TEST_FALLBACK_START', basePayload);
+
+  if (hasAmazonDirectTestSignal(normalizedText)) {
+    const reason = 'Testmodus: Verkauf durch Amazon per Textsignal erkannt.';
+    logDecisionFlow('SELLER_TEXT_SIGNAL_AMAZON_DIRECT', {
+      ...basePayload,
+      reason
+    });
+
+    return buildTestModeSellerPolicyOverride({
+      sellerDecisionPolicy,
+      sellerClass: 'AMAZON_DIRECT',
+      sellerType: 'AMAZON',
+      soldByAmazon: true,
+      shippedByAmazon: true,
+      detectionSource: 'text_fallback',
+      reason
+    });
+  }
+
+  if (hasFbaTestSignal(normalizedText)) {
+    const reason = 'Testmodus: Versand/Fulfillment durch Amazon per Textsignal erkannt.';
+    logDecisionFlow('SELLER_TEXT_SIGNAL_FBA', {
+      ...basePayload,
+      reason
+    });
+
+    return buildTestModeSellerPolicyOverride({
+      sellerDecisionPolicy,
+      sellerClass: 'FBA',
+      sellerType: 'FBA',
+      soldByAmazon: false,
+      shippedByAmazon: true,
+      detectionSource: 'text_fallback',
+      reason
+    });
+  }
+
+  if (hasFbmTestSignal(normalizedText)) {
+    const reason = 'Testmodus: FBM/Drittanbieter erkannt.';
+    logDecisionFlow('SELLER_TEXT_SIGNAL_FBM_BLOCKED', {
+      ...basePayload,
+      reason
+    });
+
+    return buildTestModeSellerPolicyOverride({
+      sellerDecisionPolicy,
+      sellerClass: 'FBM',
+      sellerType: 'FBM',
+      soldByAmazon: false,
+      shippedByAmazon: false,
+      detectionSource: 'text_fallback',
+      reason
+    });
+  }
+
+  const dataset = hasVerifiedAmazonDataset({
+    input,
+    amazonPreview
+  });
+
+  if (dataset.verified === true) {
+    const reason = 'Testmodus: Amazon Produktdaten verifiziert, Seller noch nicht eindeutig.';
+    logDecisionFlow('SELLER_VERIFIED_AMAZON_DATASET_APPROVED', {
+      ...basePayload,
+      ...dataset,
+      reason
+    });
+
+    return buildTestModeSellerPolicyOverride({
+      sellerDecisionPolicy,
+      sellerClass: 'FBA_OR_AMAZON_UNKNOWN',
+      sellerType: 'AMAZON_VERIFIED',
+      soldByAmazon: null,
+      shippedByAmazon: null,
+      detectionSource: 'verified_amazon_dataset_fallback',
+      reason: 'Seller nicht eindeutig, aber Amazon Produktdaten vollständig verifiziert.'
+    });
+  }
+
+  logDecisionFlow('SELLER_STILL_UNKNOWN_AFTER_FALLBACK', {
+    ...basePayload,
+    ...dataset,
+    reason: 'Testmodus-Fallback konnte Seller UNKNOWN nicht sicher reduzieren.'
+  });
+
+  return sellerDecisionPolicy;
+}
+
+function applyTestSellerRouting({
+  routing = {},
+  sellerDecisionPolicy = {},
+  input = {},
+  runtimeConfig = {}
+} = {}) {
+  if (runtimeConfig.readerTestMode !== true) {
+    return routing;
+  }
+
+  const sellerClass = normalizeTestSellerRoutingClass(sellerDecisionPolicy, input);
+  const basePayload = {
+    sellerClass,
+    sellerType: sellerDecisionPolicy.seller?.sellerType || input.sellerType || 'UNKNOWN',
+    routingBefore: cleanText(routing.decision) || 'review'
+  };
+
+  logDecisionFlow('TEST_SELLER_ROUTING_ACTIVE', basePayload);
+
+  if (sellerClass === 'AMAZON_DIRECT') {
+    logDecisionFlow('SELLER_TEXT_SIGNAL_AMAZON_DIRECT', {
+      ...basePayload,
+      routingAfter: 'approve',
+      sellerDetectionSource: sellerDecisionPolicy.seller?.details?.detectionSource || 'unknown',
+      reason: 'Testmodus: Amazon Direkt freigegeben'
+    });
+    logDecisionFlow('TEST_APPROVE_AMAZON_DIRECT', {
+      ...basePayload,
+      routingAfter: 'approve',
+      reason: 'Testmodus: Amazon Direkt freigegeben'
+    });
+
+    return {
+      ...routing,
+      decision: 'approve',
+      reason: 'Testmodus: Amazon Direkt freigegeben',
+      strategy: 'test_seller_routing'
+    };
+  }
+
+  if (sellerClass === 'FBA') {
+    logDecisionFlow('SELLER_TEXT_SIGNAL_FBA', {
+      ...basePayload,
+      routingAfter: 'approve',
+      sellerDetectionSource: sellerDecisionPolicy.seller?.details?.detectionSource || 'unknown',
+      reason: 'Testmodus: FBA freigegeben'
+    });
+    logDecisionFlow('TEST_APPROVE_FBA', {
+      ...basePayload,
+      routingAfter: 'approve',
+      reason: 'Testmodus: FBA freigegeben'
+    });
+
+    return {
+      ...routing,
+      decision: 'approve',
+      reason: 'Testmodus: FBA freigegeben',
+      strategy: 'test_seller_routing'
+    };
+  }
+
+  if (sellerClass === 'FBA_OR_AMAZON_UNKNOWN') {
+    const reason = 'Testmodus: Amazon Produktdaten verifiziert, Seller noch nicht eindeutig.';
+    logDecisionFlow('SELLER_VERIFIED_AMAZON_DATASET_APPROVED', {
+      ...basePayload,
+      routingAfter: 'approve',
+      reason
+    });
+
+    return {
+      ...routing,
+      decision: 'approve',
+      reason,
+      strategy: 'test_seller_routing'
+    };
+  }
+
+  if (sellerClass === 'FBM') {
+    const reason = 'Testmodus: FBM/Drittanbieter erkannt.';
+    logDecisionFlow('SELLER_TEXT_SIGNAL_FBM_BLOCKED', {
+      ...basePayload,
+      routingAfter: 'block',
+      sellerDetectionSource: sellerDecisionPolicy.seller?.details?.detectionSource || 'unknown',
+      reason
+    });
+    logDecisionFlow('TEST_BLOCK_FBM', {
+      ...basePayload,
+      routingAfter: 'block',
+      reason
+    });
+
+    return {
+      ...routing,
+      decision: 'block',
+      reason,
+      strategy: 'test_seller_routing'
+    };
+  }
+
+  logDecisionFlow('TEST_REVIEW_UNKNOWN', {
+    ...basePayload,
+    routingAfter: 'review',
+    reason: 'Testmodus: Seller unbekannt, manuelle Pr\u00FCfung n\u00F6tig'
+  });
+
+  return {
+    ...routing,
+    decision: 'review',
+    reason: 'Testmodus: Seller unbekannt, manuelle Pr\u00FCfung n\u00F6tig',
+    strategy: 'test_seller_routing'
+  };
+}
+
+function applyTestFiltersZeroToEvaluation(evaluation = {}) {
+  const nextConfig = {
+    ...(evaluation.config || {}),
+    minDiscount: 0,
+    minScore: 0,
+    maxFakeDropRisk: 100
+  };
+  const nextChecks = {
+    ...(evaluation.checks || {}),
+    minDiscountPassed: true,
+    minScorePassed: true,
+    fakeDropPassed: true,
+    classificationPassed: true
+  };
+  const blockedByFilter = evaluation.decision === 'hold';
+
+  return {
+    ...evaluation,
+    decision: blockedByFilter ? 'manual_review' : evaluation.decision,
+    decisionLabel: blockedByFilter ? 'Manuelle Pruefung' : evaluation.decisionLabel,
+    testGroupApproved: blockedByFilter ? false : evaluation.testGroupApproved === true,
+    automationReady: blockedByFilter ? false : evaluation.automationReady === true,
+    config: nextConfig,
+    checks: nextChecks,
+    reasons: [
+      ...(Array.isArray(evaluation.reasons) ? evaluation.reasons : []),
+      'READER_TEST_MODE setzt Rabatt, Score und Fake-Schwelle auf Testwerte.'
+    ]
+  };
+}
+
+function disableRequiredCheckInTestMode(execution = {}, label = 'Pruefung') {
+  return {
+    ...execution,
+    required: false,
+    forceMarketCompare: false,
+    forceAiCheck: false,
+    reason: cleanText(execution.reason) || `READER_TEST_MODE setzt ${label}-Pflicht aus.`
+  };
+}
+
+function applyTestFiltersZeroToRouting(routing = {}, runtimeConfig = {}) {
+  if (isTestFiltersZeroActive(runtimeConfig) !== true || routing.decision !== 'block') {
+    return routing;
+  }
+
+  logDecisionFlow('TEST_FILTERS_ZERO_ACTIVE', {
+    routingBefore: routing.decision,
+    routingAfter: 'review',
+    reason: 'READER_TEST_MODE verhindert harte Filter-Blocks.'
+  });
+
+  return {
+    ...routing,
+    decision: 'review',
+    reason: cleanText(routing.reason)
+      ? `${routing.reason} | READER_TEST_MODE verhindert harte Filter-Blocks.`
+      : 'READER_TEST_MODE verhindert harte Filter-Blocks.'
+  };
 }
 
 function shouldAllowUnknownAmazonInTestMode({ input = {}, sellerDecisionPolicy = {} } = {}) {
@@ -881,11 +1374,22 @@ export function evaluateLearningRoute(input = {}) {
     dealType: input.dealType,
     isAmazonDeal: input.isAmazonDeal
   });
-  const sellerType = normalizeSellerType(sellerIdentity.sellerType || input.sellerType);
+  let sellerType = normalizeSellerType(sellerIdentity.sellerType || input.sellerType);
   const dealEngineSettings = input.dealEngineSettings || {};
   const runtimeConfig = input.runtimeConfig && typeof input.runtimeConfig === 'object' ? input.runtimeConfig : {};
+  const testFiltersZeroActive = isTestFiltersZeroActive(runtimeConfig);
   const keepaPreview = normalizeKeepaContext(input);
-  const sellerDecisionPolicy = input.sellerDecisionPolicy || evaluateSellerDecisionPolicy(dealEngineSettings, sellerIdentity);
+  const amazonPreview = normalizeAmazonContext(input);
+  let sellerDecisionPolicy = input.sellerDecisionPolicy || evaluateSellerDecisionPolicy(dealEngineSettings, sellerIdentity);
+  sellerDecisionPolicy = applyTestModeUnknownSellerFallback({
+    sellerDecisionPolicy,
+    input,
+    runtimeConfig,
+    amazonPreview
+  });
+  if (sellerDecisionPolicy.seller?.sellerType === 'AMAZON_VERIFIED') {
+    sellerType = 'AMAZON_VERIFIED';
+  }
   const allowUnknownAmazonInTestMode = shouldAllowUnknownAmazonInTestMode({
     input,
     sellerDecisionPolicy,
@@ -920,15 +1424,17 @@ export function evaluateLearningRoute(input = {}) {
           status: 'blocked_by_seller_policy',
           reason: marketComparisonReason || 'Marktvergleich blockiert.'
         };
-  const amazonPreview = normalizeAmazonContext(input);
   const patternSupportEnabled = input.patternSupportEnabled !== false;
-  const marketExecution = resolveMarketComparisonExecutionState({
+  let marketExecution = resolveMarketComparisonExecutionState({
     input,
     settings: dealEngineSettings,
     sellerDecisionPolicy,
     internetPreview,
     runtimeConfig
   });
+  if (testFiltersZeroActive) {
+    marketExecution = disableRequiredCheckInTestMode(marketExecution, 'Marktvergleich');
+  }
 
   logDecisionFlow('SELLER_DETAILS', {
     sellerType: sellerDecisionPolicy.seller?.sellerType || 'UNKNOWN',
@@ -1017,7 +1523,7 @@ export function evaluateLearningRoute(input = {}) {
     amazonStatus: amazonPreview.status
   });
 
-  const sellerTypeConfig = getSellerTypeLogicConfig(sellerType);
+  let sellerTypeConfig = getSellerTypeLogicConfig(sellerType);
   const feedbackSummary =
     input.feedbackSummary?.sellerType === sellerType ? input.feedbackSummary : getSellerTypeFeedbackSummary(sellerType);
   const similarCaseSignals =
@@ -1058,7 +1564,7 @@ export function evaluateLearningRoute(input = {}) {
             scoreAdjustment: 0
           }
         };
-  const evaluation = evaluateSellerTypeDeal({
+  let evaluation = evaluateSellerTypeDeal({
     sellerType,
     keepaAvailable: keepaPreview.available,
     keepaDiscount: keepaPreview.keepaDiscount,
@@ -1068,6 +1574,22 @@ export function evaluateLearningRoute(input = {}) {
     feedbackSummary,
     similarCaseSummary: similarCaseSignals.summary
   });
+  if (testFiltersZeroActive) {
+    evaluation = applyTestFiltersZeroToEvaluation(evaluation);
+    sellerTypeConfig = evaluation.config || sellerTypeConfig;
+    logDecisionFlow('TEST_FILTERS_ZERO_ACTIVE', {
+      minDiscountPercent: 0,
+      minScore: 0,
+      sellerTypeMinDiscount: 0,
+      sellerTypeMinScore: 0,
+      sellerTypeFakeThreshold: 100,
+      fakeRejectThreshold: 100,
+      marketComparisonRequired: false,
+      aiRequired: false,
+      unknownSellerBlock: false,
+      productRuleBlock: false
+    });
+  }
   let routing = buildRoutingDecision(input, internetPreview, keepaPreview, evaluation);
   routing = applySellerPolicyToRouting(routing, sellerDecisionPolicy);
   routing = applyUnknownSellerReaderReviewCap({
@@ -1076,7 +1598,14 @@ export function evaluateLearningRoute(input = {}) {
     sellerDecisionPolicy,
     runtimeConfig
   });
-  const aiExecution = resolveAiCheckExecutionState({
+  routing = applyTestFiltersZeroToRouting(routing, runtimeConfig);
+  routing = applyTestSellerRouting({
+    routing,
+    sellerDecisionPolicy,
+    input,
+    runtimeConfig
+  });
+  let aiExecution = resolveAiCheckExecutionState({
     input,
     settings: dealEngineSettings,
     sellerDecisionPolicy,
@@ -1085,6 +1614,9 @@ export function evaluateLearningRoute(input = {}) {
     marketExecution,
     aiRuntimeContext: input.aiRuntimeContext
   });
+  if (testFiltersZeroActive) {
+    aiExecution = disableRequiredCheckInTestMode(aiExecution, 'KI');
+  }
   const aiAllowedForExecution = sellerDecisionPolicy.ai?.allowed === true || allowUnknownAmazonInTestMode === true;
   const aiPolicyReason =
     allowUnknownAmazonInTestMode === true
@@ -1157,7 +1689,12 @@ export function evaluateLearningRoute(input = {}) {
     sourceLabel,
     enforced: input.enforceDecision === true,
     keepaRequired: input.keepaRequired === true,
-    primaryDecisionSource: routing.strategy === 'internet_primary' ? 'internetvergleich' : 'keepa_fallback',
+    primaryDecisionSource:
+      routing.strategy === 'test_seller_routing'
+        ? 'test_seller_routing'
+        : routing.strategy === 'internet_primary'
+          ? 'internetvergleich'
+          : 'keepa_fallback',
     fallbackUsed: routing.strategy === 'keepa_fallback',
     internetPrimary: routing.strategy === 'internet_primary',
     keepaFallbackUsed: routing.strategy === 'keepa_fallback',
@@ -1185,7 +1722,8 @@ export function evaluateLearningRoute(input = {}) {
     sperrmodulIntegrated: true,
     routingDecision: routing.decision,
     routingLabel: getRoutingLabel(routing.decision),
-    canReachTestGroup: routing.decision === 'test_group',
+    testGroupApproved: routing.decision === 'test_group' || routing.decision === 'approve',
+    canReachTestGroup: routing.decision === 'test_group' || routing.decision === 'approve',
     shouldReview: routing.decision === 'review',
     blocked: routing.decision === 'block',
     dealLockBlocked: dealLock.blocked,
@@ -1202,13 +1740,19 @@ export function evaluateLearningRoute(input = {}) {
         : '',
     decisionEngine,
     workflow:
-      routing.strategy === 'internet_primary'
-        ? routing.decision === 'test_group'
+      routing.strategy === 'test_seller_routing'
+        ? routing.decision === 'approve'
+          ? 'Deal -> Testmodus Seller-Schublade -> Ver\u00F6ffentlicht Test'
+          : routing.decision === 'block'
+            ? 'Deal -> Testmodus Seller-Schublade -> Geblockt Test'
+            : 'Deal -> Testmodus Seller-Schublade -> Review'
+        : routing.strategy === 'internet_primary'
+          ? routing.decision === 'test_group' || routing.decision === 'approve'
           ? 'Deal -> Sperrcheck -> Internetvergleich -> Marktentscheidung -> Queue'
           : routing.decision === 'block'
             ? 'Deal -> Sperrcheck -> Internetvergleich -> Marktentscheidung -> Block'
             : 'Deal -> Sperrcheck -> Internetvergleich -> Review'
-        : routing.decision === 'test_group'
+        : routing.decision === 'test_group' || routing.decision === 'approve'
           ? 'Deal -> Sperrcheck -> Keepa-Fallback -> Regler -> Queue'
           : routing.decision === 'block'
             ? 'Deal -> Sperrcheck -> Keepa-Fallback -> Regler -> Block'

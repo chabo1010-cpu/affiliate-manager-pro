@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
 import Layout from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
 import './Home.css'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'
+const DASHBOARD_API_TIMEOUT_MS = 1500
 
 function toNumber(value) {
   const parsed = Number(value)
@@ -46,6 +46,19 @@ function sortByTimeDesc(items = []) {
     const rightTime = new Date(right.time || right.createdAt || right.updatedAt || 0).getTime()
     return rightTime - leftTime
   })
+}
+
+function isWithinLastMinutes(value, minutes) {
+  if (!value) {
+    return false
+  }
+
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return false
+  }
+
+  return Date.now() - parsed.getTime() <= minutes * 60 * 1000
 }
 
 function getStatusTone(status) {
@@ -119,33 +132,59 @@ function HomePage() {
     repostSettings: null,
     history: null,
     sources: null,
-    copybotLogs: null
+    copybotLogs: null,
+    debug: null
   })
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState('')
 
   useEffect(() => {
     let cancelled = false
 
     async function apiFetch(path) {
-      const response = await fetch(`${API_BASE_URL}${path}`, {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-User-Role': user?.role || ''
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), DASHBOARD_API_TIMEOUT_MS)
+
+      try {
+        const response = await fetch(`${API_BASE_URL}${path}`, {
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-User-Role': user?.role || ''
+          }
+        })
+        const data = await response.json().catch(() => ({}))
+
+        if (!response.ok) {
+          throw new Error(data?.error || `Request fehlgeschlagen (${response.status}).`)
         }
-      })
-      const data = await response.json().catch(() => ({}))
 
-      if (!response.ok) {
-        throw new Error(data?.error || `Request fehlgeschlagen (${response.status}).`)
+        return data
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          console.warn('[DASHBOARD_DATA_LOAD_TIMEOUT]', {
+            path,
+            timeoutMs: DASHBOARD_API_TIMEOUT_MS
+          })
+          throw new Error(`Timeout nach ${DASHBOARD_API_TIMEOUT_MS}ms: ${path}`)
+        }
+        throw error
+      } finally {
+        window.clearTimeout(timeoutId)
       }
-
-      return data
     }
 
     async function loadDashboard() {
       try {
-        setLoading(true)
+        console.info('[DASHBOARD_RENDER_START]', {
+          mode: 'async_placeholders_first',
+          timeoutMs: DASHBOARD_API_TIMEOUT_MS
+        })
+        console.info('[DASHBOARD_SAFE_FALLBACK_RENDERED]', {
+          state: 'initial_placeholders',
+          message: 'Keine Daten'
+        })
+        setLoading(false)
         setStatus('')
 
         const results = await Promise.allSettled([
@@ -154,14 +193,15 @@ function HomePage() {
           apiFetch('/api/keepa/status'),
           apiFetch('/api/amazon/status'),
           apiFetch('/api/publishing/queue'),
-          apiFetch('/api/publishing/logs'),
+          Promise.resolve({ items: [] }),
           apiFetch('/api/publishing/workers/status'),
           apiFetch('/api/deals/settings'),
           apiFetch('/api/deals/history'),
           apiFetch('/api/copybot/sources'),
-          apiFetch('/api/copybot/logs'),
+          Promise.resolve({ items: [] }),
           apiFetch('/api/advertising/dashboard'),
-          apiFetch('/api/deal-engine/dashboard')
+          apiFetch('/api/deal-engine/dashboard'),
+          Promise.resolve({ runtimeFlags: {} })
         ])
 
         const [
@@ -177,12 +217,15 @@ function HomePage() {
           sourcesResult,
           copybotLogsResult,
           advertisingResult,
-          dealEngineResult
+          dealEngineResult,
+          debugResult
         ] = results
 
         const partialErrors = results
           .filter((item) => item.status === 'rejected')
           .map((item) => (item.reason instanceof Error ? item.reason.message : 'Ein Teilbereich konnte nicht geladen werden.'))
+        const loadedCount = results.filter((item) => item.status === 'fulfilled').length
+        const failedCount = results.length - loadedCount
 
         if (!cancelled) {
           setDashboard({
@@ -198,16 +241,31 @@ function HomePage() {
             history: historyResult.status === 'fulfilled' ? historyResult.value : null,
             sources: sourcesResult.status === 'fulfilled' ? sourcesResult.value : null,
             copybotLogs: copybotLogsResult.status === 'fulfilled' ? copybotLogsResult.value : null,
-            advertising: advertisingResult.status === 'fulfilled' ? advertisingResult.value : null
+            advertising: advertisingResult.status === 'fulfilled' ? advertisingResult.value : null,
+            debug: debugResult.status === 'fulfilled' ? debugResult.value : null
+          })
+
+          console.info('[DASHBOARD_DATA_LOADED]', {
+            loadedCount,
+            failedCount,
+            skippedHeavyInitialLoads: ['publishing_logs', 'copybot_logs', 'debug_test']
           })
 
           if (partialErrors.length) {
-            setStatus(`Monitoring teilweise unvollstaendig: ${partialErrors[0]}`)
+            setStatus(failedCount === results.length ? 'Keine Daten' : `Monitoring teilweise unvollstaendig: ${partialErrors[0]}`)
+            console.info('[DASHBOARD_SAFE_FALLBACK_RENDERED]', {
+              state: failedCount === results.length ? 'all_failed' : 'partial_failed',
+              failedCount
+            })
           }
         }
       } catch (error) {
         if (!cancelled) {
-          setStatus(error instanceof Error ? error.message : 'Dashboard konnte nicht geladen werden.')
+          setStatus('Keine Daten')
+          console.info('[DASHBOARD_SAFE_FALLBACK_RENDERED]', {
+            state: 'load_error',
+            error: error instanceof Error ? error.message : 'Dashboard konnte nicht geladen werden.'
+          })
         }
       } finally {
         if (!cancelled) {
@@ -237,6 +295,8 @@ function HomePage() {
   const sourceItems = Array.isArray(dashboard.sources?.items) ? dashboard.sources.items : []
   const copybotLogItems = Array.isArray(dashboard.copybotLogs?.items) ? dashboard.copybotLogs.items : []
   const advertisingOverview = dashboard.advertising || {}
+  const debugOverview = dashboard.debug || {}
+  const runtimeFlags = debugOverview.runtimeFlags || {}
   const operationalStatus = botOverview.operationalStatus || {}
   const productionReality = botOverview.productionReality || { live: [], prepared: [], blocked: [] }
   const latestQueueItems = queueItems.slice(0, 6)
@@ -614,69 +674,167 @@ function HomePage() {
           }
         ]
 
-  const workspaceCards = [
+  const dealEngineTimelineItems = Array.isArray(dealEngineOverview?.timeline) ? dealEngineOverview.timeline : []
+  const dealEngineRunItems = Array.isArray(dealEngineOverview?.runs) ? dealEngineOverview.runs : []
+  const topDealCandidates = useMemo(
+    () =>
+      sortByTimeDesc([
+        ...latestDeals.map((item, index) => ({
+          id: `copybot-live-${item.id || index}`,
+          title: item.title || item.source_name || 'Keine Daten',
+          decision: item.status || 'Keine Daten',
+          source: item.source_name || item.platform || 'Keine Daten',
+          time: item.created_at || item.updated_at
+        })),
+        ...dealEngineTimelineItems.map((item, index) => ({
+          id: `engine-live-timeline-${item.id || index}`,
+          title: item.title || 'Keine Daten',
+          decision: String(item.detail || '').split('|')[0]?.trim() || 'Keine Daten',
+          source: 'Deal Engine',
+          time: item.createdAt || item.created_at
+        })),
+        ...dealEngineRunItems.map((item, index) => ({
+          id: `engine-live-run-${item.id || index}`,
+          title: item.title || item.asin || 'Keine Daten',
+          decision: item.decision || 'Keine Daten',
+          source: item.source?.name || item.sourceName || item.sourcePlatform || 'Deal Engine',
+          time: item.createdAt || item.created_at
+        }))
+      ]),
+    [dealEngineRunItems, dealEngineTimelineItems, latestDeals]
+  )
+  const lastDeal = topDealCandidates[0] || null
+  const newDealsLastFiveMinutes = topDealCandidates.filter((item) => isWithinLastMinutes(item.time, 5)).length
+  const approvedCount = toNumber(copybotOverview?.approvedCount) + toNumber(dealEngineOverview?.metrics?.approvedRuns)
+  const reviewCount = toNumber(copybotOverview?.reviewCount) + toNumber(dealEngineOverview?.metrics?.queuedRuns)
+  const blockCount = toNumber(copybotOverview?.rejectedCount) + toNumber(dealEngineOverview?.metrics?.rejectedRuns)
+  const backendLiveStatus =
+    loading
+      ? 'Keine Daten'
+      : status && !botOverview?.lastCheck && !dealEngineOverview?.systemStatus
+        ? 'Offline'
+        : botOverview?.lastCheck || dealEngineOverview?.systemStatus
+          ? 'Online'
+          : 'Keine Daten'
+  const telegramReaderActive =
+    String(telegramReaderRuntime?.status || '').toLowerCase() === 'active' || toNumber(telegramUserApi?.activeSessions) > 0
+  const queueActive =
+    openQueueCount > 0 ||
+    schedulerRuntime?.live === true ||
+    workerChannels.some((item) => ['active', 'running'].includes(String(item.status || '').toLowerCase()))
+  const testGroupActive = Boolean(
+    telegramBotConfigured || telegramBotApi?.targetChatConfigured || toNumber(telegramBotApi?.publishTargets) > 0
+  )
+  const routeEvidence = useMemo(
+    () =>
+      queueItems.reduce(
+        (summary, item) => {
+          const sourceType = String(item.source_type || item.sourceType || '').toLowerCase()
+          const routingChannel = String(item.payload?.meta?.telegramRoutingChannel || '').toLowerCase()
+
+          if (sourceType.includes('approved_route') || routingChannel === 'approved') {
+            summary.approved = true
+          }
+
+          if (sourceType.includes('rejected_route') || routingChannel === 'rejected') {
+            summary.rejected = true
+          }
+
+          return summary
+        },
+        { approved: false, rejected: false }
+      ),
+    [queueItems]
+  )
+  const outputTestGroupStatus = testGroupActive ? 'aktiv' : 'inaktiv'
+  const outputApprovedStatus = routeEvidence.approved ? 'aktiv' : 'Keine Daten'
+  const outputRejectedStatus = routeEvidence.rejected ? 'aktiv' : 'Keine Daten'
+  const readerTestModeActive = runtimeFlags.readerTestMode === true
+  const topLiveCards = [
     {
-      title: 'Dashboard',
-      path: '/',
-      description: 'Status, Timeline und Systemsicht'
+      title: 'System Status',
+      value: backendLiveStatus,
+      detail: `Backend: ${backendLiveStatus} | Reader: ${telegramReaderActive ? 'Aktiv' : 'Inaktiv'} | Queue: ${
+        queueActive ? 'Aktiv' : 'Inaktiv'
+      }`,
+      tone: backendLiveStatus === 'Online' && telegramReaderActive && queueActive ? 'success' : backendLiveStatus === 'Online' ? 'info' : 'warning'
     },
     {
-      title: 'Generator',
-      path: '/generator',
-      description: 'Manueller Deal-Workflow'
+      title: 'Deal Flow Live',
+      value: `${newDealsLastFiveMinutes} neu`,
+      detail: `Approved ${approvedCount} | Review ${reviewCount} | Block ${blockCount}`,
+      tone: blockCount > 0 ? 'warning' : approvedCount > 0 ? 'success' : 'info'
     },
     {
-      title: 'Scrapper',
-      path: '/scraper',
-      description: 'Deal-Eingang und Pruefung'
+      title: 'Output Status',
+      value: `Testgruppe ${outputTestGroupStatus}`,
+      detail: `Approved: ${outputApprovedStatus} | Rejected: ${outputRejectedStatus}`,
+      tone: outputTestGroupStatus === 'aktiv' ? 'success' : 'warning'
     },
     {
-      title: 'Copybot',
-      path: '/copybot',
-      description: 'Telegram- und WhatsApp-Quellen'
-    },
-    {
-      title: 'Templates',
-      path: '/templates',
-      description: 'Vorlagen und Textbausteine'
-    },
-    {
-      title: 'Autobot',
-      path: '/autobot',
-      description: 'Integrationen, Queue und Plattformstatus'
-    },
-    {
-      title: 'Werbung',
-      path: '/advertising',
-      description: 'Freie Werbemodule und geplante Posts'
-    },
-    {
-      title: 'Logik-Zentrale',
-      path: '/learning',
-      description: 'Keepa, Marktvergleich und Lernlogik',
-      adminOnly: true
-    },
-    {
-      title: 'Publishing',
-      path: '/publishing',
-      description: 'Queue, Worker und Versand'
-    },
-    {
-      title: 'Sperrzeiten',
-      path: '/sperrzeiten',
-      description: 'Repost-Sperre und Verlauf'
-    },
-    {
-      title: 'Logs',
-      path: '/logs',
-      description: 'Aktionen und Historie'
-    },
-    {
-      title: 'Einstellungen',
-      path: '/settings',
-      description: 'System und Ausgabe konfigurieren'
+      title: 'Letzter Deal',
+      value: shortenText(lastDeal?.title, 46),
+      detail: lastDeal ? `${lastDeal.decision || 'Keine Daten'} | ${lastDeal.source || 'Keine Daten'}` : 'Keine Daten',
+      tone: getStatusTone(lastDeal?.decision || 'info')
     }
   ]
+
+  useEffect(() => {
+    if (loading) {
+      return
+    }
+
+    console.info('[DASHBOARD_TOP_PANEL_RENDERED]', {
+      cardCount: topLiveCards.length,
+      lastDeal: lastDeal?.id || null
+    })
+    console.info('[DASHBOARD_LIVE_DATA_BOUND]', {
+      backend: backendLiveStatus,
+      telegramReader: telegramReaderActive ? 'Aktiv' : 'Inaktiv',
+      queue: queueActive ? 'Aktiv' : 'Inaktiv',
+      newDealsLastFiveMinutes,
+      approvedCount,
+      reviewCount,
+      blockCount,
+      output: {
+        testGroup: outputTestGroupStatus,
+        approved: outputApprovedStatus,
+        rejected: outputRejectedStatus
+      }
+    })
+  }, [
+    approvedCount,
+    backendLiveStatus,
+    blockCount,
+    lastDeal?.id,
+    loading,
+    newDealsLastFiveMinutes,
+    outputApprovedStatus,
+    outputRejectedStatus,
+    outputTestGroupStatus,
+    queueActive,
+    reviewCount,
+    telegramReaderActive,
+    topLiveCards.length
+  ])
+
+  useEffect(() => {
+    if (!loading && readerTestModeActive) {
+      console.info('[FRONTEND_TEST_FILTERS_RENDERED]', {
+        minDiscountPercent: 0,
+        minScore: 0,
+        fakeThreshold: 100,
+        sellerBlockade: 'AUS',
+        marketComparisonRequired: 'AUS',
+        sellerRouting: {
+          amazonDirect: 'Veröffentlicht',
+          fba: 'Veröffentlicht',
+          fbm: 'Geblockt',
+          unknown: 'Geblockt/Prüfen'
+        }
+      })
+    }
+  }, [loading, readerTestModeActive])
 
   return (
     <Layout>
@@ -686,35 +844,36 @@ function HomePage() {
             <div className="ops-hero-copy">
               <p className="section-title">Affiliate Manager Pro</p>
               <h1 className="page-title">System Dashboard</h1>
-              <p className="page-subtitle">
-                Uebersichtlich nach Arbeitsfluss geordnet: Systemstatus, Telegram Login, aktive Quellen, Live Flow,
-                Queue, Sperren, letzte Deals, Fehler und Timeline. Internet bleibt Hauptlogik, Keepa bleibt Fallback,
-                KI bleibt optional und Telegram Reader sowie WhatsApp werden nur dann als live gezeigt, wenn echte
-                Sessions oder produktive Anbindungen vorhanden sind.
-              </p>
-            </div>
-
-            <div className="ops-hero-aside">
-              <div className="ops-hero-chip-row">
-                <span className="badge">Internet zuerst - Keepa nur Fallback - KI nur bei Unsicherheit</span>
-                <span className="badge">
-                  Reader {telegramReaderRuntime?.label || 'vorbereitet'} - WhatsApp {whatsappRuntime?.label || 'optional'}
-                </span>
-                <span className={`status-chip ${user?.role === 'admin' ? 'info' : 'success'}`}>
-                  {user?.role === 'admin' ? 'Admin Workspace' : 'Workspace View'}
-                </span>
-              </div>
-
-              <div className="ops-quick-links">
-                {workspaceCards.filter((item) => !item.adminOnly || user?.role === 'admin').map((item) => (
-                  <Link key={item.title} to={item.path} className="ops-quick-link">
-                    <span>{item.title}</span>
-                    <small>{item.description}</small>
-                  </Link>
-                ))}
-              </div>
+              <span className="ops-header-note">Letzter Check {formatDateTime(botOverview?.lastCheck)}</span>
             </div>
           </div>
+
+          <div className="ops-topbar" aria-label="Live Dashboard">
+            {topLiveCards.map((card) => (
+              <article key={card.title} className={`ops-status-card ops-tone-${card.tone}`}>
+                <div className="ops-card-head">
+                  <p className="section-title">{card.title}</p>
+                  <span className={`status-chip ${card.tone}`}>{card.tone}</span>
+                </div>
+                <h2>{card.value || 'Keine Daten'}</h2>
+                <p className="ops-card-copy">{card.detail || 'Keine Daten'}</p>
+              </article>
+            ))}
+          </div>
+
+          {readerTestModeActive && (
+            <div className="ops-inline-alert">
+              <span className="status-chip info">{'\u{1F9EA} Testmodus aktiv'}</span>
+              <p>
+                {'Seller Routing: '}
+                {'\u2705 Amazon Direkt -> Veröffentlicht | '}
+                {'\u2705 FBA -> Veröffentlicht | '}
+                {'\u{1F6AB} FBM -> Geblockt | '}
+                {'\u26A0\uFE0F UNKNOWN -> Geblockt/Prüfen. '}
+                {'Filter: Mindest-Rabatt: 0% | Mindest-Score: 0 | Fake-Schwelle: 100%'}
+              </p>
+            </div>
+          )}
 
           {status && (
             <div className="ops-inline-alert">

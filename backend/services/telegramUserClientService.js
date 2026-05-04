@@ -8,7 +8,12 @@ import QRCode from 'qrcode';
 import { getDb } from '../db.js';
 import { getReaderRuntimeConfig, getTelegramTestGroupConfig, getTelegramUserReaderConfig } from '../env.js';
 import { scrapeAmazonProduct } from '../routes/amazon.js';
-import { loadAmazonAffiliateContext } from './amazonAffiliateService.js';
+import {
+  enrichAmazonAffiliateProductsWithOfferData,
+  loadAmazonAffiliateVariations,
+  loadAmazonAffiliateContext,
+  searchAmazonAffiliateProducts
+} from './amazonAffiliateService.js';
 import { buildAmazonAffiliateLinkRecord, extractAsin, isAmazonShortLink, normalizeSellerType } from './dealHistoryService.js';
 import { upsertAppSession } from './databaseService.js';
 import { publishGeneratorPostDirect } from './directPublisher.js';
@@ -39,6 +44,116 @@ const TELEGRAM_POLL_INTERVAL_MS = 30 * 1000;
 const TELEGRAM_POLL_MESSAGE_LIMIT = 5;
 const TELEGRAM_DEBUG_SCAN_MESSAGE_LIMIT = 10;
 const DEBUG_QUEUE_ID_PLACEHOLDER = '__QUEUE_ID__';
+const OPTIMIZED_CHANNEL_ENABLED = process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1';
+const OPTIMIZED_CHANNEL_ID = cleanText(process.env.TELEGRAM_OPTIMIZED_CHANNEL_ID);
+const OPTIMIZED_CHANNEL_USERNAME = normalizeConfiguredChannelRef(process.env.TELEGRAM_OPTIMIZED_CHANNEL_USERNAME);
+const SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT = process.env.SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT === '1';
+const optimizedChannelCache = {
+  chatId: OPTIMIZED_CHANNEL_ID,
+  resolvedFromUsername: false,
+  resolveAttempted: false,
+  error: '',
+  lastSkipReason: '',
+  lastTestAt: '',
+  lastTestStatus: '',
+  lastTestMessageId: null,
+  lastOptimizedDeal: null,
+  lastOriginalSourceGroup: '',
+  lastComparisonPrice: ''
+};
+const SIMILAR_PRODUCT_QUERY_STOPWORDS = new Set([
+  'amazon',
+  'deal',
+  'angebot',
+  'angebote',
+  'coupon',
+  'gutschein',
+  'rabatt',
+  'sparabo',
+  'anzeige',
+  'partnerlink',
+  'preis',
+  'statt',
+  'nur',
+  'heute',
+  'top',
+  'mega',
+  'hot',
+  'sale',
+  'prime'
+]);
+const SIMILAR_PRODUCT_MIN_SCORE = 70;
+const SIMILAR_PRODUCT_TEST_MIN_SCORE = 60;
+const SIMILAR_PRODUCT_TEST_SOFT_MIN_SCORE = 50;
+const PRODUCT_INTELLIGENCE_CATEGORIES = [
+  {
+    category: 'Powerbank',
+    keywords: ['powerbank', 'power bank', 'mah'],
+    attributes: ['mAh', 'Watt', 'USB-C', 'PD', 'Schnellladen']
+  },
+  {
+    category: 'Kopfhoerer',
+    keywords: ['kopfhoerer', 'kopfhörer', 'earbuds', 'in ear', 'bluetooth', 'anc', 'noise cancelling'],
+    attributes: ['ANC', 'Bluetooth', 'In Ear']
+  },
+  { category: 'USB-C Hub', keywords: ['usb-c hub', 'usb c hub', 'hub docking'], attributes: ['USB-C', 'HDMI', 'PD'] },
+  { category: 'Ladegeraet', keywords: ['ladegeraet', 'ladegerät', 'charger', 'netzteil'], attributes: ['Watt', 'USB-C', 'PD'] },
+  { category: 'Kabel', keywords: ['kabel', 'usb-c kabel', 'ladekabel'], attributes: ['USB-C', 'Laenge', 'Watt'] },
+  { category: 'Smartwatch', keywords: ['smartwatch', 'fitness tracker', 'uhr'], attributes: ['Groesse', 'GPS', 'Bluetooth'] },
+  { category: 'Staubsauger', keywords: ['staubsauger', 'akkusauger', 'saugroboter'], attributes: ['Watt', 'Akku', 'Zubehoer'] },
+  { category: 'Kuechenzubehoer', keywords: ['kueche', 'küche', 'pfanne', 'messer', 'air fryer'], attributes: ['Groesse', 'Material'] },
+  { category: 'Kleidung', keywords: ['shirt', 'hose', 'jacke', 'kleid', 'sneaker'], attributes: ['Groesse', 'Farbe'] }
+];
+
+console.info('[OPTIMIZED_CHANNEL_CONFIG_LOADED]', {
+  enabled: process.env.OPTIMIZED_DEALS_ENABLED === '1' && process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1',
+  optimizedDealsEnabled: process.env.OPTIMIZED_DEALS_ENABLED === '1',
+  telegramChannelEnabled: process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1',
+  chatIdConfigured: Boolean(OPTIMIZED_CHANNEL_ID),
+  usernameConfigured: Boolean(OPTIMIZED_CHANNEL_USERNAME),
+  ready:
+    process.env.OPTIMIZED_DEALS_ENABLED === '1' &&
+    process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1' &&
+    Boolean(OPTIMIZED_CHANNEL_ID || OPTIMIZED_CHANNEL_USERNAME)
+});
+console.info('[OPTIMIZED_CHANNEL_ENV_LOADED]', {
+  enabled: process.env.OPTIMIZED_DEALS_ENABLED === '1' && process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1',
+  optimizedDealsEnabled: process.env.OPTIMIZED_DEALS_ENABLED === '1',
+  telegramChannelEnabled: process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1',
+  channelIdConfigured: Boolean(OPTIMIZED_CHANNEL_ID),
+  usernameConfigured: Boolean(OPTIMIZED_CHANNEL_USERNAME),
+  finalTarget: OPTIMIZED_CHANNEL_ID || OPTIMIZED_CHANNEL_USERNAME || ''
+});
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS product_intelligence_baselines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category TEXT NOT NULL,
+      attributeKey TEXT NOT NULL,
+      brand TEXT,
+      title TEXT,
+      asin TEXT,
+      price REAL,
+      sellerClass TEXT,
+      similarityScore REAL,
+      source TEXT,
+      firstSeenAt TEXT NOT NULL,
+      lastSeenAt TEXT NOT NULL,
+      timesSeen INTEGER NOT NULL DEFAULT 1,
+      isMasterBaseline INTEGER NOT NULL DEFAULT 0,
+      ignoredAsPriceError INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_product_intelligence_baselines_lookup
+      ON product_intelligence_baselines (category, attributeKey, brand, isMasterBaseline);
+    CREATE INDEX IF NOT EXISTS idx_product_intelligence_baselines_seen
+      ON product_intelligence_baselines (lastSeenAt DESC);
+  `);
+} catch (error) {
+  console.warn('[PRODUCT_INTELLIGENCE_STORAGE_INIT_FAILED]', {
+    error: error instanceof Error ? error.message : 'product_intelligence_baselines konnte nicht initialisiert werden.'
+  });
+}
 const AMAZON_SEARCH_FETCH_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -688,6 +803,250 @@ function normalizeChannelMatchKey(value = '') {
 
   const parsed = Number(normalizedRef);
   return Number.isFinite(parsed) ? String(parsed) : normalizedRef.toLowerCase();
+}
+
+function getOptimizedChannelEnvSnapshot() {
+  const optimizedDealsEnabled = process.env.OPTIMIZED_DEALS_ENABLED === '1';
+  const telegramChannelEnabled = process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1';
+
+  return {
+    enabled: optimizedDealsEnabled && telegramChannelEnabled,
+    optimizedDealsEnabled,
+    telegramChannelEnabled,
+    channelIdConfigured: Boolean(OPTIMIZED_CHANNEL_ID),
+    usernameConfigured: Boolean(OPTIMIZED_CHANNEL_USERNAME),
+    configuredChatId: OPTIMIZED_CHANNEL_ID,
+    configuredUsername: OPTIMIZED_CHANNEL_USERNAME,
+    finalTarget: OPTIMIZED_CHANNEL_ID || OPTIMIZED_CHANNEL_USERNAME || '',
+    resolvedChatId: optimizedChannelCache.chatId || '',
+    resolvedFromUsername: optimizedChannelCache.resolvedFromUsername === true,
+    lastSkipReason: optimizedChannelCache.lastSkipReason || '',
+    lastTestAt: optimizedChannelCache.lastTestAt || '',
+    lastTestStatus: optimizedChannelCache.lastTestStatus || '',
+    lastTestMessageId: optimizedChannelCache.lastTestMessageId || null,
+    lastOptimizedDeal: optimizedChannelCache.lastOptimizedDeal || null,
+    lastOriginalSourceGroup: optimizedChannelCache.lastOriginalSourceGroup || '',
+    lastComparisonPrice: optimizedChannelCache.lastComparisonPrice || '',
+    error: optimizedChannelCache.error || ''
+  };
+}
+
+function getOptimizedDealsDisabledReason() {
+  if (process.env.OPTIMIZED_DEALS_ENABLED !== '1') {
+    return 'optimized_deals_disabled';
+  }
+
+  if (process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED !== '1') {
+    return 'optimized_channel_disabled';
+  }
+
+  return '';
+}
+
+function logOptimizedDealsDisabledSendBlocked(extra = {}) {
+  const reason = getOptimizedDealsDisabledReason() || 'optimized_deals_disabled';
+  optimizedChannelCache.lastSkipReason = reason;
+  console.info('[OPTIMIZED_DEALS_DISABLED_SEND_BLOCKED]', {
+    reason,
+    optimizedDealsEnabled: process.env.OPTIMIZED_DEALS_ENABLED === '1',
+    telegramOptimizedChannelEnabled: process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1',
+    ...extra
+  });
+  return reason;
+}
+
+function logOptimizedDealsDisabledCheckSkipped(extra = {}) {
+  const reason = getOptimizedDealsDisabledReason() || 'optimized_deals_disabled';
+  optimizedChannelCache.lastSkipReason = reason;
+  console.info('[OPTIMIZED_DEALS_DISABLED_CHECK_SKIPPED]', {
+    reason,
+    optimizedDealsEnabled: process.env.OPTIMIZED_DEALS_ENABLED === '1',
+    telegramOptimizedChannelEnabled: process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1',
+    ...extra
+  });
+  return reason;
+}
+
+async function resolveOptimizedDealsChannelId() {
+  const disabledReason = getOptimizedDealsDisabledReason();
+  if (disabledReason) {
+    optimizedChannelCache.lastSkipReason = disabledReason;
+    return '';
+  }
+
+  if (OPTIMIZED_CHANNEL_ID) {
+    optimizedChannelCache.chatId = OPTIMIZED_CHANNEL_ID;
+    optimizedChannelCache.error = '';
+    optimizedChannelCache.lastSkipReason = '';
+    return OPTIMIZED_CHANNEL_ID;
+  }
+
+  if (optimizedChannelCache.chatId) {
+    return optimizedChannelCache.chatId;
+  }
+
+  if (!OPTIMIZED_CHANNEL_USERNAME) {
+    optimizedChannelCache.lastSkipReason = 'optimized_channel_missing_target';
+    return '';
+  }
+
+  if (optimizedChannelCache.resolveAttempted) {
+    return optimizedChannelCache.chatId || '';
+  }
+
+  optimizedChannelCache.resolveAttempted = true;
+
+  try {
+    const { token } = getTelegramTestGroupConfig();
+    if (!cleanText(token)) {
+      throw new Error('TELEGRAM_BOT_TOKEN fehlt.');
+    }
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${cleanText(token)}/getChat?chat_id=${encodeURIComponent(OPTIMIZED_CHANNEL_USERNAME)}`
+    );
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok || data?.ok !== true) {
+      throw new Error(data?.description || `Telegram getChat fehlgeschlagen (${response.status}).`);
+    }
+
+    const chatId = data?.result?.id === undefined || data?.result?.id === null ? '' : String(data.result.id);
+    if (!chatId) {
+      throw new Error('Telegram getChat hat keine chat.id geliefert.');
+    }
+
+    optimizedChannelCache.chatId = chatId;
+    optimizedChannelCache.resolvedFromUsername = true;
+    optimizedChannelCache.error = '';
+    optimizedChannelCache.lastSkipReason = '';
+    console.info('[OPTIMIZED_CHANNEL_CONFIG_LOADED]', {
+      enabled: OPTIMIZED_CHANNEL_ENABLED,
+      username: OPTIMIZED_CHANNEL_USERNAME,
+      chatId,
+      resolvedFromUsername: true
+    });
+    return chatId;
+  } catch (error) {
+    optimizedChannelCache.error = error instanceof Error ? error.message : 'Optimized Channel konnte nicht aufgeloest werden.';
+    optimizedChannelCache.lastSkipReason = 'optimized_channel_missing_target';
+    console.warn('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      reason: 'optimized_channel_missing_target',
+      username: OPTIMIZED_CHANNEL_USERNAME,
+      error: optimizedChannelCache.error
+    });
+    return '';
+  }
+}
+
+export async function getOptimizedDealsChannelStatus({ resolve = false } = {}) {
+  if (resolve === true) {
+    await resolveOptimizedDealsChannelId();
+  }
+
+  return getOptimizedChannelEnvSnapshot();
+}
+
+export async function sendOptimizedDealsChannelTestMessage() {
+  const envSnapshot = getOptimizedChannelEnvSnapshot();
+  console.info('[OPTIMIZED_CHANNEL_TEST_SEND_START]', envSnapshot);
+
+  const disabledReason = getOptimizedDealsDisabledReason();
+  if (disabledReason) {
+    logOptimizedDealsDisabledSendBlocked({
+      context: 'optimized_channel_test',
+      finalTarget: envSnapshot.finalTarget
+    });
+    optimizedChannelCache.lastTestAt = nowIso();
+    optimizedChannelCache.lastTestStatus = 'failed';
+    console.error('[OPTIMIZED_CHANNEL_TEST_SEND_FAILED]', {
+      reason: optimizedChannelCache.lastSkipReason,
+      finalTarget: envSnapshot.finalTarget
+    });
+    return {
+      success: false,
+      reason: optimizedChannelCache.lastSkipReason,
+      status: getOptimizedChannelEnvSnapshot()
+    };
+  }
+
+  if (!envSnapshot.finalTarget) {
+    optimizedChannelCache.lastSkipReason = 'optimized_channel_missing_target';
+    optimizedChannelCache.lastTestAt = nowIso();
+    optimizedChannelCache.lastTestStatus = 'failed';
+    console.error('[OPTIMIZED_CHANNEL_TEST_SEND_FAILED]', {
+      reason: optimizedChannelCache.lastSkipReason,
+      finalTarget: ''
+    });
+    return {
+      success: false,
+      reason: optimizedChannelCache.lastSkipReason,
+      status: getOptimizedChannelEnvSnapshot()
+    };
+  }
+
+  try {
+    const preSendDisabledReason = getOptimizedDealsDisabledReason();
+    if (preSendDisabledReason) {
+      throw new Error(logOptimizedDealsDisabledSendBlocked({
+        context: 'optimized_channel_test_presend',
+        finalTarget: envSnapshot.finalTarget
+      }));
+    }
+
+    const chatId = await resolveOptimizedDealsChannelId();
+    if (!chatId) {
+      throw new Error(optimizedChannelCache.lastSkipReason || 'optimized_channel_missing_target');
+    }
+
+    const finalSendDisabledReason = getOptimizedDealsDisabledReason();
+    if (finalSendDisabledReason) {
+      throw new Error(logOptimizedDealsDisabledSendBlocked({
+        context: 'optimized_channel_test_final_send',
+        finalTarget: chatId
+      }));
+    }
+
+    const result = await sendTelegramPost({
+      text: ['\u{1F9EA} Optimierte Deals Test', '\u2705 Verbindung funktioniert', '\u{1F4E6} Produkt-Intelligenz ist verbunden'].join('\n'),
+      chatId,
+      disableWebPagePreview: true,
+      titlePreview: 'Optimierte Deals Test',
+      postContext: 'product_intelligence_optimized_channel_test'
+    });
+
+    optimizedChannelCache.lastSkipReason = '';
+    optimizedChannelCache.lastTestAt = nowIso();
+    optimizedChannelCache.lastTestStatus = 'success';
+    optimizedChannelCache.lastTestMessageId = result?.messageId || null;
+    console.info('[OPTIMIZED_CHANNEL_TEST_SEND_SUCCESS]', {
+      chatId,
+      messageId: result?.messageId || null,
+      method: result?.method || ''
+    });
+
+    return {
+      success: true,
+      chatId,
+      messageId: result?.messageId || null,
+      method: result?.method || '',
+      status: getOptimizedChannelEnvSnapshot()
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'optimized_channel_test_failed';
+    optimizedChannelCache.lastSkipReason = reason;
+    optimizedChannelCache.lastTestAt = nowIso();
+    optimizedChannelCache.lastTestStatus = 'failed';
+    console.error('[OPTIMIZED_CHANNEL_TEST_SEND_FAILED]', {
+      reason,
+      finalTarget: envSnapshot.finalTarget
+    });
+    return {
+      success: false,
+      reason,
+      status: getOptimizedChannelEnvSnapshot()
+    };
+  }
 }
 
 function normalizeReaderImagePolicySourceKey(value = '') {
@@ -2463,6 +2822,38 @@ function computeAmazonProductMatchScore(sourceFacts = {}, candidate = {}) {
     score += 10;
   }
 
+  const sourceRoleInfo = extractProductRole(sourceFacts.titleCandidate || sourceFacts.title || '', []);
+  const candidateRoleInfo = extractProductRole(candidate.title, candidate.features || []);
+  const roleComparison = compareSimilarProductRoles({
+    originalRoleInfo: sourceRoleInfo,
+    candidateRoleInfo,
+    originalTitle: sourceFacts.titleCandidate || sourceFacts.title || '',
+    candidateTitle: candidate.title,
+    candidateAsin: candidate.asin
+  });
+  if (!roleComparison.allowed) {
+    return 0;
+  }
+
+  const sourceQuantityInfo = extractQuantityInfo(sourceFacts.titleCandidate || sourceFacts.title || '', [], {});
+  const candidateQuantityInfo = extractQuantityInfo(
+    candidate.title,
+    candidate.features || [],
+    candidate.rawItem?.ItemInfo || candidate.rawItem?.itemInfo || candidate.rawItem || candidate
+  );
+  const quantityComparison = compareSimilarQuantityInfo({
+    originalQuantityInfo: sourceQuantityInfo,
+    candidateQuantityInfo,
+    originalPrice: sourceFacts.priceValue,
+    candidatePrice: candidate.priceValue,
+    originalTitle: sourceFacts.titleCandidate || sourceFacts.title || '',
+    candidateTitle: candidate.title,
+    candidateAsin: candidate.asin
+  });
+  if (!quantityComparison.allowed) {
+    return 0;
+  }
+
   const variantCandidates = [cleanText(sourceFacts.colorCandidate), cleanText(sourceFacts.sizeCandidate), cleanText(sourceFacts.quantityCandidate)]
     .filter(Boolean)
     .map((value) => value.toLowerCase());
@@ -2674,6 +3065,3510 @@ async function fetchAmazonSearchCandidatesForQuery({
     blocked: false,
     blockedReason: ''
   };
+}
+
+function detectProductIntelligenceCategory(title = '') {
+  const normalized = cleanText(title).toLowerCase();
+  const matchedCategory = PRODUCT_INTELLIGENCE_CATEGORIES.find((entry) =>
+    entry.keywords.some((keyword) => normalized.includes(keyword.toLowerCase()))
+  );
+
+  return matchedCategory?.category || 'Unbekannt';
+}
+
+function extractProductIntelligenceAttributes(title = '') {
+  const text = cleanText(title);
+  const lower = text.toLowerCase();
+  const capacityMatch = text.match(/(\d{4,6})\s*m\s*a\s*h/i);
+  const wattMatch = text.match(/(\d{2,3})\s*w(?:att)?\b/i);
+  const colorMatch = text.match(/\b(schwarz|weiss|weiß|blau|rot|grau|silber|green|black|white|blue|red|grey|gray)\b/i);
+  const sizeMatch = text.match(/\b(xs|s|m|l|xl|xxl|\d{2,3}\s?cm|\d{1,2}\s?zoll)\b/i);
+
+  return {
+    capacityMah: capacityMatch ? `${capacityMatch[1]}mAh` : '',
+    watt: wattMatch ? `${wattMatch[1]}W` : '',
+    usbC: /\busb[\s-]?c\b/i.test(text),
+    pd: /\bpd\b|power\s*delivery/i.test(text),
+    fastCharging: /schnellladen|fast\s*charg/i.test(lower),
+    anc: /\banc\b|noise\s*cancell/i.test(lower),
+    color: colorMatch ? colorMatch[1] : '',
+    size: sizeMatch ? sizeMatch[1] : ''
+  };
+}
+
+function buildProductIntelligenceAttributeKey(category = '', attributes = {}) {
+  const parts = [];
+
+  if (attributes.capacityMah) {
+    parts.push(attributes.capacityMah);
+  }
+  if (attributes.watt) {
+    parts.push(attributes.watt);
+  }
+  if (attributes.usbC) {
+    parts.push('USBC');
+  }
+  if (attributes.pd) {
+    parts.push('PD');
+  }
+  if (attributes.anc) {
+    parts.push('ANC');
+  }
+  if (attributes.size) {
+    parts.push(cleanText(attributes.size).replace(/\s+/g, ''));
+  }
+  if (attributes.color) {
+    parts.push(cleanText(attributes.color).toUpperCase());
+  }
+
+  return parts.length ? parts.join('_') : cleanText(category || 'UNKNOWN').toUpperCase();
+}
+
+function buildProductIntelligenceSearchQuery(category = '', brand = '', attributes = {}, title = '') {
+  const parts = [];
+
+  if (category && category !== 'Unbekannt') {
+    parts.push(category === 'Kopfhoerer' ? 'bluetooth kopfhoerer' : category);
+  }
+  if (brand) {
+    parts.unshift(brand);
+  }
+  if (attributes.capacityMah) {
+    parts.push(attributes.capacityMah);
+  }
+  if (attributes.usbC) {
+    parts.push('usb c');
+  }
+  if (attributes.watt) {
+    parts.push(attributes.watt);
+  }
+  if (attributes.pd) {
+    parts.push('pd');
+  }
+  if (attributes.anc) {
+    parts.push('anc');
+  }
+
+  return sanitizeAmazonFallbackQueryLine(parts.join(' ') || title)
+    .replace(/%/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
+function buildProductIntelligenceProfile(generatorInput = {}, scrapedDeal = {}) {
+  const title = cleanText(generatorInput?.title || scrapedDeal?.productTitle || scrapedDeal?.title);
+  const asin = cleanText(generatorInput?.asin || scrapedDeal?.asin).toUpperCase();
+  const brand = cleanText(scrapedDeal?.brand || scrapedDeal?.paapiBrand || generatorInput?.brand || resolveSourceBrandCandidate(title));
+  const category = detectProductIntelligenceCategory(title);
+  const attributes = extractProductIntelligenceAttributes(title);
+  const attributeKey = buildProductIntelligenceAttributeKey(category, attributes);
+  const searchQuery = buildProductIntelligenceSearchQuery(category, brand, attributes, title);
+
+  console.info('[PRODUCT_INTELLIGENCE_START]', {
+    asin,
+    titlePreview: title.slice(0, 140)
+  });
+  console.info('[PRODUCT_CATEGORY_DETECTED]', {
+    asin,
+    category,
+    titlePreview: title.slice(0, 140)
+  });
+  console.info('[PRODUCT_ATTRIBUTES_EXTRACTED]', {
+    asin,
+    category,
+    attributeKey,
+    attributes
+  });
+  console.info('[SIMILAR_SEARCH_QUERY_BUILT]', {
+    asin,
+    category,
+    attributeKey,
+    query: searchQuery
+  });
+
+  return {
+    category,
+    brand,
+    title,
+    asin,
+    price: parseTelegramLocalizedNumber(generatorInput?.currentPrice || scrapedDeal?.price || scrapedDeal?.basePrice),
+    attributes,
+    attributeKey,
+    searchQuery
+  };
+}
+
+function getProductIntelligenceMaster(profile = {}) {
+  if (!profile.category || !profile.attributeKey) {
+    return null;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT *
+        FROM product_intelligence_baselines
+        WHERE category = ?
+          AND attributeKey = ?
+          AND COALESCE(brand, '') = COALESCE(?, '')
+          AND isMasterBaseline = 1
+          AND ignoredAsPriceError = 0
+        ORDER BY price ASC, lastSeenAt DESC
+        LIMIT 1
+      `
+    )
+    .get(profile.category, profile.attributeKey, cleanText(profile.brand));
+
+  if (row) {
+    console.info('[BASELINE_MASTER_FOUND]', {
+      category: row.category,
+      attributeKey: row.attributeKey,
+      brand: row.brand || '',
+      asin: row.asin || '',
+      price: row.price,
+      sellerClass: row.sellerClass,
+      similarityScore: row.similarityScore
+    });
+  }
+
+  return row || null;
+}
+
+function upsertProductIntelligenceBaseline({
+  profile = {},
+  candidate = {},
+  sellerClass = '',
+  similarityScore = 100,
+  source = '',
+  isMasterBaseline = false,
+  ignoredAsPriceError = false
+} = {}) {
+  const timestamp = nowIso();
+  const asin = cleanText(candidate.asin || profile.asin).toUpperCase();
+  const price = Number(candidate.price ?? profile.price);
+
+  if (!profile.category || !profile.attributeKey || !asin || !Number.isFinite(price)) {
+    return null;
+  }
+
+  const existing = db
+    .prepare(
+      `
+        SELECT *
+        FROM product_intelligence_baselines
+        WHERE category = ?
+          AND attributeKey = ?
+          AND COALESCE(brand, '') = COALESCE(?, '')
+          AND asin = ?
+        LIMIT 1
+      `
+    )
+    .get(profile.category, profile.attributeKey, cleanText(candidate.brand || profile.brand), asin);
+
+  if (isMasterBaseline) {
+    db.prepare(
+      `
+        UPDATE product_intelligence_baselines
+        SET isMasterBaseline = 0
+        WHERE category = ?
+          AND attributeKey = ?
+          AND COALESCE(brand, '') = COALESCE(?, '')
+      `
+    ).run(profile.category, profile.attributeKey, cleanText(candidate.brand || profile.brand));
+  }
+
+  if (existing) {
+    db.prepare(
+      `
+        UPDATE product_intelligence_baselines
+        SET title = @title,
+            price = @price,
+            sellerClass = @sellerClass,
+            similarityScore = @similarityScore,
+            source = @source,
+            lastSeenAt = @lastSeenAt,
+            timesSeen = timesSeen + 1,
+            isMasterBaseline = @isMasterBaseline,
+            ignoredAsPriceError = @ignoredAsPriceError
+        WHERE id = @id
+      `
+    ).run({
+      id: existing.id,
+      title: cleanText(candidate.title || profile.title),
+      price,
+      sellerClass,
+      similarityScore,
+      source,
+      lastSeenAt: timestamp,
+      isMasterBaseline: isMasterBaseline ? 1 : 0,
+      ignoredAsPriceError: ignoredAsPriceError ? 1 : 0
+    });
+    return db.prepare(`SELECT * FROM product_intelligence_baselines WHERE id = ?`).get(existing.id) || null;
+  }
+
+  const result = db.prepare(
+    `
+      INSERT INTO product_intelligence_baselines (
+        category,
+        attributeKey,
+        brand,
+        title,
+        asin,
+        price,
+        sellerClass,
+        similarityScore,
+        source,
+        firstSeenAt,
+        lastSeenAt,
+        timesSeen,
+        isMasterBaseline,
+        ignoredAsPriceError
+      ) VALUES (
+        @category,
+        @attributeKey,
+        @brand,
+        @title,
+        @asin,
+        @price,
+        @sellerClass,
+        @similarityScore,
+        @source,
+        @firstSeenAt,
+        @lastSeenAt,
+        1,
+        @isMasterBaseline,
+        @ignoredAsPriceError
+      )
+    `
+  ).run({
+    category: profile.category,
+    attributeKey: profile.attributeKey,
+    brand: cleanText(candidate.brand || profile.brand),
+    title: cleanText(candidate.title || profile.title),
+    asin,
+    price,
+    sellerClass,
+    similarityScore,
+    source,
+    firstSeenAt: timestamp,
+    lastSeenAt: timestamp,
+    isMasterBaseline: isMasterBaseline ? 1 : 0,
+    ignoredAsPriceError: ignoredAsPriceError ? 1 : 0
+  });
+
+  return db.prepare(`SELECT * FROM product_intelligence_baselines WHERE id = ?`).get(result.lastInsertRowid) || null;
+}
+
+function maybeStoreProductIntelligenceMaster({
+  profile = {},
+  candidate = {},
+  sellerClass = '',
+  similarityScore = 100,
+  source = ''
+} = {}) {
+  const normalizedSellerClass = normalizeSimilarSellerClass(sellerClass);
+  const price = Number(candidate.price ?? profile.price);
+
+  if (similarityScore < 70 || !['FBA', 'AMAZON_DIRECT'].includes(normalizedSellerClass) || !Number.isFinite(price)) {
+    return {
+      stored: false,
+      priceErrorProtected: false,
+      master: getProductIntelligenceMaster(profile),
+      reason: 'Master-Regel nicht erfuellt.'
+    };
+  }
+
+  const currentMaster = getProductIntelligenceMaster(profile);
+  const priceErrorProtected =
+    currentMaster?.price && Number(currentMaster.price) > 0 && price <= Number(currentMaster.price) * 0.5;
+
+  if (priceErrorProtected) {
+    const protectedRow = upsertProductIntelligenceBaseline({
+      profile,
+      candidate,
+      sellerClass: normalizedSellerClass,
+      similarityScore,
+      source,
+      isMasterBaseline: false,
+      ignoredAsPriceError: true
+    });
+    console.info('[BASELINE_PRICE_ERROR_PROTECTED]', {
+      category: profile.category,
+      attributeKey: profile.attributeKey,
+      asin: candidate.asin || profile.asin,
+      price,
+      masterPrice: currentMaster.price,
+      ignoredAsPriceError: true
+    });
+    return {
+      stored: false,
+      priceErrorProtected: true,
+      master: currentMaster,
+      row: protectedRow,
+      reason: 'Preis liegt mindestens 50% unter Master und wurde als Preisfehler geschuetzt.'
+    };
+  }
+
+  const shouldCreateMaster = !currentMaster;
+  const shouldUpdateMaster = currentMaster && price < Number(currentMaster.price || Infinity);
+  const row = upsertProductIntelligenceBaseline({
+    profile,
+    candidate,
+    sellerClass: normalizedSellerClass,
+    similarityScore,
+    source,
+    isMasterBaseline: shouldCreateMaster || shouldUpdateMaster,
+    ignoredAsPriceError: false
+  });
+
+  if (shouldCreateMaster) {
+    console.info('[BASELINE_MASTER_CREATED]', {
+      category: profile.category,
+      attributeKey: profile.attributeKey,
+      asin: row?.asin || '',
+      price: row?.price ?? price,
+      sellerClass: normalizedSellerClass
+    });
+  } else if (shouldUpdateMaster) {
+    console.info('[BASELINE_MASTER_UPDATED]', {
+      category: profile.category,
+      attributeKey: profile.attributeKey,
+      previousAsin: currentMaster.asin || '',
+      previousPrice: currentMaster.price,
+      asin: row?.asin || '',
+      price: row?.price ?? price,
+      sellerClass: normalizedSellerClass
+    });
+  }
+
+  return {
+    stored: Boolean(row),
+    priceErrorProtected: false,
+    master: row || currentMaster,
+    row,
+    reason: shouldCreateMaster ? 'Erster Master gespeichert.' : shouldUpdateMaster ? 'Master aktualisiert.' : 'Fund gespeichert, Master bleibt bestehen.'
+  };
+}
+
+function normalizeSimilarSellerClass(value = '') {
+  const sellerClass = cleanText(value).toUpperCase();
+
+  if (sellerClass === 'FBA_THIRDPARTY') {
+    return 'FBA';
+  }
+
+  if (sellerClass === 'FBM_THIRDPARTY') {
+    return 'FBM';
+  }
+
+  return sellerClass || 'UNKNOWN';
+}
+
+function isSimilarProductTestModeActive() {
+  const runtimeConfig = getReaderRuntimeConfig();
+  return runtimeConfig.readerTestMode === true || process.env.READER_TEST_MODE === '1';
+}
+
+function resolveSimilarProductEligibility(generatorInput = {}, generatorContext = {}) {
+  const sellerClass = normalizeSimilarSellerClass(
+    generatorInput.sellerClass ||
+      generatorContext?.seller?.sellerClass ||
+      generatorContext?.decisionPolicy?.seller?.sellerClass ||
+      generatorInput.sellerType
+  );
+  const optimizedTestModeRelaxed = isSimilarProductTestModeActive();
+
+  if (sellerClass === 'FBA') {
+    if (optimizedTestModeRelaxed) {
+      console.info('[OPTIMIZED_TEST_MODE_RELAXED]', {
+        sellerClass,
+        allowed: true,
+        reason: 'READER_TEST_MODE erlaubt Optimierte Deals fuer alle Nicht-FBM Seller.'
+      });
+    }
+    return {
+      allowed: true,
+      checked: true,
+      sellerClass,
+      reason: 'FBA Deal: Similar Product Check aktiv.',
+      fbmExcluded: false
+    };
+  }
+
+  if (sellerClass === 'FBM' || sellerClass.includes('FBM')) {
+    console.info('[OPTIMIZED_SKIP_FBM]', {
+      sellerClass: 'FBM',
+      allowed: false,
+      reason: 'FBM bleibt fuer Optimierte Deals komplett blockiert.'
+    });
+    return {
+      allowed: false,
+      checked: optimizedTestModeRelaxed,
+      sellerClass: 'FBM',
+      reason: 'FBM bleibt fuer Optimierte Deals komplett blockiert.',
+      fbmExcluded: true
+    };
+  }
+
+  if (optimizedTestModeRelaxed) {
+    const normalizedSellerClass = sellerClass || 'UNKNOWN';
+    console.info('[OPTIMIZED_TEST_MODE_RELAXED]', {
+      sellerClass: normalizedSellerClass,
+      allowed: true,
+      reason: 'READER_TEST_MODE erlaubt Optimierte Deals fuer alle Nicht-FBM Seller.'
+    });
+    if (normalizedSellerClass === 'UNKNOWN') {
+      console.info('[OPTIMIZED_ALLOW_UNKNOWN]', {
+        sellerClass: normalizedSellerClass,
+        allowed: true
+      });
+    }
+    if (normalizedSellerClass === 'FBA_OR_AMAZON_UNKNOWN') {
+      console.info('[OPTIMIZED_ALLOW_FBA_UNKNOWN]', {
+        sellerClass: normalizedSellerClass,
+        allowed: true
+      });
+    }
+    return {
+      allowed: true,
+      checked: true,
+      sellerClass: normalizedSellerClass,
+      reason: 'READER_TEST_MODE: Nicht-FBM Seller fuer Optimierte Deals erlaubt.',
+      fbmExcluded: false
+    };
+  }
+
+  if (sellerClass === 'AMAZON_DIRECT') {
+    return {
+      allowed: SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT === true,
+      checked: SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT === true,
+      sellerClass,
+      reason: SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT
+        ? 'Amazon Direct per SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT aktiviert.'
+        : 'Amazon Direct fuer Optimierte Deals vorbereitet, aktuell deaktiviert.',
+      fbmExcluded: false
+    };
+  }
+
+  return {
+    allowed: false,
+    checked: false,
+    sellerClass: sellerClass || 'UNKNOWN',
+    reason: 'SellerClass ist nicht FBA.',
+    fbmExcluded: false
+  };
+}
+
+function buildSimilarProductSearchQuery(generatorInput = {}, scrapedDeal = {}) {
+  const title = cleanText(generatorInput?.title || scrapedDeal?.productTitle || scrapedDeal?.title);
+  const brand = cleanText(scrapedDeal?.brand || scrapedDeal?.paapiBrand || generatorInput?.brand || resolveSourceBrandCandidate(title));
+  const cleanedTitle = sanitizeAmazonFallbackQueryLine(title);
+  const tokens = tokenizeMatchText(cleanedTitle)
+    .filter((token) => token.length >= 3)
+    .filter((token) => !SIMILAR_PRODUCT_QUERY_STOPWORDS.has(token.toLowerCase()))
+    .filter((token) => !/^\d{1,3}$/.test(token))
+    .slice(0, 9);
+  const queryParts = [];
+
+  if (brand) {
+    queryParts.push(brand);
+  }
+
+  for (const token of tokens) {
+    if (!queryParts.some((part) => part.toLowerCase() === token.toLowerCase())) {
+      queryParts.push(token);
+    }
+  }
+
+  return queryParts.join(' ').replace(/%/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+}
+
+function buildSimilarProductShortSearchQuery(generatorInput = {}, scrapedDeal = {}, productIntelligenceProfile = {}) {
+  const title = cleanText(generatorInput?.title || scrapedDeal?.productTitle || scrapedDeal?.title);
+  const lower = title.toLowerCase();
+  const attributes = productIntelligenceProfile?.attributes || extractProductIntelligenceAttributes(title);
+  const category = cleanText(productIntelligenceProfile?.category);
+  const parts = [];
+
+  if (/\b(kratzbaum|katzenbaum|cat\s*tree)\b/i.test(title)) {
+    parts.push('Katzenbaum');
+    const heightMatch = title.match(/(\d{2,3})\s*cm/i);
+    const height = heightMatch ? Number(heightMatch[1]) : 0;
+    if (height >= 180 || /\bxxl\b/i.test(title)) {
+      parts.push('XXL');
+    }
+  } else if (category === 'Powerbank' || /\bpower\s*bank|powerbank\b/i.test(title)) {
+    parts.push('Powerbank');
+    if (attributes.capacityMah) {
+      parts.push(attributes.capacityMah);
+    }
+    if (attributes.usbC) {
+      parts.push('USB C');
+    }
+    if (attributes.watt) {
+      parts.push(attributes.watt);
+    }
+  } else if (category === 'Kopfhoerer' || /\b(kopfhoerer|kopfhörer|earbuds|bluetooth|anc)\b/i.test(lower)) {
+    parts.push('Bluetooth Kopfhoerer');
+    if (attributes.anc) {
+      parts.push('ANC');
+    }
+    if (/\b(in\s*ear|inear|earbuds)\b/i.test(lower)) {
+      parts.push('in ear');
+    }
+  } else if (category && category !== 'Unbekannt') {
+    parts.push(category);
+    if (attributes.watt) {
+      parts.push(attributes.watt);
+    }
+    if (attributes.size) {
+      parts.push(attributes.size);
+    }
+  }
+
+  if (!parts.length) {
+    parts.push(...resolveSimilarProductTypeTokens(title).slice(0, 4));
+    parts.push(...resolveSimilarCoreFeatureTokens(title, scrapedDeal?.bulletPoints || scrapedDeal?.features || []).slice(0, 3));
+  }
+
+  return parts
+    .filter(Boolean)
+    .join(' ')
+    .replace(/%/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100);
+}
+
+function buildSimilarProductSearchQueries({
+  exactQuery = '',
+  shortQuery = '',
+  testMode = false
+} = {}) {
+  const queries = [];
+  const entries =
+    testMode && cleanText(shortQuery)
+      ? [{ type: 'short', query: shortQuery }]
+      : [{ type: 'exact', query: exactQuery }];
+
+  for (const entry of entries) {
+    if (!entry) {
+      continue;
+    }
+
+    const normalizedQuery = cleanText(entry.query).replace(/\s+/g, ' ').trim();
+    if (!normalizedQuery) {
+      continue;
+    }
+
+    if (!queries.some((item) => item.query.toLowerCase() === normalizedQuery.toLowerCase())) {
+      queries.push({
+        ...entry,
+        query: normalizedQuery
+      });
+    }
+  }
+
+  return queries;
+}
+
+function resolveSimilarProductTypeTokens(title = '') {
+  return tokenizeMatchText(title)
+    .filter((token) => token.length >= 4)
+    .filter((token) => !SIMILAR_PRODUCT_QUERY_STOPWORDS.has(token.toLowerCase()))
+    .filter((token) => !/^\d+$/.test(token))
+    .slice(0, 10);
+}
+
+function resolveSimilarCoreFeatureTokens(title = '', features = []) {
+  const sourceText = [title, ...(Array.isArray(features) ? features : [])].join(' ');
+  return tokenizeMatchText(sourceText)
+    .filter((token) => /(?:\d|mah|wh|watt|gb|tb|hz|zoll|usb|type|typ|xl|pro|max|mini)/i.test(token))
+    .filter((token) => token.length >= 2)
+    .slice(0, 12);
+}
+
+function parseSimilarQuantityNumber(value = '') {
+  const parsed = Number.parseFloat(cleanText(value).replace(',', '.'));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeSimilarQuantityUnit(unit = '') {
+  const normalized = cleanText(unit).toLowerCase();
+  if (normalized === 'kg') {
+    return { quantityUnit: 'g', multiplier: 1000, unitLabel: 'g' };
+  }
+  if (normalized === 'g') {
+    return { quantityUnit: 'g', multiplier: 1, unitLabel: 'g' };
+  }
+  if (normalized === 'l') {
+    return { quantityUnit: 'ml', multiplier: 1000, unitLabel: 'ml' };
+  }
+  if (normalized === 'ml') {
+    return { quantityUnit: 'ml', multiplier: 1, unitLabel: 'ml' };
+  }
+  return { quantityUnit: 'stück', multiplier: 1, unitLabel: 'Stück' };
+}
+
+function formatSimilarQuantityTotal(total = null, unit = 'stück') {
+  const numericTotal = Number(total);
+  if (!Number.isFinite(numericTotal) || numericTotal <= 0) {
+    return '';
+  }
+
+  const rounded = Math.round(numericTotal * 100) / 100;
+  if (unit === 'g') {
+    return rounded >= 1000 && rounded % 1000 === 0 ? `${rounded / 1000} kg` : `${rounded} g`;
+  }
+  if (unit === 'ml') {
+    return rounded >= 1000 && rounded % 1000 === 0 ? `${rounded / 1000} l` : `${rounded} ml`;
+  }
+  return `${rounded} Stück`;
+}
+
+function buildSimilarQuantityInfo({ total = null, unit = 'stück', raw = '', source = '', multiplier = null, each = null } = {}) {
+  const quantityTotal = Number(total);
+  if (!Number.isFinite(quantityTotal) || quantityTotal <= 0) {
+    return null;
+  }
+
+  const quantityUnit = normalizeSimilarQuantityUnit(unit).quantityUnit;
+  let result = {
+    quantityTotal,
+    quantityUnit,
+    quantityLabel: formatSimilarQuantityTotal(quantityTotal, quantityUnit),
+    rawQuantity: cleanText(raw),
+    source: cleanText(source) || 'title',
+    multiplier: Number.isFinite(Number(multiplier)) ? Number(multiplier) : null,
+    each: Number.isFinite(Number(each)) ? Number(each) : null
+  };
+
+  console.info('[QUANTITY_EXTRACTED]', {
+    title: cleanText(source).slice(0, 180),
+    quantityTotal: result.quantityTotal,
+    quantityUnit: result.quantityUnit,
+    quantityLabel: result.quantityLabel,
+    rawQuantity: result.rawQuantity
+  });
+
+  return result;
+}
+
+function normalizeSimilarQuantitySource(title = '', features = [], itemInfo = {}) {
+  const featureText = Array.isArray(features) ? features.join(' ') : cleanText(features);
+  const itemInfoText = [
+    itemInfo?.Title?.DisplayValue,
+    itemInfo?.title?.displayValue,
+    itemInfo?.title,
+    ...(Array.isArray(itemInfo?.Features?.DisplayValues) ? itemInfo.Features.DisplayValues : []),
+    ...(Array.isArray(itemInfo?.features?.displayValues) ? itemInfo.features.displayValues : [])
+  ]
+    .map((value) => cleanText(value))
+    .filter(Boolean)
+    .join(' ');
+
+  return [title, featureText, itemInfoText]
+    .map((value) => cleanText(value))
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractQuantityInfo(title = '', features = [], itemInfo = {}) {
+  const source = normalizeSimilarQuantitySource(title, features, itemInfo);
+  if (!source) {
+    return null;
+  }
+
+  const patterns = [
+    {
+      type: 'multiMetric',
+      regex: /(\d+(?:[,.]\d+)?)\s*(?:x|×)\s*(\d+(?:[,.]\d+)?)\s*(kg|g|ml|l)\b/i
+    },
+    {
+      type: 'multiCount',
+      regex: /(\d+(?:[,.]\d+)?)\s*(?:x|×)\s*(\d+(?:[,.]\d+)?)\s*(?:er\b|stk\.?|stück|stueck|pcs?|karten?|rollen?|beutel|packs?|packungen?|sets?)\b/i
+    },
+    {
+      type: 'count',
+      regex: /(\d+(?:[,.]\d+)?)\s*er\s*(?:pack|packung|set|multipack|mehrfachpackung|vorratspack|karton|beutel|box|rollen?|stück|stueck|stk\.?|pcs?|karten?)\b/i
+    },
+    {
+      type: 'count',
+      regex: /(\d+(?:[,.]\d+)?)\s*(?:stück|stueck|stk\.?|pcs?|karten?|rollen?|beutel|packs?|packungen?|sets?)\b/i
+    },
+    {
+      type: 'countAfter',
+      regex: /(?:packung|pack|set|multipack|mehrfachpackung)\s*(?:mit|à|a)?\s*(\d+(?:[,.]\d+)?)\s*(?:stück|stueck|stk\.?|pcs?|karten?|rollen?)\b/i
+    },
+    {
+      type: 'count',
+      regex: /(\d+(?:[,.]\d+)?)\s*[- ]?\s*(?:teilig|tlg\.?|teile)\b/i
+    },
+    {
+      type: 'metric',
+      regex: /(\d+(?:[,.]\d+)?)\s*(kg|g|ml|l)\b/i
+    }
+  ];
+
+  for (const pattern of patterns) {
+    const match = source.match(pattern.regex);
+    if (!match) {
+      continue;
+    }
+
+    if (pattern.type === 'multiMetric') {
+      const multiplier = parseSimilarQuantityNumber(match[1]);
+      const each = parseSimilarQuantityNumber(match[2]);
+      const unit = normalizeSimilarQuantityUnit(match[3]);
+      if (multiplier && each) {
+        return buildSimilarQuantityInfo({
+          total: multiplier * each * unit.multiplier,
+          unit: unit.quantityUnit,
+          raw: match[0],
+          source,
+          multiplier,
+          each
+        });
+      }
+    }
+
+    if (pattern.type === 'multiCount') {
+      const multiplier = parseSimilarQuantityNumber(match[1]);
+      const each = parseSimilarQuantityNumber(match[2]);
+      if (multiplier && each) {
+        return buildSimilarQuantityInfo({
+          total: multiplier * each,
+          unit: 'stück',
+          raw: match[0],
+          source,
+          multiplier,
+          each
+        });
+      }
+    }
+
+    if (pattern.type === 'count' || pattern.type === 'countAfter') {
+      const total = parseSimilarQuantityNumber(match[1]);
+      if (total) {
+        return buildSimilarQuantityInfo({
+          total,
+          unit: 'stück',
+          raw: match[0],
+          source
+        });
+      }
+    }
+
+    if (pattern.type === 'metric') {
+      const total = parseSimilarQuantityNumber(match[1]);
+      const unit = normalizeSimilarQuantityUnit(match[2]);
+      if (total) {
+        return buildSimilarQuantityInfo({
+          total: total * unit.multiplier,
+          unit: unit.quantityUnit,
+          raw: match[0],
+          source
+        });
+      }
+    }
+  }
+
+  if (/\b(multipack|mehrfachpackung|vorratspack)\b/i.test(source)) {
+    console.info('[QUANTITY_EXTRACTED]', {
+      title: source.slice(0, 180),
+      quantityTotal: null,
+      quantityUnit: 'stück',
+      quantityLabel: 'Multipack ohne erkannte Anzahl',
+      rawQuantity: 'multipack'
+    });
+    return {
+      quantityTotal: null,
+      quantityUnit: 'stück',
+      quantityLabel: 'Multipack',
+      rawQuantity: 'multipack',
+      source
+    };
+  }
+
+  return null;
+}
+
+function hasComparableSimilarQuantity(quantityInfo = null) {
+  return Boolean(
+    quantityInfo &&
+      Number.isFinite(Number(quantityInfo.quantityTotal)) &&
+      Number(quantityInfo.quantityTotal) > 0 &&
+      cleanText(quantityInfo.quantityUnit)
+  );
+}
+
+function resolveSimilarUnitPrice(price = null, quantityInfo = null) {
+  const numericPrice = normalizeSimilarPositivePrice(price);
+  if (numericPrice === null || !hasComparableSimilarQuantity(quantityInfo)) {
+    return null;
+  }
+
+  const total = Number(quantityInfo.quantityTotal);
+  const baseAmount = quantityInfo.quantityUnit === 'g' || quantityInfo.quantityUnit === 'ml' ? 100 : 1;
+  return Math.round((numericPrice / total) * baseAmount * 10000) / 10000;
+}
+
+function formatSimilarUnitPrice(price = null, quantityInfo = null) {
+  const unitPrice = resolveSimilarUnitPrice(price, quantityInfo);
+  if (unitPrice === null) {
+    return '';
+  }
+
+  const label = quantityInfo.quantityUnit === 'g' ? '100 g' : quantityInfo.quantityUnit === 'ml' ? '100 ml' : 'Stück';
+  return `${formatPrice(unitPrice)} / ${label}`;
+}
+
+function compareSimilarQuantityInfo({
+  originalQuantityInfo = null,
+  candidateQuantityInfo = null,
+  originalPrice = null,
+  candidatePrice = null,
+  originalTitle = '',
+  candidateTitle = '',
+  candidateAsin = ''
+} = {}) {
+  const originalHasQuantity = hasComparableSimilarQuantity(originalQuantityInfo);
+  const candidateHasQuantity = hasComparableSimilarQuantity(candidateQuantityInfo);
+  const originalUnitPrice = formatSimilarUnitPrice(originalPrice, originalQuantityInfo);
+  const candidateUnitPrice = formatSimilarUnitPrice(candidatePrice, candidateQuantityInfo);
+
+  if (originalHasQuantity && candidateHasQuantity) {
+    console.info('[UNIT_PRICE_COMPARISON]', {
+      originalUnitPrice,
+      candidateUnitPrice,
+      originalQuantity: originalQuantityInfo.quantityLabel,
+      candidateQuantity: candidateQuantityInfo.quantityLabel,
+      originalQuantityTotal: originalQuantityInfo.quantityTotal,
+      candidateQuantityTotal: candidateQuantityInfo.quantityTotal,
+      quantityUnit: originalQuantityInfo.quantityUnit,
+      candidateAsin
+    });
+  }
+
+  const buildResult = (allowed, reason, extra = {}) => ({
+    allowed,
+    rejectReason: allowed ? '' : 'PACK_SIZE_MISMATCH',
+    reason,
+    originalQuantityLabel: originalQuantityInfo?.quantityLabel || '',
+    candidateQuantityLabel: candidateQuantityInfo?.quantityLabel || '',
+    originalUnitPrice,
+    candidateUnitPrice,
+    originalQuantityInfo,
+    candidateQuantityInfo,
+    ...extra
+  });
+
+  if (!originalHasQuantity && !candidateHasQuantity) {
+    return buildResult(true, 'Keine Mengenangaben erkannt, Mengencheck neutral.');
+  }
+
+  if (originalHasQuantity !== candidateHasQuantity) {
+    console.warn('[PACK_SIZE_MISMATCH]', {
+      original: originalQuantityInfo?.quantityLabel || 'fehlt',
+      candidate: candidateQuantityInfo?.quantityLabel || 'fehlt',
+      originalTitle: cleanText(originalTitle).slice(0, 140),
+      candidateTitle: cleanText(candidateTitle).slice(0, 140),
+      reason: 'Menge nur auf einer Seite erkannt.'
+    });
+    return buildResult(false, 'Andere oder fehlende Packgröße.');
+  }
+
+  if (originalQuantityInfo.quantityUnit !== candidateQuantityInfo.quantityUnit) {
+    console.warn('[PACK_SIZE_MISMATCH]', {
+      original: originalQuantityInfo.quantityLabel,
+      candidate: candidateQuantityInfo.quantityLabel,
+      originalUnit: originalQuantityInfo.quantityUnit,
+      candidateUnit: candidateQuantityInfo.quantityUnit,
+      reason: 'Unterschiedliche Mengeneinheit.'
+    });
+    return buildResult(false, 'Andere Mengeneinheit.');
+  }
+
+  const originalTotal = Number(originalQuantityInfo.quantityTotal);
+  const candidateTotal = Number(candidateQuantityInfo.quantityTotal);
+  const deviationPercent = originalTotal > 0 ? Math.abs(candidateTotal - originalTotal) / originalTotal : 1;
+
+  if (deviationPercent > 0.15) {
+    console.warn('[PACK_SIZE_MISMATCH]', {
+      original: originalQuantityInfo.quantityLabel,
+      candidate: candidateQuantityInfo.quantityLabel,
+      originalQuantityTotal: originalTotal,
+      candidateQuantityTotal: candidateTotal,
+      deviationPercent: Math.round(deviationPercent * 1000) / 10,
+      originalUnitPrice,
+      candidateUnitPrice,
+      reason: 'Packgröße weicht mehr als 15 Prozent ab.'
+    });
+    return buildResult(false, 'Andere Packgröße.', {
+      deviationPercent: Math.round(deviationPercent * 1000) / 10
+    });
+  }
+
+  return buildResult(true, 'Menge vergleichbar.', {
+    deviationPercent: Math.round(deviationPercent * 1000) / 10
+  });
+}
+
+function matchSimilarProductRolePattern(source = '', patterns = []) {
+  for (const entry of patterns) {
+    const match = source.match(entry.regex);
+    if (match) {
+      return {
+        term: match[0],
+        reason: entry.reason
+      };
+    }
+  }
+
+  return null;
+}
+
+function extractProductRole(title = '', features = []) {
+  const source = normalizeSimilarQuantitySource(title, features, {});
+  const lowerSource = source.toLowerCase();
+  const strongSetMatch = matchSimilarProductRolePattern(lowerSource, [
+    { regex: /\bkochgeschirr\s*[- ]?\s*set\b/i, reason: 'Kochgeschirr-Set erkannt.' },
+    { regex: /\btopf\s*[- ]?\s*set\b|\btopfset\b/i, reason: 'Topfset erkannt.' },
+    { regex: /\bpfannen\s*[- ]?\s*set\b|\bpfannenset\b/i, reason: 'Pfannenset erkannt.' },
+    { regex: /\b\d+\s*[- ]?\s*(?:teilig|tlg\.?|teile)\b/i, reason: 'Mehrteiliges Set erkannt.' },
+    { regex: /\bmehrteilig(?:es|er|e)?\b/i, reason: 'Mehrteiliges Produkt erkannt.' }
+  ]);
+  const sparePartMatch = matchSimilarProductRolePattern(lowerSource, [
+    { regex: /\bersatz\s*(?:teil|deckel|filter|griff)\b/i, reason: 'Ersatzteil erkannt.' },
+    { regex: /\bersatzteil\b|\bspare\s*part\b|\breplacement\b/i, reason: 'Ersatzteil erkannt.' }
+  ]);
+  const accessoryMatch = matchSimilarProductRolePattern(lowerSource, [
+    { regex: /\b(?:topfdeckel|pfannendeckel|schutzdeckel|ersatzdeckel)\b/i, reason: 'Deckel/Zubehoer erkannt.' },
+    { regex: /\bdeckel\b|\blid\b/i, reason: 'Deckel/Zubehoer erkannt.' },
+    { regex: /\bgriff\b|\bhalterung\b|\baufsatz\b/i, reason: 'Zubehoer erkannt.' },
+    { regex: /\bzubeh(?:oe|\u00f6)r\b|\bh(?:ue|\u00fc)lle\b|\btasche\b/i, reason: 'Zubehoer erkannt.' },
+    { regex: /\bladekabel\b|\bcharging\s*cable\b|\bcable\b/i, reason: 'Kabel/Zubehoer erkannt.' }
+  ]);
+  const consumableMatch = matchSimilarProductRolePattern(lowerSource, [
+    { regex: /\bersatzfilter\b|\bfilter\b|\bfilterset\b/i, reason: 'Verbrauchsmaterial/Filter erkannt.' }
+  ]);
+  const weakSetMatch = matchSimilarProductRolePattern(lowerSource, [
+    { regex: /\bset\b|\bbundle\b/i, reason: 'Set/Bundle erkannt.' }
+  ]);
+  let role = 'MAIN_PRODUCT';
+  let match = null;
+
+  if (strongSetMatch) {
+    role = 'SET_BUNDLE';
+    match = strongSetMatch;
+  } else if (sparePartMatch) {
+    role = 'SPARE_PART';
+    match = sparePartMatch;
+  } else if (accessoryMatch) {
+    role = 'ACCESSORY';
+    match = accessoryMatch;
+  } else if (consumableMatch) {
+    role = 'CONSUMABLE';
+    match = consumableMatch;
+  } else if (weakSetMatch) {
+    role = 'SET_BUNDLE';
+    match = weakSetMatch;
+  } else if (!source) {
+    role = 'UNKNOWN';
+  }
+
+  const result = {
+    role,
+    reason: match?.reason || (role === 'MAIN_PRODUCT' ? 'Normales Hauptprodukt.' : 'Produktrolle nicht erkannt.'),
+    matchedTerm: match?.term || '',
+    source
+  };
+
+  console.info('[PRODUCT_ROLE_EXTRACTED]', {
+    title: cleanText(title).slice(0, 180),
+    role: result.role,
+    matchedTerm: result.matchedTerm,
+    reason: result.reason
+  });
+
+  return result;
+}
+
+function isSimilarAccessoryLikeRole(role = '') {
+  return ['ACCESSORY', 'SPARE_PART', 'CONSUMABLE'].includes(cleanText(role).toUpperCase());
+}
+
+function formatSimilarProductRoleLabel(role = '') {
+  const normalizedRole = cleanText(role).toUpperCase();
+  if (normalizedRole === 'SET_BUNDLE') {
+    return 'Set/Bundle';
+  }
+  if (normalizedRole === 'ACCESSORY') {
+    return 'Zubehoer';
+  }
+  if (normalizedRole === 'SPARE_PART') {
+    return 'Ersatzteil';
+  }
+  if (normalizedRole === 'CONSUMABLE') {
+    return 'Verbrauchsmaterial';
+  }
+  if (normalizedRole === 'MAIN_PRODUCT') {
+    return 'Hauptprodukt';
+  }
+  return 'Unbekannt';
+}
+
+function compareSimilarProductRoles({
+  originalRoleInfo = null,
+  candidateRoleInfo = null,
+  originalTitle = '',
+  candidateTitle = '',
+  candidateAsin = ''
+} = {}) {
+  const originalRole = cleanText(originalRoleInfo?.role).toUpperCase() || 'UNKNOWN';
+  const candidateRole = cleanText(candidateRoleInfo?.role).toUpperCase() || 'UNKNOWN';
+  const buildResult = (allowed, reason) => ({
+    allowed,
+    rejectReason: allowed ? '' : 'PRODUCT_ROLE_MISMATCH',
+    reason,
+    originalRole,
+    candidateRole,
+    originalRoleLabel: formatSimilarProductRoleLabel(originalRole),
+    candidateRoleLabel: formatSimilarProductRoleLabel(candidateRole),
+    originalRoleInfo,
+    candidateRoleInfo
+  });
+  let result = buildResult(true, 'Produktrollen vergleichbar.');
+
+  if (originalRole === 'SET_BUNDLE' && candidateRole !== 'SET_BUNDLE') {
+    result = buildResult(
+      false,
+      isSimilarAccessoryLikeRole(candidateRole) ? 'Zubehoer statt Set.' : 'Kandidat ist kein vergleichbares Set.'
+    );
+  } else if (candidateRole === 'SET_BUNDLE' && originalRole !== 'SET_BUNDLE') {
+    result = buildResult(false, 'Set statt Hauptprodukt.');
+  } else if ((originalRole === 'MAIN_PRODUCT' || originalRole === 'UNKNOWN') && isSimilarAccessoryLikeRole(candidateRole)) {
+    result = buildResult(false, candidateRole === 'SPARE_PART' ? 'Ersatzteil statt Hauptprodukt.' : 'Zubehoer statt Hauptprodukt.');
+  } else if (isSimilarAccessoryLikeRole(originalRole) && candidateRole !== originalRole) {
+    result = buildResult(false, 'Andere Produktrolle.');
+  }
+
+  if (!result.allowed) {
+    console.warn('[PRODUCT_ROLE_MISMATCH]', {
+      original: result.originalRole,
+      candidate: result.candidateRole,
+      originalRoleLabel: result.originalRoleLabel,
+      candidateRoleLabel: result.candidateRoleLabel,
+      originalTitle: cleanText(originalTitle).slice(0, 140),
+      candidateTitle: cleanText(candidateTitle).slice(0, 140),
+      candidateAsin,
+      reason: result.reason
+    });
+  }
+
+  return result;
+}
+
+function isOptimizedVariationSellerAllowed(sellerClass = '', testMode = false) {
+  const normalizedSellerClass = normalizeSimilarSellerClass(sellerClass);
+  return (
+    normalizedSellerClass === 'AMAZON_DIRECT' ||
+    normalizedSellerClass === 'FBA' ||
+    (testMode === true && normalizedSellerClass === 'FBA_OR_AMAZON_UNKNOWN')
+  );
+}
+
+function resolveSimilarVariantLabel(variant = {}) {
+  const attributeLabel = Array.isArray(variant.variationAttributes)
+    ? variant.variationAttributes
+        .map((entry) => cleanText(entry?.value || entry?.Value || entry?.displayValue || entry?.DisplayValue))
+        .filter(Boolean)
+        .join(' / ')
+    : '';
+
+  return cleanText(variant.variationLabel) || attributeLabel || shortenSimilarText(variant.title, 70) || cleanText(variant.asin).toUpperCase();
+}
+
+function applyVariantToSimilarResult(result = {}, variantPayload = {}) {
+  const variant = variantPayload.variant || {};
+  const variantPrice = normalizeSimilarPositivePrice(variantPayload.variantPrice);
+  const originalPrice = normalizeSimilarPositivePrice(result.originalPriceValue);
+  const previousCandidatePrice = normalizeSimilarPositivePrice(result.optimizedPriceValue);
+
+  if (variantPrice === null || originalPrice === null || previousCandidatePrice === null) {
+    return result;
+  }
+
+  const linkRecord = buildAmazonAffiliateLinkRecord(variant.normalizedUrl || variant.detailPageUrl || variant.asin, {
+    asin: variant.asin
+  });
+  const totalDifferenceAmount = Math.max(0, originalPrice - variantPrice);
+  const totalDifferencePercent = originalPrice > 0 ? Math.round((totalDifferenceAmount / originalPrice) * 1000) / 10 : 0;
+  const variantExtraDifferenceAmount = Math.max(0, previousCandidatePrice - variantPrice);
+  const variantExtraDifferencePercent =
+    previousCandidatePrice > 0 ? Math.round((variantExtraDifferenceAmount / previousCandidatePrice) * 1000) / 10 : 0;
+
+  return {
+    ...result,
+    similarCheaperPrice: formatPrice(variantPrice),
+    similarCheaperPriceValue: variantPrice,
+    similarCheaperAsin: variant.asin,
+    similarCheaperTitle: cleanText(variant.title),
+    similarCheaperReason: variantPayload.reason || result.similarCheaperReason,
+    similarCheaperSellerClass: variantPayload.sellerDetection?.sellerClass || result.similarCheaperSellerClass,
+    similarCheaperShipping: variantPayload.sellerDetection?.shipping || result.similarCheaperShipping,
+    similarCheaperSellerSource: variantPayload.sellerDetection?.sellerSource || result.similarCheaperSellerSource,
+    similarCheaperMerchantName: variantPayload.sellerDetection?.merchantName || '',
+    similarCheaperIsAmazonFulfilled: variantPayload.sellerDetection?.isAmazonFulfilled === true,
+    similarCheaperIsPrimeEligible: variantPayload.sellerDetection?.isPrimeEligible === true,
+    similarCheaperRawSellerKeysFound: variantPayload.sellerDetection?.rawSellerKeysFound || [],
+    similarCheaperAmazonFulfilledLabel: variantPayload.sellerDetection?.amazonFulfilledLabel || '',
+    similarCheaperPrimeLabel: variantPayload.sellerDetection?.primeLabel || '',
+    similarCheaperScore: variantPayload.scoring?.score ?? result.similarCheaperScore,
+    optimizedTitle: cleanText(variant.title),
+    optimizedPrice: formatPrice(variantPrice),
+    optimizedPriceValue: variantPrice,
+    optimizedAsin: variant.asin,
+    optimizedAffiliateUrl: linkRecord.valid ? linkRecord.affiliateUrl : cleanText(variant.affiliateUrl),
+    optimizedImageUrl: resolveOptimizedCandidateImageUrl(variant) || result.optimizedImageUrl,
+    optimizedSellerClass: variantPayload.sellerDetection?.sellerClass || result.optimizedSellerClass,
+    optimizedSellerSource: variantPayload.sellerDetection?.sellerSource || result.optimizedSellerSource,
+    optimizedMerchantName: variantPayload.sellerDetection?.merchantName || '',
+    optimizedIsAmazonFulfilled: variantPayload.sellerDetection?.isAmazonFulfilled === true,
+    optimizedIsPrimeEligible: variantPayload.sellerDetection?.isPrimeEligible === true,
+    optimizedRawSellerKeysFound: variantPayload.sellerDetection?.rawSellerKeysFound || [],
+    similarityScore: variantPayload.scoring?.score ?? result.similarityScore,
+    alternativePrice: formatPrice(variantPrice),
+    alternativePriceValue: variantPrice,
+    alternativeScore: variantPayload.scoring?.score ?? result.alternativeScore,
+    alternativeShipping: variantPayload.sellerDetection?.shipping || result.alternativeShipping,
+    affiliateUrl: linkRecord.valid ? linkRecord.affiliateUrl : cleanText(variant.affiliateUrl),
+    amazonApiTitle: cleanText(variant.title),
+    amazonAsin: cleanText(variant.asin).toUpperCase(),
+    amazonMerchantName: variantPayload.sellerDetection?.merchantName || '',
+    amazonMerchantId: cleanText(variant.merchantId || variant.sellerId || ''),
+    amazonIsAmazonFulfilled: variantPayload.sellerDetection?.isAmazonFulfilled === true,
+    amazonIsPrimeEligible: variantPayload.sellerDetection?.isPrimeEligible === true,
+    amazonSellerClass: variantPayload.sellerDetection?.sellerClass || result.amazonSellerClass,
+    amazonSellerSource: variantPayload.sellerDetection?.sellerSource || result.amazonSellerSource,
+    differenceAmount: formatPrice(totalDifferenceAmount),
+    differencePercent: totalDifferencePercent,
+    originalProductRoleInfo: variantPayload.productRoleComparison?.originalRoleInfo || result.originalProductRoleInfo,
+    optimizedProductRoleInfo: variantPayload.productRoleComparison?.candidateRoleInfo || result.optimizedProductRoleInfo,
+    productRoleComparison: variantPayload.productRoleComparison || result.productRoleComparison,
+    productRoleComparable: variantPayload.productRoleComparison?.allowed === true,
+    originalProductRole: variantPayload.productRoleComparison?.originalRoleLabel || result.originalProductRole,
+    optimizedProductRole: variantPayload.productRoleComparison?.candidateRoleLabel || result.optimizedProductRole,
+    originalQuantityInfo: variantPayload.quantityComparison?.originalQuantityInfo || result.originalQuantityInfo,
+    optimizedQuantityInfo: variantPayload.quantityComparison?.candidateQuantityInfo || result.optimizedQuantityInfo,
+    quantityComparison: variantPayload.quantityComparison || result.quantityComparison,
+    quantityComparable: variantPayload.quantityComparison?.allowed === true,
+    originalQuantity: variantPayload.quantityComparison?.originalQuantityLabel || result.originalQuantity,
+    optimizedQuantity: variantPayload.quantityComparison?.candidateQuantityLabel || result.optimizedQuantity,
+    originalUnitPrice: variantPayload.quantityComparison?.originalUnitPrice || result.originalUnitPrice,
+    optimizedUnitPrice: variantPayload.quantityComparison?.candidateUnitPrice || result.optimizedUnitPrice,
+    rawPriceObject: resolveSimilarCandidateRawPriceObject(variant),
+    extractedPrice: variantPrice,
+    candidate: variant,
+    variantSelected: true,
+    variantLabel: variantPayload.label || resolveSimilarVariantLabel(variant),
+    previousCandidatePrice: formatPrice(previousCandidatePrice),
+    variantPrice: formatPrice(variantPrice),
+    variantDifferenceAmount: formatPrice(variantExtraDifferenceAmount),
+    variantDifferencePercent: variantExtraDifferencePercent,
+    variantSourceAsin: result.optimizedAsin || result.similarCheaperAsin || ''
+  };
+}
+
+async function findCheapestAllowedVariation({
+  finalCandidate = {},
+  originalProfile = {},
+  currentResult = {},
+  testMode = false,
+  sessionName = '',
+  sourceId = null,
+  messageId = ''
+} = {}) {
+  if ((process.env.SIMILAR_VARIANT_CHECK_ENABLED || '0') !== '1') {
+    return null;
+  }
+
+  const candidateAsin = cleanText(finalCandidate.asin || currentResult.optimizedAsin || currentResult.similarCheaperAsin).toUpperCase();
+  const currentPrice = normalizeSimilarPositivePrice(currentResult.optimizedPriceValue || finalCandidate.priceValue);
+  if (!candidateAsin || currentPrice === null) {
+    return null;
+  }
+
+  console.info('[VARIANT_SCAN_START]', {
+    sessionName,
+    sourceId,
+    messageId,
+    asin: candidateAsin,
+    currentPrice: formatPrice(currentPrice)
+  });
+
+  const variationResult = await loadAmazonAffiliateVariations({
+    asin: candidateAsin,
+    limit: Number.parseInt(process.env.SIMILAR_VARIANT_LIMIT || '10', 10) || 10
+  });
+
+  if (variationResult.status === 'throttled') {
+    console.info('[VARIANT_SCAN_DONE]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin,
+      status: 'throttled',
+      action: 'keep_original_candidate'
+    });
+    return null;
+  }
+
+  const variants = Array.isArray(variationResult.items) ? variationResult.items : [];
+  let bestVariantPayload = null;
+
+  for (const variant of variants) {
+    const variantAsin = cleanText(variant.asin).toUpperCase();
+    const variantPrice = resolveSimilarCandidatePrice(variant);
+    const variantPriceValid = Number.isFinite(variantPrice) && variantPrice > 0;
+    const sellerDetection = detectSimilarSellerClass(variant, { testMode });
+    const sellerAllowed = isOptimizedVariationSellerAllowed(sellerDetection.sellerClass, testMode);
+    const candidateRoleInfo = extractProductRole(variant.title, variant.features || []);
+    const productRoleComparison = compareSimilarProductRoles({
+      originalRoleInfo: originalProfile.productRoleInfo,
+      candidateRoleInfo,
+      originalTitle: originalProfile.title,
+      candidateTitle: variant.title,
+      candidateAsin: variantAsin
+    });
+    const candidateQuantityInfo = extractQuantityInfo(
+      variant.title,
+      variant.features || [],
+      variant.rawItem?.ItemInfo || variant.rawItem?.itemInfo || variant.rawItem || variant
+    );
+    const quantityComparison = compareSimilarQuantityInfo({
+      originalQuantityInfo: originalProfile.quantityInfo,
+      candidateQuantityInfo,
+      originalPrice: originalProfile.price,
+      candidatePrice: variantPrice,
+      originalTitle: originalProfile.title,
+      candidateTitle: variant.title,
+      candidateAsin: variantAsin
+    });
+    const scoring = scoreSimilarProductCandidate(originalProfile, variant, {
+      testMode,
+      sellerDetection
+    });
+    let rejectReason = '';
+
+    if (!variantPriceValid) {
+      rejectReason = 'PRICE_MISSING';
+    } else if (variantPrice >= currentPrice) {
+      rejectReason = 'PRICE_NOT_CHEAPER';
+    } else if (!sellerAllowed) {
+      rejectReason = sellerDetection.sellerClass === 'FBM' ? 'candidate_is_fbm' : 'SELLER_NOT_ALLOWED';
+    } else if (!productRoleComparison.allowed) {
+      rejectReason = 'PRODUCT_ROLE_MISMATCH';
+    } else if (!quantityComparison.allowed) {
+      rejectReason = 'PACK_SIZE_MISMATCH';
+    } else if (scoring.score < SIMILAR_PRODUCT_MIN_SCORE) {
+      rejectReason = 'SIMILARITY_TOO_LOW';
+    }
+
+    const allowed = !rejectReason;
+    const label = resolveSimilarVariantLabel(variant);
+    console.info('[VARIANT_CANDIDATE]', {
+      asin: variantAsin,
+      label,
+      price: variantPriceValid ? formatPrice(variantPrice) : null,
+      sellerClass: sellerDetection.sellerClass,
+      allowed,
+      rejectReason,
+      similarityScore: scoring.score,
+      productRole: productRoleComparison.candidateRoleLabel || '',
+      quantity: quantityComparison.candidateQuantityLabel || ''
+    });
+
+    if (!allowed) {
+      continue;
+    }
+
+    if (!bestVariantPayload || variantPrice < bestVariantPayload.variantPrice) {
+      bestVariantPayload = {
+        variant,
+        variantPrice,
+        label,
+        sellerDetection,
+        scoring,
+        productRoleComparison,
+        quantityComparison,
+        reason: `Guenstigste erlaubte Variante gewaehlt: ${label}`
+      };
+    }
+  }
+
+  if (bestVariantPayload && bestVariantPayload.variantPrice < currentPrice) {
+    console.info('[VARIANT_CHEAPER_FOUND]', {
+      oldPrice: formatPrice(currentPrice),
+      newPrice: formatPrice(bestVariantPayload.variantPrice),
+      label: bestVariantPayload.label,
+      asin: cleanText(bestVariantPayload.variant.asin).toUpperCase()
+    });
+    console.info('[VARIANT_SCAN_DONE]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin,
+      status: 'cheaper_found',
+      selectedAsin: cleanText(bestVariantPayload.variant.asin).toUpperCase(),
+      label: bestVariantPayload.label
+    });
+    return bestVariantPayload;
+  }
+
+  console.info('[VARIANT_SCAN_DONE]', {
+    sessionName,
+    sourceId,
+    messageId,
+    asin: candidateAsin,
+    status: 'no_cheaper_allowed_variant',
+    count: variants.length
+  });
+  return null;
+}
+
+function buildSimilarProductProfile(generatorInput = {}, scrapedDeal = {}) {
+  const title = cleanText(generatorInput?.title || scrapedDeal?.productTitle || scrapedDeal?.title);
+  const features = generatorInput?.features || generatorInput?.bulletPoints || scrapedDeal?.bulletPoints || scrapedDeal?.features || [];
+  return {
+    asin: cleanText(generatorInput?.asin || scrapedDeal?.asin).toUpperCase(),
+    title,
+    brand: cleanText(scrapedDeal?.brand || scrapedDeal?.paapiBrand || generatorInput?.brand || resolveSourceBrandCandidate(title)),
+    price: normalizeSimilarPositivePrice(generatorInput?.currentPrice || scrapedDeal?.price || scrapedDeal?.basePrice),
+    quantityInfo: extractQuantityInfo(title, features, generatorInput?.itemInfo || scrapedDeal?.itemInfo || {}),
+    productRoleInfo: extractProductRole(title, features),
+    productTypeTokens: resolveSimilarProductTypeTokens(title),
+    coreFeatureTokens: resolveSimilarCoreFeatureTokens(title, features)
+  };
+}
+
+function normalizeSimilarPositivePrice(value = null) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 0 ? value : null;
+  }
+
+  const parsed = parseTelegramLocalizedNumber(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function resolveFirstSimilarPositivePrice(...values) {
+  for (const value of values) {
+    const parsed = normalizeSimilarPositivePrice(value);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function resolveSimilarCandidateRawPriceObject(candidate = {}) {
+  const listing = resolveSimilarCandidateListing(candidate);
+  return (
+    candidate.rawPriceObject ||
+    listing?.Price ||
+    listing?.price ||
+    candidate.rawItem?.Price ||
+    candidate.rawItem?.price ||
+    {}
+  );
+}
+
+function resolveSimilarCandidatePrice(candidate = {}) {
+  const rawPriceObject = resolveSimilarCandidateRawPriceObject(candidate);
+  const priceCandidates = [
+    candidate.extractedPrice,
+    candidate.priceValue,
+    rawPriceObject?.Money?.Amount,
+    rawPriceObject?.money?.amount,
+    rawPriceObject?.Amount,
+    rawPriceObject?.amount,
+    candidate.rawItem?.OffersV2?.Listings?.[0]?.Price?.Money?.Amount,
+    candidate.rawItem?.OffersV2?.Listings?.[0]?.Price?.Amount,
+    candidate.rawItem?.Offers?.Listings?.[0]?.Price?.Amount,
+    candidate.rawItem?.offersV2?.listings?.[0]?.price?.money?.amount,
+    candidate.rawItem?.offersV2?.listings?.[0]?.price?.amount,
+    candidate.rawItem?.offers?.listings?.[0]?.price?.amount,
+    candidate.rawItem?.price?.amount,
+    candidate.rawItem?.Price?.Amount,
+    candidate.priceDisplay,
+    rawPriceObject?.DisplayAmount,
+    rawPriceObject?.displayAmount,
+    rawPriceObject?.Money?.DisplayAmount,
+    rawPriceObject?.money?.displayAmount
+  ];
+
+  return resolveFirstSimilarPositivePrice(...priceCandidates);
+}
+
+function resolveSimilarCandidateListing(candidate = {}) {
+  return (
+    candidate.rawItem?.OffersV2?.Listings?.[0] ||
+    candidate.rawItem?.offersV2?.listings?.[0] ||
+    candidate.rawItem?.Offers?.Listings?.[0] ||
+    candidate.rawItem?.offers?.listings?.[0] ||
+    null
+  );
+}
+
+function hasSimilarCandidateMerchantInfo(candidate = {}) {
+  const listing = resolveSimilarCandidateListing(candidate);
+  return Boolean(
+    listing?.MerchantInfo ||
+      listing?.merchantInfo ||
+      candidate.rawItem?.MerchantInfo ||
+      candidate.rawItem?.merchantInfo ||
+      cleanText(candidate.merchantName)
+  );
+}
+
+function hasSimilarCandidateDeliveryInfo(candidate = {}) {
+  const listing = resolveSimilarCandidateListing(candidate);
+  return Boolean(
+    listing?.DeliveryInfo ||
+      listing?.deliveryInfo ||
+      candidate.isAmazonFulfilled === true ||
+      candidate.isPrimeEligible === true
+  );
+}
+
+function resolveSimilarCandidateRawSellerKeys(candidate = {}) {
+  const listing = resolveSimilarCandidateListing(candidate);
+  const keys = Array.isArray(candidate.rawSellerKeysFound) ? [...candidate.rawSellerKeysFound] : [];
+  const addKey = (condition, key) => {
+    if (condition) {
+      keys.push(key);
+    }
+  };
+
+  addKey(Boolean(listing?.MerchantInfo || listing?.merchantInfo), 'Offers.Listings.MerchantInfo');
+  addKey(Boolean(listing?.MerchantInfo?.Name || listing?.merchantInfo?.name || candidate.merchantName), 'Offers.Listings.MerchantInfo.Name');
+  addKey(Boolean(listing?.DeliveryInfo || listing?.deliveryInfo), 'Offers.Listings.DeliveryInfo');
+  addKey(
+    listing?.DeliveryInfo?.IsAmazonFulfilled !== undefined || listing?.deliveryInfo?.isAmazonFulfilled !== undefined,
+    'Offers.Listings.DeliveryInfo.IsAmazonFulfilled'
+  );
+  addKey(
+    listing?.DeliveryInfo?.IsPrimeEligible !== undefined || listing?.deliveryInfo?.isPrimeEligible !== undefined,
+    'Offers.Listings.DeliveryInfo.IsPrimeEligible'
+  );
+  addKey(Boolean(listing?.Availability?.Message || listing?.availability?.message || candidate.availability), 'Offers.Listings.Availability.Message');
+
+  return [...new Set(keys.map((key) => cleanText(key)).filter(Boolean))];
+}
+
+function formatSimilarSellerDebugBoolean(value, rawSellerKeysFound = [], keyNeedle = '') {
+  if (value === true) {
+    return 'JA';
+  }
+
+  const keyKnown = rawSellerKeysFound.some((key) => cleanText(key).toLowerCase().includes(keyNeedle.toLowerCase()));
+  return keyKnown ? 'NEIN' : 'fehlt';
+}
+
+function detectSimilarSellerClass(candidate = {}, options = {}) {
+  const testMode = options.testMode === true;
+  const asin = cleanText(candidate.asin).toUpperCase();
+  const merchantName = cleanText(candidate.merchantName);
+  const merchantNameLower = merchantName.toLowerCase();
+  const availability = cleanText(candidate.availability).toLowerCase();
+  const rawSellerKeysFound = resolveSimilarCandidateRawSellerKeys(candidate);
+  const hasMerchantInfo = rawSellerKeysFound.some((key) => key.includes('MerchantInfo'));
+  const hasDeliveryInfo = rawSellerKeysFound.some((key) => key.includes('DeliveryInfo'));
+  const hasAmazonFulfilledKey = rawSellerKeysFound.some((key) => key.includes('IsAmazonFulfilled'));
+  const isAmazonFulfilled = candidate.isAmazonFulfilled === true;
+  const isPrimeEligible = candidate.isPrimeEligible === true;
+  const configuredSellerClass = normalizeSimilarSellerClass(candidate.sellerClass || candidate.sellerType);
+  const explicitFbmSignal =
+    configuredSellerClass === 'FBM' ||
+    configuredSellerClass.includes('FBM') ||
+    /\b(versand durch verkaeufer|versand durch verk\u00e4ufer|ships from seller|seller fulfilled)\b/i.test(availability);
+  const merchantIsAmazon = Boolean(merchantName && /amazon/i.test(merchantNameLower));
+  const merchantIsThirdParty = Boolean(merchantName && !merchantIsAmazon);
+  const merchantIndicatesFbm = merchantIsThirdParty && isAmazonFulfilled !== true;
+  let sellerClass = 'UNKNOWN';
+  let shipping = 'UNKNOWN';
+  let allowed = false;
+  let rejectReason = 'SELLER_UNKNOWN';
+  let sellerSource = 'Keine Seller Felder in API Response gefunden';
+
+  if (cleanText(candidate.offerApiStatus).toUpperCase() === 'THROTTLED' || cleanText(candidate.offerEnrichmentStatus) === 'api_throttled') {
+    return {
+      allowed: false,
+      sellerClass: 'API_THROTTLED',
+      shipping: 'UNKNOWN',
+      reason: 'Amazon API gedrosselt, Offer-Daten konnten nicht geladen werden.',
+      sellerSource: 'Amazon API gedrosselt, spaeter erneut pruefen.',
+      merchantName: '',
+      isAmazonFulfilled: false,
+      isPrimeEligible: false,
+      rawSellerKeysFound,
+      rawSellerKeysFoundText: rawSellerKeysFound.length ? rawSellerKeysFound.join(', ') : 'keine Seller-Felder wegen API_LIMIT',
+      rejectReason: 'API_THROTTLED',
+      amazonFulfilledLabel: 'fehlt',
+      primeLabel: 'fehlt',
+      oldSellerClassField: configuredSellerClass,
+      sellerDataMissing: true
+    };
+  }
+
+  if ((!rawSellerKeysFound.length || (!hasMerchantInfo && !hasDeliveryInfo)) && candidate.sellerDataMissing !== true) {
+    console.warn('[SELLER_DATA_MISSING]', {
+      asin,
+      api: candidate.dataSource || candidate.sourceLabel || 'paapi',
+      availableKeys: rawSellerKeysFound
+    });
+  }
+
+  if (explicitFbmSignal || merchantIndicatesFbm) {
+    sellerClass = 'FBM';
+    shipping = 'FBM';
+    allowed = false;
+    rejectReason = 'SELLER_NOT_ALLOWED';
+    sellerSource = explicitFbmSignal
+      ? 'Explizites FBM/Drittanbieter-Versand-Signal erkannt.'
+      : 'MerchantInfo.Name ist Drittanbieter und IsAmazonFulfilled ist nicht true.';
+  } else if (merchantIsAmazon) {
+    sellerClass = 'AMAZON_DIRECT';
+    shipping = 'Amazon';
+    allowed = true;
+    rejectReason = '';
+    sellerSource = 'MerchantInfo enthaelt Amazon.';
+  } else if (isAmazonFulfilled) {
+    sellerClass = 'FBA';
+    shipping = 'FBA';
+    allowed = true;
+    rejectReason = '';
+    sellerSource = 'DeliveryInfo.IsAmazonFulfilled=true.';
+  } else if (/\b(fulfilled by amazon|versand durch amazon|fba)\b/i.test(availability)) {
+    sellerClass = 'FBA';
+    shipping = 'FBA';
+    allowed = true;
+    rejectReason = '';
+    sellerSource = 'Availability enthaelt Versand durch Amazon/FBA.';
+  } else if (isPrimeEligible) {
+    sellerClass = 'FBA_OR_AMAZON_UNKNOWN';
+    shipping = 'Prime / Amazon unklar';
+    allowed = testMode;
+    rejectReason = testMode ? '' : 'SELLER_NOT_ALLOWED';
+    sellerSource = hasAmazonFulfilledKey
+      ? 'Prime=true, aber IsAmazonFulfilled ist nicht true.'
+      : 'Prime=true aber MerchantInfo fehlt und IsAmazonFulfilled fehlt.';
+  } else if (merchantIsThirdParty) {
+    sellerClass = 'UNKNOWN';
+    shipping = 'UNKNOWN';
+    allowed = false;
+    rejectReason = 'SELLER_UNKNOWN';
+    sellerSource = 'MerchantInfo vorhanden, aber kein Amazon-Fulfillment-Signal gefunden.';
+  }
+
+  return {
+    allowed,
+    sellerClass,
+    shipping,
+    reason: sellerSource,
+    sellerSource,
+    merchantName,
+    isAmazonFulfilled,
+    isPrimeEligible,
+    rawSellerKeysFound,
+    rawSellerKeysFoundText: rawSellerKeysFound.length ? rawSellerKeysFound.join(', ') : 'keine Seller-Felder',
+    rejectReason,
+    amazonFulfilledLabel: formatSimilarSellerDebugBoolean(isAmazonFulfilled, rawSellerKeysFound, 'IsAmazonFulfilled'),
+    primeLabel: formatSimilarSellerDebugBoolean(isPrimeEligible, rawSellerKeysFound, 'IsPrimeEligible'),
+    oldSellerClassField: configuredSellerClass,
+    sellerDataMissing: !rawSellerKeysFound.length || (!hasMerchantInfo && !hasDeliveryInfo)
+  };
+}
+
+function buildSimilarCandidateDebugRow({
+  candidate = {},
+  candidateAsin = '',
+  candidatePrice = null,
+  scoring = {},
+  cheaper = false,
+  rejectReason = '',
+  quantityComparison = {},
+  productRoleComparison = {}
+} = {}) {
+  const rawPriceObject = resolveSimilarCandidateRawPriceObject(candidate);
+  const priceValid = Number.isFinite(candidatePrice) && candidatePrice > 0;
+  const sellerDetection = scoring.sellerDetection || scoring.shipping?.sellerDetection || detectSimilarSellerClass(candidate);
+
+  return {
+    title: cleanText(candidate.title).slice(0, 140),
+    asin: candidateAsin || cleanText(candidate.asin).toUpperCase(),
+    price: priceValid ? formatPrice(candidatePrice) : null,
+    rawPriceObject,
+    extractedPrice: priceValid ? candidatePrice : null,
+    priceValid,
+    seller: sellerDetection.sellerClass,
+    sellerClass: sellerDetection.sellerClass,
+    sellerSource: sellerDetection.sellerSource,
+    merchantName: sellerDetection.merchantName || 'fehlt',
+    isAmazonFulfilled: sellerDetection.isAmazonFulfilled === true,
+    isPrimeEligible: sellerDetection.isPrimeEligible === true,
+    similarityScore: scoring.score ?? null,
+    cheaper: cheaper === true,
+    rejectReason: rejectReason || '',
+    originalProductRole: productRoleComparison.originalRoleLabel || '',
+    candidateProductRole: productRoleComparison.candidateRoleLabel || '',
+    productRoleComparable: productRoleComparison.allowed === true,
+    originalQuantity: quantityComparison.originalQuantityLabel || '',
+    candidateQuantity: quantityComparison.candidateQuantityLabel || '',
+    originalUnitPrice: quantityComparison.originalUnitPrice || '',
+    candidateUnitPrice: quantityComparison.candidateUnitPrice || '',
+    offerApiStatus: cleanText(candidate.offerApiStatus).toUpperCase() || '',
+    offerEnrichmentStatus: cleanText(candidate.offerEnrichmentStatus) || '',
+    offerCacheHit: candidate.offerCacheHit === true,
+    rawSellerKeysFound: sellerDetection.rawSellerKeysFound,
+    source: candidate.dataSource || candidate.sourceLabel || 'paapi',
+    merchantInfoRead: hasSimilarCandidateMerchantInfo(candidate),
+    deliveryInfoRead: hasSimilarCandidateDeliveryInfo(candidate)
+  };
+}
+
+function resolveSimilarCandidateShipping(candidate = {}, options = {}) {
+  const sellerDetection = options.sellerDetection || detectSimilarSellerClass(candidate, options);
+  return {
+    ...sellerDetection,
+    sellerDetection
+  };
+}
+
+function scoreSimilarCandidatePreselect(originalProfile = {}, candidate = {}) {
+  const candidateTitle = cleanText(candidate.title);
+  const candidateBrand = cleanText(candidate.brand);
+  const candidateTypeTokens = resolveSimilarProductTypeTokens(candidateTitle);
+  const candidateFeatureTokens = resolveSimilarCoreFeatureTokens(candidateTitle, candidate.features || []);
+  const originalTypeSet = new Set(originalProfile.productTypeTokens || []);
+  const originalFeatureSet = new Set(originalProfile.coreFeatureTokens || []);
+  const typeOverlap = candidateTypeTokens.filter((token) => originalTypeSet.has(token)).length;
+  const featureOverlap = candidateFeatureTokens.filter((token) => originalFeatureSet.has(token)).length;
+  const sameBrand =
+    cleanText(originalProfile.brand) &&
+    candidateBrand &&
+    cleanText(originalProfile.brand).toLowerCase() === candidateBrand.toLowerCase();
+
+  return (sameBrand ? 40 : 0) + Math.min(30, typeOverlap * 15) + Math.min(30, featureOverlap * 10);
+}
+
+function preselectSimilarCandidatesForOfferEnrichment(candidates = [], originalProfile = {}, limit = 10) {
+  const safeLimit = Math.max(1, Math.min(10, Number.parseInt(limit || '10', 10) || 10));
+  return [...(Array.isArray(candidates) ? candidates : [])]
+    .map((candidate, index) => ({
+      candidate,
+      index,
+      preselectScore: scoreSimilarCandidatePreselect(originalProfile, candidate)
+    }))
+    .sort((left, right) => right.preselectScore - left.preselectScore || left.index - right.index)
+    .slice(0, safeLimit)
+    .map((entry) => ({
+      ...entry.candidate,
+      similarPreselectScore: entry.preselectScore
+    }));
+}
+
+function scoreSimilarProductCandidate(originalProfile = {}, candidate = {}, options = {}) {
+  const candidateTitle = cleanText(candidate.title);
+  const candidateBrand = cleanText(candidate.brand);
+  const candidateTypeTokens = resolveSimilarProductTypeTokens(candidateTitle);
+  const candidateFeatureTokens = resolveSimilarCoreFeatureTokens(candidateTitle, candidate.features || []);
+  const originalTypeSet = new Set(originalProfile.productTypeTokens || []);
+  const originalFeatureSet = new Set(originalProfile.coreFeatureTokens || []);
+  const typeOverlap = candidateTypeTokens.filter((token) => originalTypeSet.has(token));
+  const featureOverlap = candidateFeatureTokens.filter((token) => originalFeatureSet.has(token));
+  const sameBrand =
+    cleanText(originalProfile.brand) &&
+    candidateBrand &&
+    cleanText(originalProfile.brand).toLowerCase() === candidateBrand.toLowerCase();
+  let score = 0;
+
+  if (sameBrand) {
+    score += 40;
+  }
+
+  if (typeOverlap.length) {
+    score += 30;
+  }
+
+  if (featureOverlap.length) {
+    score += Math.min(20, Math.max(8, featureOverlap.length * 7));
+  }
+
+  if (candidate.rating || candidate.reviewCount) {
+    score += 5;
+  }
+
+  const sellerDetection = options.sellerDetection || detectSimilarSellerClass(candidate, options);
+  const shipping = resolveSimilarCandidateShipping(candidate, {
+    ...options,
+    sellerDetection
+  });
+  if (shipping.allowed) {
+    score += 10;
+  }
+
+  if (!typeOverlap.length && !sameBrand) {
+    return {
+      score: 0,
+      shipping,
+      sellerDetection,
+      reason: 'Deutlich anderer Produkttyp.',
+      rejectReason: 'CATEGORY_MISMATCH'
+    };
+  }
+
+  return {
+    score: Math.max(0, Math.min(100, Math.round(score))),
+    shipping,
+    sellerDetection,
+    rejectReason: '',
+    reason: [
+      sameBrand ? 'gleiche Marke' : '',
+      typeOverlap.length ? 'gleiche Produktart' : '',
+      featureOverlap.length ? `Kernmerkmale: ${featureOverlap.slice(0, 4).join(', ')}` : '',
+      shipping.allowed ? 'Amazon/FBA Versand' : ''
+    ]
+      .filter(Boolean)
+      .join(' / ') || 'Aehnliches Produkt'
+  };
+}
+
+function buildEmptySimilarProductCheck(overrides = {}) {
+  return {
+    checked: false,
+    allowed: false,
+    similarCheaperFound: false,
+    fbmExcluded: false,
+    alternativePrice: '',
+    alternativeScore: null,
+    alternativeShipping: 'UNKNOWN',
+    reason: '',
+    ...overrides
+  };
+}
+
+async function enrichCandidatesWithOfferData(candidates = []) {
+  const candidateList = Array.isArray(candidates) ? candidates : [];
+  if (!candidateList.length) {
+    return candidateList;
+  }
+
+  return enrichAmazonAffiliateProductsWithOfferData(candidateList, {
+    limit: 3
+  });
+}
+
+function getSimilarSearchResultLimit() {
+  const envLimit = Number.parseInt(process.env.SIMILAR_MAX_SEARCH_RESULTS || '10', 10);
+  const limit = Number.isFinite(envLimit) && envLimit > 0 ? envLimit : 10;
+  return Math.max(1, Math.min(10, limit));
+}
+
+function resolveOptimizedOriginalSourceGroup({ source = {}, structuredMessage = {}, generatorInput = {} } = {}) {
+  return (
+    cleanText(structuredMessage?.channelRef) ||
+    cleanText(structuredMessage?.channelTitle) ||
+    cleanText(structuredMessage?.group) ||
+    cleanText(generatorInput?.channelRef) ||
+    cleanText(generatorInput?.channelTitle) ||
+    cleanText(generatorInput?.group) ||
+    cleanText(source?.channelRef) ||
+    cleanText(source?.channelTitle) ||
+    cleanText(source?.name) ||
+    'Unbekannt'
+  );
+}
+
+function resolveOptimizedCandidateImageUrl(candidate = {}) {
+  return (
+    cleanText(candidate.imageUrl) ||
+    cleanText(candidate.image?.url) ||
+    cleanText(candidate.images?.primary?.large?.url) ||
+    cleanText(candidate.images?.primary?.medium?.url) ||
+    cleanText(candidate.images?.primary?.small?.url)
+  );
+}
+
+function formatSimilarSellerPostBoolean(value, fallback = 'fehlt') {
+  if (value === true) {
+    return 'JA';
+  }
+
+  if (value === false) {
+    return 'NEIN';
+  }
+
+  return fallback;
+}
+
+function formatSimilarSellerKeys(value = []) {
+  const keys = Array.isArray(value) ? value.map((entry) => cleanText(entry)).filter(Boolean) : [];
+  return keys.length ? keys.join(', ') : 'keine Seller-Felder';
+}
+
+function looksLikeTelegramDealText(value = '') {
+  const text = cleanText(value);
+  return /https?:\/\/|www\.|amazon\.de|bester preis|partnerlink|coupon|angebot|deal|rabatt|preis:/i.test(text) || text.length > 120;
+}
+
+function normalizeSimilarDebugPrice(value = null) {
+  const parsed = normalizeSimilarPositivePrice(value);
+  return parsed === null ? 'fehlt' : formatPrice(parsed);
+}
+
+function pickBestSimilarCandidateDebugRow(rows = []) {
+  if (!Array.isArray(rows) || !rows.length) {
+    return null;
+  }
+
+  return [...rows].sort((left, right) => {
+    const rightScore = Number(right.similarityScore ?? -1);
+    const leftScore = Number(left.similarityScore ?? -1);
+    const rightCheaper = right.cheaper === true ? 1 : 0;
+    const leftCheaper = left.cheaper === true ? 1 : 0;
+    return rightCheaper - leftCheaper || rightScore - leftScore;
+  })[0] || null;
+}
+
+function buildSimilarDataSources({
+  source = {},
+  structuredMessage = {},
+  generatorInput = {},
+  originalProfile = {},
+  originalPrice = null
+} = {}) {
+  return {
+    sourceTelegramText: cleanText(structuredMessage?.text || generatorInput?.sourceTelegramText),
+    sourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+    originalTitle: cleanText(originalProfile.title || generatorInput?.title),
+    originalPrice: originalPrice === null ? 'n/a' : formatPrice(originalPrice),
+    originalUrl: cleanText(generatorInput?.normalizedUrl || generatorInput?.productUrl || generatorInput?.link || structuredMessage?.externalLink),
+    originalAsin: cleanText(originalProfile.asin || generatorInput?.asin).toUpperCase()
+  };
+}
+
+function resolveSimilarOriginalSellerDebug(eligibility = {}, generatorInput = {}, generatorContext = {}) {
+  const details =
+    generatorInput?.sellerDetails && typeof generatorInput.sellerDetails === 'object'
+      ? generatorInput.sellerDetails
+      : generatorContext?.seller?.details || {};
+  const rawSellerKeysFound = Array.isArray(generatorInput?.sellerDetectionSources)
+    ? generatorInput.sellerDetectionSources
+    : Array.isArray(details?.detectionSources)
+      ? details.detectionSources
+      : [];
+  const merchantNameCandidate = cleanText(
+    generatorInput?.amazonMerchantName ||
+      generatorInput?.paapiMerchantInfo ||
+      generatorInput?.offerMerchantInfo ||
+      details?.paapiMerchantInfo ||
+      details?.offerMerchantInfo
+  );
+  const merchantName = looksLikeTelegramDealText(merchantNameCandidate) ? '' : merchantNameCandidate;
+  const shippedKnown = generatorInput?.shippedByAmazon === true || generatorInput?.shippedByAmazon === false;
+  const noRealSellerFields = !merchantName && !shippedKnown;
+  const fallbackSellerClass = eligibility.sellerClass || cleanText(generatorInput?.sellerClass) || 'UNKNOWN';
+  const sellerClass =
+    fallbackSellerClass === 'FBA_OR_AMAZON_UNKNOWN' && noRealSellerFields ? 'UNKNOWN' : fallbackSellerClass;
+  const sellerSource =
+    noRealSellerFields
+      ? 'Keine echten Seller Felder in API Response gefunden.'
+      : cleanText(generatorInput?.sellerRecognitionMessage) ||
+        cleanText(details?.sellerRecognitionMessage) ||
+        cleanText(details?.recognitionMessage) ||
+        cleanText(eligibility.reason) ||
+        cleanText(generatorInput?.sellerDetectionSource) ||
+        'Keine Seller-Zusatzinfo verfuegbar.';
+
+  return {
+    sellerClass,
+    sellerSource,
+    merchantName,
+    sourceTelegramText: cleanText(generatorInput?.sourceTelegramText),
+    amazonFulfilledLabel: generatorInput?.shippedByAmazon === true ? 'JA' : generatorInput?.shippedByAmazon === false ? 'NEIN' : 'fehlt',
+    primeLabel: 'fehlt',
+    rawSellerKeysFound
+  };
+}
+
+function resolveSimilarPostSellerDebug(similarCheck = {}, mode = 'optimized') {
+  const prefix = mode === 'optimized' ? 'optimized' : '';
+  const fallbackPrefix = mode === 'optimized' ? 'similarCheaper' : '';
+  const sellerClass =
+    cleanText(similarCheck[`${prefix}SellerClass`]) ||
+    cleanText(similarCheck[`${fallbackPrefix}SellerClass`]) ||
+    cleanText(similarCheck.sellerClass) ||
+    'UNKNOWN';
+  const sellerSource =
+    cleanText(similarCheck[`${prefix}SellerSource`]) ||
+    cleanText(similarCheck[`${fallbackPrefix}SellerSource`]) ||
+    cleanText(similarCheck.sellerSource) ||
+    'Keine Seller Quelle vorhanden.';
+  const merchantNameCandidate =
+    cleanText(similarCheck[`${prefix}MerchantName`]) ||
+    cleanText(similarCheck[`${fallbackPrefix}MerchantName`]) ||
+    cleanText(similarCheck.merchantName);
+  const merchantName = looksLikeTelegramDealText(merchantNameCandidate) ? '' : merchantNameCandidate;
+  const rawSellerKeysFound =
+    similarCheck[`${prefix}RawSellerKeysFound`] ||
+    similarCheck[`${fallbackPrefix}RawSellerKeysFound`] ||
+    similarCheck.rawSellerKeysFound ||
+    [];
+  const amazonFulfilled =
+    similarCheck[`${prefix}IsAmazonFulfilled`] ??
+    similarCheck[`${fallbackPrefix}IsAmazonFulfilled`] ??
+    similarCheck.isAmazonFulfilled;
+  const prime =
+    similarCheck[`${prefix}IsPrimeEligible`] ??
+    similarCheck[`${fallbackPrefix}IsPrimeEligible`] ??
+    similarCheck.isPrimeEligible;
+
+  return {
+    sellerClass,
+    sellerSource,
+    merchantName: merchantName || 'fehlt',
+    amazonFulfilled:
+      cleanText(similarCheck[`${fallbackPrefix}AmazonFulfilledLabel`] || similarCheck.amazonFulfilledLabel) ||
+      formatSimilarSellerPostBoolean(amazonFulfilled),
+    prime:
+      cleanText(similarCheck[`${fallbackPrefix}PrimeLabel`] || similarCheck.primeLabel) ||
+      formatSimilarSellerPostBoolean(prime),
+    rawSellerKeysFoundText: formatSimilarSellerKeys(rawSellerKeysFound)
+  };
+}
+
+async function runSimilarProductOptimizationCheck({
+  sessionName = '',
+  source = {},
+  structuredMessage = {},
+  generatorInput = {},
+  generatorContext = {},
+  scrapedDeal = {}
+} = {}) {
+  const disabledReason = getOptimizedDealsDisabledReason();
+  if (disabledReason) {
+    logOptimizedDealsDisabledCheckSkipped({
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: generatorInput?.asin || '',
+      reason: disabledReason
+    });
+    return buildEmptySimilarProductCheck({
+      checked: false,
+      allowed: false,
+      sellerClass: normalizeSimilarSellerClass(generatorInput?.sellerClass || generatorInput?.sellerType),
+      originalTitle: cleanText(generatorInput?.title || scrapedDeal?.productTitle || scrapedDeal?.title),
+      originalPrice: cleanText(generatorInput?.currentPrice || scrapedDeal?.price || ''),
+      reason: disabledReason,
+      detail: 'Optimierte Deals sind per OPTIMIZED_DEALS_ENABLED deaktiviert.'
+    });
+  }
+
+  const eligibility = resolveSimilarProductEligibility(generatorInput, generatorContext);
+  const originalProfile = buildSimilarProductProfile(generatorInput, scrapedDeal);
+  const productIntelligenceProfile = buildProductIntelligenceProfile(generatorInput, scrapedDeal);
+  const similarProductTestMode = isSimilarProductTestModeActive();
+  const query = productIntelligenceProfile.searchQuery || buildSimilarProductSearchQuery(generatorInput, scrapedDeal);
+  const shortQuery = buildSimilarProductShortSearchQuery(generatorInput, scrapedDeal, productIntelligenceProfile);
+  const searchQueries = buildSimilarProductSearchQueries({
+    exactQuery: query,
+    shortQuery,
+    testMode: similarProductTestMode
+  });
+  const primaryQuery = searchQueries[0]?.query || query || shortQuery || '';
+  const strictScoreThreshold = SIMILAR_PRODUCT_MIN_SCORE;
+  const minimumPostScoreThreshold = SIMILAR_PRODUCT_MIN_SCORE;
+  const searchResultLimit = getSimilarSearchResultLimit();
+  const originalSellerDebug = resolveSimilarOriginalSellerDebug(eligibility, generatorInput, generatorContext);
+  const originalDataSources = buildSimilarDataSources({
+    source,
+    structuredMessage,
+    generatorInput,
+    originalProfile,
+    originalPrice: originalProfile.price
+  });
+
+  if (similarProductTestMode) {
+    console.info('[API_SAVING_MODE_ACTIVE]', {
+      strictScoreThreshold,
+      minimumPostScoreThreshold,
+      searchResultLimit,
+      enrichLimit: 3,
+      priceRule: 'candidatePrice < originalPrice',
+      minimumDifferencePercent: 3,
+      fbmBlocked: true,
+      debugSpamPosts: false
+    });
+  }
+
+  console.info('[SIMILAR_PRODUCT_CHECK_ALLOWED]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    sellerClass: eligibility.sellerClass,
+    allowed: eligibility.allowed === true,
+    reason: eligibility.reason,
+    sellerSource: originalSellerDebug.sellerSource,
+    merchantName: originalSellerDebug.merchantName || 'fehlt',
+    rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound
+  });
+  console.info('[SIMILAR_PRODUCT_ORIGINAL_SELLER_DEBUG]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    readerTestMode: similarProductTestMode,
+    resolvedSellerClass: eligibility.sellerClass,
+    generatorSellerClass: generatorInput?.sellerClass || '',
+    generatorSellerType: generatorInput?.sellerType || '',
+    contextSellerClass:
+      generatorContext?.seller?.sellerClass || generatorContext?.decisionPolicy?.seller?.sellerClass || '',
+    allowed: eligibility.allowed === true,
+    fbmExcluded: eligibility.fbmExcluded === true,
+    sellerSource: originalSellerDebug.sellerSource,
+    merchantName: originalSellerDebug.merchantName || 'fehlt',
+    amazonFulfilled: originalSellerDebug.amazonFulfilledLabel,
+    prime: originalSellerDebug.primeLabel,
+    rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound
+  });
+
+  if (!eligibility.allowed) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: originalProfile.asin,
+      sellerClass: originalSellerDebug.sellerClass,
+      reason: 'seller_not_fba',
+      detail: eligibility.reason
+    });
+    return buildEmptySimilarProductCheck({
+      checked: eligibility.checked,
+      allowed: false,
+      sellerClass: originalSellerDebug.sellerClass,
+      sourceTelegramText: originalDataSources.sourceTelegramText,
+      sourceGroup: originalDataSources.sourceGroup,
+      originalUrl: originalDataSources.originalUrl,
+      originalAsin: originalDataSources.originalAsin,
+      sellerSource: originalSellerDebug.sellerSource,
+      merchantName: originalSellerDebug.merchantName || '',
+      amazonFulfilledLabel: originalSellerDebug.amazonFulfilledLabel,
+      primeLabel: originalSellerDebug.primeLabel,
+      rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound,
+      fbmExcluded: eligibility.fbmExcluded,
+      productIntelligence: productIntelligenceProfile,
+      originalTitle: originalProfile.title,
+      originalPrice: originalProfile.price === null ? 'n/a' : formatPrice(originalProfile.price),
+      originalSourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+      candidateCount: 0,
+      bestScore: null,
+      query: primaryQuery,
+      reason: 'seller_not_fba',
+      detail: eligibility.reason
+    });
+  }
+
+  console.info('[SIMILAR_PRODUCT_SEARCH_STARTED]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    asin: originalProfile.asin,
+    sellerClass: eligibility.sellerClass,
+    query: primaryQuery,
+    shortQuery: similarProductTestMode ? shortQuery : ''
+  });
+  console.info('[SIMILAR_SEARCH_STARTED]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    asin: originalProfile.asin,
+    sellerClass: eligibility.sellerClass,
+    query: primaryQuery,
+    shortQuery: similarProductTestMode ? shortQuery : ''
+  });
+  console.info('[SIMILAR_PRODUCT_SEARCH_START]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    asin: originalProfile.asin,
+    sellerClass: eligibility.sellerClass,
+    query: primaryQuery,
+    shortQuery: similarProductTestMode ? shortQuery : ''
+  });
+
+  if (!searchQueries.length || originalProfile.price === null) {
+    console.info('[SIMILAR_PRODUCT_NO_CHEAPER_FOUND]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: originalProfile.asin,
+      reason: !searchQueries.length ? 'no_similar_candidates' : 'no_cheaper_candidate',
+      detail: !searchQueries.length ? 'Keine Similar-Search-Query verfuegbar.' : 'Originalpreis fehlt.'
+    });
+    return buildEmptySimilarProductCheck({
+      checked: true,
+      allowed: true,
+      sellerClass: originalSellerDebug.sellerClass,
+      sourceTelegramText: originalDataSources.sourceTelegramText,
+      sourceGroup: originalDataSources.sourceGroup,
+      originalUrl: originalDataSources.originalUrl,
+      originalAsin: originalDataSources.originalAsin,
+      sellerSource: originalSellerDebug.sellerSource,
+      merchantName: originalSellerDebug.merchantName || '',
+      amazonFulfilledLabel: originalSellerDebug.amazonFulfilledLabel,
+      primeLabel: originalSellerDebug.primeLabel,
+      rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound,
+      productIntelligence: productIntelligenceProfile,
+      originalTitle: originalProfile.title,
+      originalPrice: originalProfile.price === null ? 'n/a' : formatPrice(originalProfile.price),
+      originalSourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+      candidateCount: 0,
+      bestScore: null,
+      query: primaryQuery,
+      shortQuery: similarProductTestMode ? shortQuery : '',
+      reason: !searchQueries.length ? 'no_similar_candidates' : 'no_cheaper_candidate',
+      detail: !searchQueries.length ? 'Keine Similar-Search-Query verfuegbar.' : 'Originalpreis fehlt.'
+    });
+  }
+
+  const originalBaselineResult = maybeStoreProductIntelligenceMaster({
+    profile: productIntelligenceProfile,
+    candidate: {
+      asin: originalProfile.asin,
+      brand: originalProfile.brand,
+      title: originalProfile.title,
+      price: originalProfile.price
+    },
+    sellerClass: eligibility.sellerClass,
+    similarityScore: 100,
+    source: 'current_deal'
+  });
+
+  const searchResults = [];
+  const candidateMap = new Map();
+
+  for (const searchQuery of searchQueries) {
+    if (searchQuery.type === 'short') {
+      console.info('[SIMILAR_PRODUCT_SHORT_QUERY_USED]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: originalProfile.asin,
+        exactQuery: query,
+        shortQuery: searchQuery.query
+      });
+    }
+
+    const searchResult = await searchAmazonAffiliateProducts({
+      keywords: searchQuery.query,
+      itemCount: searchResultLimit
+    });
+    const items = Array.isArray(searchResult.items) ? searchResult.items : [];
+    searchResults.push({
+      ...searchResult,
+      query: searchQuery.query,
+      queryType: searchQuery.type,
+      count: items.length
+    });
+
+    for (const item of items) {
+      const asin = cleanText(item.asin).toUpperCase();
+      if (!asin || candidateMap.has(asin)) {
+        continue;
+      }
+
+      candidateMap.set(asin, {
+        ...item,
+        similarSearchQuery: searchQuery.query,
+        similarSearchQueryType: searchQuery.type
+      });
+    }
+  }
+
+  const rawCandidates = preselectSimilarCandidatesForOfferEnrichment([...candidateMap.values()], originalProfile, searchResultLimit);
+  const candidates = await enrichCandidatesWithOfferData(rawCandidates);
+  const primarySearchResult = searchResults[0] || {};
+  const searchStatus = searchResults.some((entry) => entry.status === 'success')
+    ? 'success'
+    : primarySearchResult.status || 'unknown';
+
+  console.info('[SIMILAR_PRODUCT_CANDIDATES_FOUND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    asin: originalProfile.asin,
+    query: primaryQuery,
+    searchQueries: searchResults.map((entry) => ({
+      type: entry.queryType,
+      query: entry.query,
+      count: entry.count,
+      status: entry.status || 'unknown'
+    })),
+    count: candidates.length,
+    status: searchStatus
+  });
+  console.info('[SIMILAR_PRODUCTS_FOUND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    asin: originalProfile.asin,
+    query: primaryQuery,
+    searchQueries: searchResults.map((entry) => ({
+      type: entry.queryType,
+      query: entry.query,
+      count: entry.count,
+      status: entry.status || 'unknown'
+    })),
+    count: candidates.length,
+    status: searchStatus
+  });
+
+  const enrichmentStats = {
+    enrichedCount: candidates.filter((candidate) => candidate.offerEnriched === true && candidate.offerCacheHit !== true).length,
+    cacheHits: candidates.filter((candidate) => candidate.offerCacheHit === true).length,
+    throttled:
+      searchResults.some((entry) => cleanText(entry.status).toLowerCase() === 'throttled') ||
+      candidates.some(
+        (candidate) =>
+          cleanText(candidate.offerApiStatus).toUpperCase() === 'THROTTLED' ||
+          cleanText(candidate.offerEnrichmentStatus) === 'api_throttled'
+      )
+  };
+
+  let bestCandidate = null;
+  let bestObservedScore = null;
+  let fbmExcluded = false;
+  let productRoleMismatchExcluded = false;
+  let packSizeMismatchExcluded = false;
+  const candidateDebugRows = [];
+
+  for (const candidate of candidates) {
+    const candidateAsin = cleanText(candidate.asin).toUpperCase();
+    if (!candidateAsin || candidateAsin === originalProfile.asin) {
+      continue;
+    }
+
+    const candidatePrice = resolveSimilarCandidatePrice(candidate);
+    const candidatePriceValid = Number.isFinite(candidatePrice) && candidatePrice > 0;
+    const candidateQuantityInfo = extractQuantityInfo(
+      candidate.title,
+      candidate.features || [],
+      candidate.rawItem?.ItemInfo || candidate.rawItem?.itemInfo || candidate.rawItem || candidate
+    );
+    const candidateRoleInfo = extractProductRole(candidate.title, candidate.features || []);
+    const productRoleComparison = compareSimilarProductRoles({
+      originalRoleInfo: originalProfile.productRoleInfo,
+      candidateRoleInfo,
+      originalTitle: originalProfile.title,
+      candidateTitle: candidate.title,
+      candidateAsin
+    });
+    const quantityComparison = compareSimilarQuantityInfo({
+      originalQuantityInfo: originalProfile.quantityInfo,
+      candidateQuantityInfo,
+      originalPrice: originalProfile.price,
+      candidatePrice,
+      originalTitle: originalProfile.title,
+      candidateTitle: candidate.title,
+      candidateAsin
+    });
+    const sellerDetection = detectSimilarSellerClass(candidate, {
+      testMode: similarProductTestMode
+    });
+    console.info('[SELLER_DETECTION_RESULT]', {
+      asin: candidateAsin,
+      sellerClass: sellerDetection.sellerClass,
+      source: sellerDetection.sellerSource,
+      reason: sellerDetection.reason,
+      merchantName: sellerDetection.merchantName || 'fehlt',
+      isAmazonFulfilled: sellerDetection.isAmazonFulfilled === true,
+      isPrimeEligible: sellerDetection.isPrimeEligible === true,
+      rawSellerKeysFound: sellerDetection.rawSellerKeysFound
+    });
+    const scoring = scoreSimilarProductCandidate(originalProfile, candidate, {
+      testMode: similarProductTestMode,
+      sellerDetection
+    });
+    bestObservedScore = bestObservedScore === null ? scoring.score : Math.max(bestObservedScore, scoring.score);
+    const cheaper = candidatePriceValid && candidatePrice < originalProfile.price;
+    const candidateDifferencePercent =
+      cheaper && Number.isFinite(originalProfile.price) && originalProfile.price > 0
+        ? Math.round(((originalProfile.price - candidatePrice) / originalProfile.price) * 1000) / 10
+        : 0;
+    let rejectReason = '';
+
+    if (cleanText(candidate.offerApiStatus).toUpperCase() === 'THROTTLED' || cleanText(candidate.offerEnrichmentStatus) === 'api_throttled') {
+      rejectReason = 'API_THROTTLED';
+    } else if (!candidatePriceValid) {
+      rejectReason = 'PRICE_MISSING';
+    } else if (!scoring.shipping.allowed) {
+      rejectReason = scoring.shipping.rejectReason || 'SELLER_NOT_ALLOWED';
+    } else if (scoring.rejectReason === 'CATEGORY_MISMATCH') {
+      rejectReason = 'CATEGORY_MISMATCH';
+    } else if (!productRoleComparison.allowed) {
+      rejectReason = 'PRODUCT_ROLE_MISMATCH';
+    } else if (!quantityComparison.allowed) {
+      rejectReason = 'PACK_SIZE_MISMATCH';
+    } else if (scoring.score < minimumPostScoreThreshold) {
+      rejectReason = 'SIMILARITY_TOO_LOW';
+    } else if (!cheaper) {
+      rejectReason = 'PRICE_NOT_CHEAPER';
+    } else if (candidateDifferencePercent < 3) {
+      rejectReason = 'SAVING_TOO_LOW';
+    }
+
+    if (candidateDebugRows.length < 10) {
+      candidateDebugRows.push(
+        buildSimilarCandidateDebugRow({
+          candidate,
+          candidateAsin,
+          candidatePrice,
+          scoring,
+          cheaper,
+          rejectReason,
+          quantityComparison,
+          productRoleComparison
+        })
+      );
+    }
+
+    console.info('[SIMILAR_CANDIDATE_DEBUG]', {
+      asin: candidateAsin,
+      title: cleanText(candidate.title).slice(0, 140),
+      price: candidatePriceValid ? formatPrice(candidatePrice) : null,
+      sellerClass: sellerDetection.sellerClass,
+      merchantName: sellerDetection.merchantName || null,
+      isAmazonFulfilled: sellerDetection.isAmazonFulfilled === true,
+      isPrimeEligible: sellerDetection.isPrimeEligible === true,
+      similarity: scoring.score,
+      rejectReason,
+      offerApiStatus: cleanText(candidate.offerApiStatus).toUpperCase() || '',
+      offerEnrichmentStatus: cleanText(candidate.offerEnrichmentStatus) || '',
+      offerCacheHit: candidate.offerCacheHit === true,
+      sellerSource: sellerDetection.sellerSource,
+      rawSellerKeysFound: sellerDetection.rawSellerKeysFound,
+      originalProductRole: productRoleComparison.originalRoleLabel || '',
+      candidateProductRole: productRoleComparison.candidateRoleLabel || '',
+      productRoleComparable: productRoleComparison.allowed === true,
+      originalQuantity: quantityComparison.originalQuantityLabel || '',
+      candidateQuantity: quantityComparison.candidateQuantityLabel || '',
+      originalUnitPrice: quantityComparison.originalUnitPrice || '',
+      candidateUnitPrice: quantityComparison.candidateUnitPrice || '',
+      quantityComparable: quantityComparison.allowed === true
+    });
+
+    console.info('[SIMILAR_PRODUCT_MATCH_SCORE]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      originalAsin: originalProfile.asin,
+      asin: candidateAsin,
+      searchQuery: candidate.similarSearchQuery || '',
+      searchQueryType: candidate.similarSearchQueryType || '',
+      category: productIntelligenceProfile.category,
+      attributeKey: productIntelligenceProfile.attributeKey,
+      score: scoring.score,
+      shipping: scoring.shipping.shipping,
+      sellerClass: scoring.shipping.sellerClass,
+      sellerSource: sellerDetection.sellerSource,
+      merchantName: sellerDetection.merchantName || 'fehlt',
+      isAmazonFulfilled: sellerDetection.isAmazonFulfilled === true,
+      isPrimeEligible: sellerDetection.isPrimeEligible === true,
+      rawSellerKeysFound: sellerDetection.rawSellerKeysFound,
+      rawPriceObject: resolveSimilarCandidateRawPriceObject(candidate),
+      extractedPrice: candidatePrice,
+      priceValid: candidatePriceValid,
+      originalProductRole: productRoleComparison.originalRoleLabel || '',
+      candidateProductRole: productRoleComparison.candidateRoleLabel || '',
+      productRoleComparable: productRoleComparison.allowed === true,
+      originalQuantity: quantityComparison.originalQuantityLabel || '',
+      candidateQuantity: quantityComparison.candidateQuantityLabel || '',
+      originalUnitPrice: quantityComparison.originalUnitPrice || '',
+      candidateUnitPrice: quantityComparison.candidateUnitPrice || '',
+      quantityComparable: quantityComparison.allowed === true,
+      offerApiStatus: cleanText(candidate.offerApiStatus).toUpperCase() || '',
+      offerEnrichmentStatus: cleanText(candidate.offerEnrichmentStatus) || '',
+      offerCacheHit: candidate.offerCacheHit === true,
+      cheaper,
+      rejectReason,
+      reason: scoring.reason
+    });
+
+    if (!scoring.shipping.allowed) {
+      if (scoring.shipping.sellerClass === 'FBM') {
+        fbmExcluded = true;
+      }
+      console.info(
+        scoring.shipping.sellerClass === 'FBM'
+          ? '[SIMILAR_PRODUCT_CANDIDATE_REJECTED_FBM]'
+          : '[SIMILAR_PRODUCT_CANDIDATE_REJECTED_SELLER]',
+        {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: candidateAsin,
+        title: cleanText(candidate.title).slice(0, 140),
+        reason: rejectReason,
+        legacyReason: scoring.shipping.sellerClass === 'FBM' ? 'candidate_is_fbm' : '',
+        shipping: scoring.shipping.shipping,
+        sellerClass: scoring.shipping.sellerClass,
+        sellerSource: sellerDetection.sellerSource,
+        merchantName: sellerDetection.merchantName || 'fehlt',
+        isAmazonFulfilled: sellerDetection.isAmazonFulfilled === true,
+        isPrimeEligible: sellerDetection.isPrimeEligible === true,
+        rawSellerKeysFound: sellerDetection.rawSellerKeysFound,
+        detail: scoring.shipping.reason
+        }
+      );
+      continue;
+    }
+
+    if (scoring.rejectReason === 'CATEGORY_MISMATCH') {
+      continue;
+    }
+
+    if (!productRoleComparison.allowed) {
+      productRoleMismatchExcluded = true;
+      console.info('[SIMILAR_PRODUCT_CANDIDATE_REJECTED_ROLE]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: candidateAsin,
+        reason: 'PRODUCT_ROLE_MISMATCH',
+        originalRole: productRoleComparison.originalRoleLabel || '',
+        candidateRole: productRoleComparison.candidateRoleLabel || '',
+        detail: productRoleComparison.reason
+      });
+      continue;
+    }
+
+    if (candidatePriceValid && !quantityComparison.allowed) {
+      packSizeMismatchExcluded = true;
+      console.info('[SIMILAR_PRODUCT_CANDIDATE_REJECTED_PACK_SIZE]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: candidateAsin,
+        reason: 'PACK_SIZE_MISMATCH',
+        originalQuantity: quantityComparison.originalQuantityLabel || '',
+        candidateQuantity: quantityComparison.candidateQuantityLabel || '',
+        originalUnitPrice: quantityComparison.originalUnitPrice || '',
+        candidateUnitPrice: quantityComparison.candidateUnitPrice || '',
+        detail: quantityComparison.reason
+      });
+      continue;
+    }
+
+    if (scoring.score < minimumPostScoreThreshold) {
+      console.info('[SIMILAR_PRODUCT_CANDIDATE_REJECTED_LOW_SCORE]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: candidateAsin,
+        reason: 'SIMILARITY_TOO_LOW',
+        score: scoring.score,
+        threshold: minimumPostScoreThreshold,
+        strictThreshold: strictScoreThreshold,
+        testMode: similarProductTestMode,
+        detail: scoring.reason
+      });
+      continue;
+    }
+
+    if (!candidatePriceValid) {
+      console.info('[SIMILAR_PRODUCT_CANDIDATE_REJECTED_PRICE]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: candidateAsin,
+        title: cleanText(candidate.title).slice(0, 140),
+        reason: 'PRICE_MISSING',
+        rawPriceObject: resolveSimilarCandidateRawPriceObject(candidate),
+        extractedPrice: candidatePrice,
+        priceValid: false
+      });
+      continue;
+    }
+
+    if (candidatePrice >= originalProfile.price) {
+      continue;
+    }
+
+    if (candidateDifferencePercent < 3) {
+      continue;
+    }
+
+    const enrichedCandidate = {
+      ...candidate,
+      priceValue: candidatePrice,
+      similarCheaperScore: scoring.score,
+      similarCheaperReason: scoring.reason,
+      similarCheaperSellerClass: scoring.shipping.sellerClass,
+      similarCheaperShipping: scoring.shipping.shipping,
+      similarCheaperSellerSource: sellerDetection.sellerSource,
+      similarCheaperMerchantName: sellerDetection.merchantName || '',
+      similarCheaperIsAmazonFulfilled: sellerDetection.isAmazonFulfilled === true,
+      similarCheaperIsPrimeEligible: sellerDetection.isPrimeEligible === true,
+      similarCheaperRawSellerKeysFound: sellerDetection.rawSellerKeysFound,
+      similarCheaperAmazonFulfilledLabel: sellerDetection.amazonFulfilledLabel,
+      similarCheaperPrimeLabel: sellerDetection.primeLabel,
+      originalProductRoleInfo: originalProfile.productRoleInfo,
+      optimizedProductRoleInfo: candidateRoleInfo,
+      productRoleComparison,
+      originalProductRole: productRoleComparison.originalRoleLabel || '',
+      optimizedProductRole: productRoleComparison.candidateRoleLabel || '',
+      productRoleComparable: productRoleComparison.allowed === true,
+      originalQuantityInfo: originalProfile.quantityInfo,
+      optimizedQuantityInfo: candidateQuantityInfo,
+      quantityComparison,
+      originalQuantity: quantityComparison.originalQuantityLabel || '',
+      optimizedQuantity: quantityComparison.candidateQuantityLabel || '',
+      originalUnitPrice: quantityComparison.originalUnitPrice || '',
+      optimizedUnitPrice: quantityComparison.candidateUnitPrice || '',
+      quantityComparable: quantityComparison.allowed === true,
+      softOptimizedDeal: similarProductTestMode && scoring.score < strictScoreThreshold,
+      similarSearchQuery: candidate.similarSearchQuery || '',
+      similarSearchQueryType: candidate.similarSearchQueryType || ''
+    };
+
+    if (!bestCandidate || candidatePrice < bestCandidate.priceValue || (candidatePrice === bestCandidate.priceValue && scoring.score > bestCandidate.similarCheaperScore)) {
+      bestCandidate = enrichedCandidate;
+    }
+  }
+
+  console.info('[SIMILAR_PRODUCT_TOP_CANDIDATES_DEBUG]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: originalProfile.asin,
+    originalPrice: formatPrice(originalProfile.price),
+    originalSellerClass: eligibility.sellerClass,
+    readerTestMode: similarProductTestMode,
+    query: primaryQuery,
+    shortQuery: similarProductTestMode ? shortQuery : '',
+    strictScoreThreshold,
+    minimumPostScoreThreshold,
+    enrichmentStats,
+    candidates: candidateDebugRows
+  });
+
+  const bestCandidateDebug = pickBestSimilarCandidateDebugRow(candidateDebugRows);
+
+  if (!bestCandidate) {
+    const anyThrottled = enrichmentStats.throttled === true;
+    const anySearchError = searchResults.some((entry) => entry.status === 'error' || entry.status === 'api_error' || entry.status === 'throttled');
+    const noCheaperReason = anyThrottled
+      ? 'API_THROTTLED'
+      : productRoleMismatchExcluded
+        ? 'PRODUCT_ROLE_MISMATCH'
+      : packSizeMismatchExcluded
+        ? 'PACK_SIZE_MISMATCH'
+        : candidates.length
+          ? 'no_cheaper_candidate'
+          : anySearchError
+            ? 'api_error'
+            : 'no_similar_candidates';
+    const noCheaperDetail =
+      (anyThrottled ? 'Amazon API gedrosselt, spaeter erneut pruefen.' : '') ||
+      (productRoleMismatchExcluded ? 'Andere Produktrolle: Zubehoer/Ersatzteil nicht gegen Hauptprodukt oder Set erlaubt.' : '') ||
+      (packSizeMismatchExcluded ? 'Andere Packgröße: Kandidat nicht als echter optimierter Deal erlaubt.' : '') ||
+      searchResults.find((entry) => cleanText(entry.reason))?.reason ||
+      (similarProductTestMode
+        ? 'Keine guenstigere erlaubte Amazon/FBA-Testalternative gefunden.'
+        : 'Keine guenstigere FBA-Alternative gefunden.');
+    console.info('[SIMILAR_PRODUCT_NO_CHEAPER_FOUND]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: originalProfile.asin,
+      query: primaryQuery,
+      shortQuery: similarProductTestMode ? shortQuery : '',
+      fbmExcluded,
+      candidateCount: candidates.length,
+      enrichedCount: enrichmentStats.enrichedCount,
+      cacheHits: enrichmentStats.cacheHits,
+      apiStatus: anyThrottled ? 'THROTTLED' : '',
+      productRoleMismatchExcluded,
+      packSizeMismatchExcluded,
+      bestScore: bestObservedScore,
+      reason: noCheaperReason,
+      detail: noCheaperDetail
+    });
+    console.info('[SIMILAR_NO_CHEAPER_FOUND]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: originalProfile.asin,
+      query: primaryQuery,
+      shortQuery: similarProductTestMode ? shortQuery : '',
+      sellerClass: eligibility.sellerClass,
+      candidateCount: candidates.length,
+      enrichedCount: enrichmentStats.enrichedCount,
+      cacheHits: enrichmentStats.cacheHits,
+      apiStatus: anyThrottled ? 'THROTTLED' : '',
+      productRoleMismatchExcluded,
+      packSizeMismatchExcluded,
+      bestScore: bestObservedScore,
+      reason: noCheaperReason,
+      detail: noCheaperDetail
+    });
+    return buildEmptySimilarProductCheck({
+      checked: true,
+      allowed: true,
+      sellerClass: originalSellerDebug.sellerClass,
+      sourceTelegramText: originalDataSources.sourceTelegramText,
+      sourceGroup: originalDataSources.sourceGroup,
+      originalUrl: originalDataSources.originalUrl,
+      originalAsin: originalDataSources.originalAsin,
+      sellerSource: originalSellerDebug.sellerSource,
+      merchantName: originalSellerDebug.merchantName || '',
+      amazonFulfilledLabel: originalSellerDebug.amazonFulfilledLabel,
+      primeLabel: originalSellerDebug.primeLabel,
+      rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound,
+      fbmExcluded,
+      productRoleMismatchExcluded,
+      packSizeMismatchExcluded,
+      productIntelligence: productIntelligenceProfile,
+      baselineMaster: originalBaselineResult?.master || null,
+      originalTitle: originalProfile.title,
+      originalPrice: formatPrice(originalProfile.price),
+      originalSourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+      candidateCount: candidates.length,
+      enrichedCount: enrichmentStats.enrichedCount,
+      cacheHits: enrichmentStats.cacheHits,
+      apiStatus: anyThrottled ? 'THROTTLED' : '',
+      bestScore: bestObservedScore,
+      bestCandidateDebug,
+      query: primaryQuery,
+      shortQuery: similarProductTestMode ? shortQuery : '',
+      reason: noCheaperReason,
+      detail: noCheaperDetail
+    });
+  }
+
+  const bestCandidatePrice = normalizeSimilarPositivePrice(bestCandidate.priceValue);
+  const originalPrice = normalizeSimilarPositivePrice(originalProfile.price);
+
+  if (bestCandidatePrice === null || originalPrice === null || bestCandidatePrice >= originalPrice) {
+    const rejectReason = bestCandidatePrice === null || originalPrice === null ? 'PRICE_MISSING' : 'PRICE_NOT_CHEAPER';
+    console.warn('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      originalAsin: originalProfile.asin,
+      similarCheaperAsin: bestCandidate?.asin || '',
+      reason: rejectReason,
+      originalPrice,
+      extractedPrice: bestCandidatePrice,
+      priceValid: bestCandidatePrice !== null && originalPrice !== null,
+      rawPriceObject: resolveSimilarCandidateRawPriceObject(bestCandidate)
+    });
+    return buildEmptySimilarProductCheck({
+      checked: true,
+      allowed: true,
+      sellerClass: originalSellerDebug.sellerClass,
+      sourceTelegramText: originalDataSources.sourceTelegramText,
+      sourceGroup: originalDataSources.sourceGroup,
+      originalUrl: originalDataSources.originalUrl,
+      originalAsin: originalDataSources.originalAsin,
+      sellerSource: originalSellerDebug.sellerSource,
+      merchantName: originalSellerDebug.merchantName || '',
+      amazonFulfilledLabel: originalSellerDebug.amazonFulfilledLabel,
+      primeLabel: originalSellerDebug.primeLabel,
+      rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound,
+      fbmExcluded,
+      productIntelligence: productIntelligenceProfile,
+      baselineMaster: originalBaselineResult?.master || null,
+      originalTitle: originalProfile.title,
+      originalPrice: originalPrice === null ? 'n/a' : formatPrice(originalPrice),
+      originalSourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+      candidateCount: candidates.length,
+      bestScore: bestObservedScore,
+      bestCandidateDebug,
+      query: primaryQuery,
+      shortQuery: similarProductTestMode ? shortQuery : '',
+      reason: rejectReason,
+      detail:
+        rejectReason === 'PRICE_MISSING'
+          ? 'Originalpreis oder Kandidatenpreis fehlt/ist ungueltig.'
+          : 'Kandidatenpreis ist nicht guenstiger als Originalpreis.'
+    });
+  }
+
+  bestCandidate.priceValue = bestCandidatePrice;
+
+  const differenceAmount = Math.max(0, originalPrice - bestCandidatePrice);
+  const differencePercent = originalPrice > 0 ? Math.round((differenceAmount / originalPrice) * 1000) / 10 : 0;
+  const linkRecord = buildAmazonAffiliateLinkRecord(bestCandidate.normalizedUrl || bestCandidate.detailPageUrl || bestCandidate.asin, {
+    asin: bestCandidate.asin
+  });
+  const alternativeBaselineResult = maybeStoreProductIntelligenceMaster({
+    profile: productIntelligenceProfile,
+    candidate: {
+      asin: bestCandidate.asin,
+      brand: bestCandidate.brand,
+      title: bestCandidate.title,
+      price: bestCandidate.priceValue
+    },
+    sellerClass: bestCandidate.similarCheaperSellerClass,
+    similarityScore: bestCandidate.similarCheaperScore,
+    source: 'similar_search'
+  });
+  const result = {
+    checked: true,
+    allowed: true,
+    sellerClass: eligibility.sellerClass,
+    similarCheaperFound: true,
+    similarCheaperPrice: formatPrice(bestCandidate.priceValue),
+    similarCheaperPriceValue: bestCandidate.priceValue,
+    similarCheaperAsin: bestCandidate.asin,
+    similarCheaperTitle: cleanText(bestCandidate.title),
+    similarCheaperReason: bestCandidate.similarCheaperReason,
+    similarCheaperSellerClass: bestCandidate.similarCheaperSellerClass,
+    similarCheaperShipping: bestCandidate.similarCheaperShipping,
+    similarCheaperSellerSource: bestCandidate.similarCheaperSellerSource || '',
+    similarCheaperMerchantName: bestCandidate.similarCheaperMerchantName || '',
+    similarCheaperIsAmazonFulfilled: bestCandidate.similarCheaperIsAmazonFulfilled === true,
+    similarCheaperIsPrimeEligible: bestCandidate.similarCheaperIsPrimeEligible === true,
+    similarCheaperRawSellerKeysFound: bestCandidate.similarCheaperRawSellerKeysFound || [],
+    similarCheaperAmazonFulfilledLabel: bestCandidate.similarCheaperAmazonFulfilledLabel || '',
+    similarCheaperPrimeLabel: bestCandidate.similarCheaperPrimeLabel || '',
+    similarCheaperScore: bestCandidate.similarCheaperScore,
+    optimizedTitle: cleanText(bestCandidate.title),
+    optimizedPrice: formatPrice(bestCandidate.priceValue),
+    optimizedPriceValue: bestCandidate.priceValue,
+    optimizedAsin: bestCandidate.asin,
+    optimizedAffiliateUrl: linkRecord.valid ? linkRecord.affiliateUrl : cleanText(bestCandidate.affiliateUrl),
+    optimizedImageUrl: resolveOptimizedCandidateImageUrl(bestCandidate),
+    optimizedSellerClass: bestCandidate.similarCheaperSellerClass,
+    optimizedSellerSource: bestCandidate.similarCheaperSellerSource || '',
+    optimizedMerchantName: bestCandidate.similarCheaperMerchantName || '',
+    optimizedIsAmazonFulfilled: bestCandidate.similarCheaperIsAmazonFulfilled === true,
+    optimizedIsPrimeEligible: bestCandidate.similarCheaperIsPrimeEligible === true,
+    optimizedRawSellerKeysFound: bestCandidate.similarCheaperRawSellerKeysFound || [],
+    similarityScore: bestCandidate.similarCheaperScore,
+    alternativePrice: formatPrice(bestCandidate.priceValue),
+    alternativePriceValue: bestCandidate.priceValue,
+    alternativeScore: bestCandidate.similarCheaperScore,
+    alternativeShipping: bestCandidate.similarCheaperShipping,
+    affiliateUrl: linkRecord.valid ? linkRecord.affiliateUrl : cleanText(bestCandidate.affiliateUrl),
+    sourceTelegramText: originalDataSources.sourceTelegramText,
+    sourceGroup: originalDataSources.sourceGroup,
+    originalTitle: originalProfile.title,
+    originalPrice: formatPrice(originalPrice),
+    originalPriceValue: originalPrice,
+    originalUrl: originalDataSources.originalUrl,
+    originalAsin: originalDataSources.originalAsin,
+    originalSourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+    amazonApiTitle: cleanText(bestCandidate.title),
+    amazonAsin: cleanText(bestCandidate.asin).toUpperCase(),
+    amazonMerchantName: bestCandidate.similarCheaperMerchantName || '',
+    amazonMerchantId: cleanText(bestCandidate.merchantId || bestCandidate.sellerId || ''),
+    amazonIsAmazonFulfilled: bestCandidate.similarCheaperIsAmazonFulfilled === true,
+    amazonIsPrimeEligible: bestCandidate.similarCheaperIsPrimeEligible === true,
+    amazonSellerClass: bestCandidate.similarCheaperSellerClass,
+    amazonSellerSource: bestCandidate.similarCheaperSellerSource || '',
+    candidateCount: candidates.length,
+    bestScore: bestObservedScore,
+    differenceAmount: formatPrice(differenceAmount),
+    differencePercent,
+    originalProductRoleInfo: bestCandidate.originalProductRoleInfo || originalProfile.productRoleInfo || null,
+    optimizedProductRoleInfo: bestCandidate.optimizedProductRoleInfo || null,
+    productRoleComparison: bestCandidate.productRoleComparison || null,
+    productRoleComparable: bestCandidate.productRoleComparable === true,
+    originalProductRole: bestCandidate.originalProductRole || '',
+    optimizedProductRole: bestCandidate.optimizedProductRole || '',
+    originalQuantityInfo: bestCandidate.originalQuantityInfo || originalProfile.quantityInfo || null,
+    optimizedQuantityInfo: bestCandidate.optimizedQuantityInfo || null,
+    quantityComparison: bestCandidate.quantityComparison || null,
+    quantityComparable: bestCandidate.quantityComparable === true,
+    originalQuantity: bestCandidate.originalQuantity || '',
+    optimizedQuantity: bestCandidate.optimizedQuantity || '',
+    originalUnitPrice: bestCandidate.originalUnitPrice || '',
+    optimizedUnitPrice: bestCandidate.optimizedUnitPrice || '',
+    priceValid: true,
+    rawPriceObject: resolveSimilarCandidateRawPriceObject(bestCandidate),
+    extractedPrice: bestCandidate.priceValue,
+    softOptimizedDeal: bestCandidate.softOptimizedDeal === true,
+    strictScoreThreshold,
+    minimumPostScoreThreshold,
+    similarSearchQuery: bestCandidate.similarSearchQuery || '',
+    similarSearchQueryType: bestCandidate.similarSearchQueryType || '',
+    fbmExcluded,
+    productIntelligence: productIntelligenceProfile,
+    baselineMaster: alternativeBaselineResult?.master || originalBaselineResult?.master || null,
+    baselineResult: alternativeBaselineResult || null,
+    priceErrorProtected: alternativeBaselineResult?.priceErrorProtected === true,
+    ignoredAsPriceError: alternativeBaselineResult?.priceErrorProtected === true,
+    query: primaryQuery,
+    shortQuery: similarProductTestMode ? shortQuery : '',
+    candidate: bestCandidate
+  };
+
+  const cheaperVariantPayload = await findCheapestAllowedVariation({
+    finalCandidate: bestCandidate,
+    originalProfile,
+    currentResult: result,
+    testMode: similarProductTestMode,
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || ''
+  });
+  if (cheaperVariantPayload) {
+    result = applyVariantToSimilarResult(result, cheaperVariantPayload);
+  }
+
+  if (result.softOptimizedDeal === true) {
+    console.info('[SIMILAR_PRODUCT_SOFT_OPTIMIZED_FOUND]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      originalAsin: originalProfile.asin,
+      similarCheaperAsin: result.similarCheaperAsin,
+      similarCheaperPrice: result.similarCheaperPrice,
+      similarityScore: result.similarityScore,
+      threshold: minimumPostScoreThreshold,
+      strictThreshold: strictScoreThreshold,
+      query: result.similarSearchQuery || result.query
+    });
+  }
+
+  console.info('[SIMILAR_PRODUCT_CHEAPER_FOUND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: originalProfile.asin,
+    similarCheaperAsin: result.similarCheaperAsin,
+    similarCheaperPrice: result.similarCheaperPrice,
+    similarCheaperScore: result.similarCheaperScore,
+    shipping: result.similarCheaperShipping,
+    fbmExcluded
+  });
+  console.info('[SIMILAR_CHEAPER_FOUND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: originalProfile.asin,
+    similarCheaperAsin: result.similarCheaperAsin,
+    similarCheaperPrice: result.similarCheaperPrice,
+    similarCheaperScore: result.similarCheaperScore,
+    candidateCount: candidates.length,
+    bestScore: bestObservedScore
+  });
+  console.info('[OPTIMIZED_DEAL_FOUND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: originalProfile.asin,
+    similarCheaperAsin: result.similarCheaperAsin,
+    similarCheaperPrice: result.similarCheaperPrice,
+    similarityScore: result.similarCheaperScore,
+    priceErrorProtected: result.priceErrorProtected
+  });
+  console.info('[OPTIMIZED_DEAL_ORIGINAL_CONTEXT_ATTACHED]', {
+    originalTitle: result.originalTitle,
+    originalPrice: result.originalPrice,
+    originalSourceGroup: result.originalSourceGroup
+  });
+  console.info('[OPTIMIZED_DEAL_AFFILIATE_LINK_USED]', {
+    optimizedAsin: result.optimizedAsin,
+    optimizedAffiliateUrl: result.optimizedAffiliateUrl,
+    ownAffiliateLink: Boolean(result.optimizedAffiliateUrl)
+  });
+  console.info('[OPTIMIZED_DEAL_IMAGE_SELECTED]', {
+    optimizedAsin: result.optimizedAsin,
+    optimizedImageUrl: result.optimizedImageUrl || '',
+    imageSource: result.optimizedImageUrl ? 'amazon_product_data' : 'missing'
+  });
+  console.info('[OPTIMIZED_DEAL_OUTPUT_BUILT]', {
+    originalTitle: result.originalTitle,
+    originalPrice: result.originalPrice,
+    originalSourceGroup: result.originalSourceGroup,
+    optimizedTitle: result.optimizedTitle,
+    optimizedPrice: result.optimizedPrice,
+    optimizedAsin: result.optimizedAsin,
+    optimizedAffiliateUrl: result.optimizedAffiliateUrl,
+    optimizedImageUrl: result.optimizedImageUrl,
+    optimizedSellerClass: result.optimizedSellerClass,
+    optimizedSellerSource: result.optimizedSellerSource,
+    optimizedMerchantName: result.optimizedMerchantName,
+    optimizedIsAmazonFulfilled: result.optimizedIsAmazonFulfilled,
+    optimizedIsPrimeEligible: result.optimizedIsPrimeEligible,
+    optimizedRawSellerKeysFound: result.optimizedRawSellerKeysFound,
+    similarityScore: result.similarityScore,
+    differenceAmount: result.differenceAmount,
+    differencePercent: result.differencePercent,
+    originalProductRole: result.originalProductRole,
+    optimizedProductRole: result.optimizedProductRole,
+    productRoleComparable: result.productRoleComparable === true,
+    originalQuantity: result.originalQuantity,
+    optimizedQuantity: result.optimizedQuantity,
+    originalUnitPrice: result.originalUnitPrice,
+    optimizedUnitPrice: result.optimizedUnitPrice,
+    quantityComparable: result.quantityComparable === true,
+    similarCheaperReason: result.similarCheaperReason
+  });
+
+  return result;
+}
+
+function shortenSimilarText(value = '', maxLength = 120) {
+  const text = cleanText(value).replace(/\s+/g, ' ');
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, maxLength - 3).trim()}...`;
+}
+
+function resolveOptimizedCouponContext({ generatorInput = {}, similarCheck = {}, structuredMessage = {} } = {}) {
+  const couponCode =
+    cleanText(similarCheck.couponCode) ||
+    cleanText(generatorInput.couponCode) ||
+    extractTelegramCouponCode(structuredMessage?.text || '');
+  const couponValue = cleanText(similarCheck.couponValue || generatorInput.couponValue);
+  const subscribeDiscount = cleanText(similarCheck.subscribeDiscount || generatorInput.subscribeDiscount);
+  const couponDetected = similarCheck.couponDetected === true || generatorInput.couponDetected === true || Boolean(couponValue);
+  const subscribeDetected =
+    similarCheck.subscribeDetected === true || generatorInput.subscribeDetected === true || Boolean(subscribeDiscount);
+  const infoParts = [];
+
+  if (couponDetected) {
+    infoParts.push(couponValue ? `Amazon Coupon: ${couponValue}` : 'Amazon Coupon erkannt');
+  }
+  if (subscribeDetected) {
+    infoParts.push(subscribeDiscount ? `Spar-Abo: ${subscribeDiscount}` : 'Spar-Abo erkannt');
+  }
+  if (couponCode) {
+    infoParts.push(`Code: ${couponCode}`);
+  }
+
+  return {
+    couponCode,
+    couponInfo: infoParts.join(' | ') || 'Kein Coupon erkannt',
+    couponDetected,
+    subscribeDetected,
+    couponValue,
+    subscribeDiscount
+  };
+}
+
+function resolveOptimizedVariantInfo(similarCheck = {}) {
+  if (similarCheck.variantSelected === true) {
+    return shortenSimilarText(similarCheck.variantLabel || 'Guenstigste Variante gewaehlt', 90);
+  }
+
+  return 'Keine guenstigere erlaubte Variante gewaehlt';
+}
+
+function buildOptimizedSimilarDealPost(similarCheck = {}) {
+  const optimizedTitleRaw = cleanText(similarCheck.optimizedTitle || similarCheck.similarCheaperTitle) || 'Optimierter Amazon Deal';
+  const optimizedTitleShort = escapeTelegramHtml(shortenSimilarText(optimizedTitleRaw, 90));
+  const originalTitle = escapeTelegramHtml(shortenSimilarText(similarCheck.originalTitle, 90) || 'Urspruenglicher Deal');
+  const sourceGroup = escapeTelegramHtml(cleanText(similarCheck.originalSourceGroup) || 'Unbekannt');
+  const optimizedPrice = escapeTelegramHtml(formatPrice(similarCheck.optimizedPriceValue || similarCheck.similarCheaperPriceValue || similarCheck.optimizedPrice || similarCheck.similarCheaperPrice) || similarCheck.optimizedPrice || similarCheck.similarCheaperPrice || 'n/a');
+  const optimizedSellerClass = escapeTelegramHtml(similarCheck.optimizedSellerClass || similarCheck.similarCheaperSellerClass || 'Amazon/FBA');
+  const similarityScore = escapeTelegramHtml(String(similarCheck.similarityScore ?? similarCheck.similarCheaperScore ?? 'n/a'));
+  const reason = escapeTelegramHtml(shortenSimilarText(similarCheck.similarCheaperReason || 'Aehnliches Produkt guenstiger gefunden.', 120));
+  const affiliateUrl = cleanText(similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl);
+  const couponCode = cleanText(similarCheck.couponCode);
+  const couponInfo = escapeTelegramHtml(cleanText(similarCheck.couponInfo) || 'Kein Coupon erkannt');
+  const variantInfo = escapeTelegramHtml(resolveOptimizedVariantInfo(similarCheck));
+  const originalQuantity = cleanText(similarCheck.originalQuantity);
+  const optimizedQuantity = cleanText(similarCheck.optimizedQuantity);
+  const originalUnitPrice = cleanText(similarCheck.originalUnitPrice);
+  const optimizedUnitPrice = cleanText(similarCheck.optimizedUnitPrice);
+  const quantityLine =
+    originalQuantity || optimizedQuantity
+      ? `\u{1F4E6} Menge: ${escapeTelegramHtml(originalQuantity || 'n/a')} \u2192 ${escapeTelegramHtml(optimizedQuantity || 'n/a')}`
+      : '';
+  const unitPriceLine =
+    originalUnitPrice || optimizedUnitPrice
+      ? `\u{1F4B6} Grundpreis: ${escapeTelegramHtml(originalUnitPrice || 'n/a')} \u2192 ${escapeTelegramHtml(optimizedUnitPrice || 'n/a')}`
+      : '';
+  const generatorPost = generatePostText({
+    productTitle: optimizedTitleRaw,
+    neuerPreis: similarCheck.optimizedPriceValue || similarCheck.similarCheaperPriceValue || similarCheck.optimizedPrice || similarCheck.similarCheaperPrice,
+    amazonLink: affiliateUrl,
+    textBaustein: '',
+    extraOptions: couponCode ? [COUPON_OPTION_LABEL] : [],
+    freiText: '',
+    rabattgutscheinCode: couponCode
+  }).telegramCaption.trim();
+
+  return [
+    generatorPost,
+    '\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
+    '',
+    '\u{1F4CA} Optimiert gefunden',
+    '',
+    '\u{1F4E2} Ursprung:',
+    sourceGroup,
+    '',
+    '\u{1F6D2} Original:',
+    originalTitle,
+    '',
+    `\u{1F4B6} Originalpreis: ${escapeTelegramHtml(similarCheck.originalPrice || 'n/a')}`,
+    '',
+    '\u2705 Besserer Fund:',
+    optimizedTitleShort,
+    '',
+    `\u{1F525} Neuer Preis: ${optimizedPrice}`,
+    '',
+    `\u{1F4B0} Ersparnis: ${escapeTelegramHtml(similarCheck.differenceAmount || 'n/a')} (${escapeTelegramHtml(String(similarCheck.differencePercent ?? 'n/a'))}%)`,
+    '',
+    '\u{1F39F} Coupon:',
+    couponInfo,
+    '',
+    '\u{1F3A8} Beste Variante:',
+    variantInfo,
+    '',
+    ...(similarCheck.variantSelected === true
+      ? [
+          `\u{1F4B6} Vorheriger Fund: ${escapeTelegramHtml(similarCheck.previousCandidatePrice || 'n/a')}`,
+          `\u{1F525} Beste Variante: ${escapeTelegramHtml(similarCheck.variantPrice || optimizedPrice)}`,
+          `\u{1F4B0} Extra gespart: ${escapeTelegramHtml(similarCheck.variantDifferenceAmount || 'n/a')} (${escapeTelegramHtml(String(similarCheck.variantDifferencePercent ?? 'n/a'))}%)`,
+          ''
+        ]
+      : []),
+    ...(quantityLine ? [quantityLine, ''] : []),
+    ...(unitPriceLine ? [unitPriceLine, ''] : []),
+    `\u{1F4E6} Versand/Seller: ${optimizedSellerClass}`,
+    '',
+    `\u{1F50E} Aehnlichkeit: ${similarityScore}/100`,
+    '',
+    '\u{1F6E1}\uFE0F Schutz:',
+    'Nur Amazon/FBA akzeptiert.',
+    'FBM wurde ausgeschlossen.',
+    '',
+    '\u{1F4CC} Warum besser:',
+    reason
+  ].join('\n');
+}
+
+async function publishSimilarProductOptimizedChannel({
+  sessionName = '',
+  source = {},
+  structuredMessage = {},
+  generatorInput = {},
+  similarCheck = null
+} = {}) {
+  const disabledReason = getOptimizedDealsDisabledReason();
+  if (disabledReason) {
+    logOptimizedDealsDisabledSendBlocked({
+      context: 'similar_product_optimized_publish',
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: generatorInput?.asin || similarCheck?.similarCheaperAsin || '',
+      reason: disabledReason
+    });
+    return { sent: false, reason: disabledReason };
+  }
+
+  if (!similarCheck?.similarCheaperFound) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: generatorInput?.asin || '',
+      reason: similarCheck?.reason || 'no_cheaper_candidate'
+    });
+    optimizedChannelCache.lastSkipReason = similarCheck?.reason || 'no_cheaper_candidate';
+    return { sent: false, reason: optimizedChannelCache.lastSkipReason };
+  }
+
+  const optimizedSellerClass = normalizeSimilarSellerClass(
+    similarCheck.optimizedSellerClass || similarCheck.similarCheaperSellerClass || similarCheck.similarCheaperShipping
+  );
+  const optimizedTestMode = isSimilarProductTestModeActive();
+  const optimizedSellerAllowed =
+    optimizedSellerClass === 'AMAZON_DIRECT' ||
+    optimizedSellerClass === 'FBA' ||
+    (optimizedTestMode && optimizedSellerClass === 'FBA_OR_AMAZON_UNKNOWN');
+
+  if (
+    cleanText(similarCheck.apiStatus).toUpperCase() === 'THROTTLED' ||
+    cleanText(similarCheck.reason).toUpperCase() === 'API_THROTTLED'
+  ) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'API_THROTTLED'
+    });
+    optimizedChannelCache.lastSkipReason = 'API_THROTTLED';
+    return { sent: false, reason: 'API_THROTTLED' };
+  }
+
+  if (!optimizedSellerAllowed) {
+    const skipReason = optimizedSellerClass.includes('FBM')
+      ? 'candidate_is_fbm'
+      : optimizedSellerClass === 'UNKNOWN'
+        ? 'SELLER_UNKNOWN_NOT_ALLOWED'
+        : 'SELLER_NOT_ALLOWED';
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: skipReason,
+      sellerClass: optimizedSellerClass,
+      shipping: similarCheck.similarCheaperShipping || 'UNKNOWN'
+    });
+    optimizedChannelCache.lastSkipReason = skipReason;
+    return { sent: false, reason: skipReason };
+  }
+
+  if (similarCheck.productRoleComparable === false || similarCheck.productRoleComparison?.allowed === false) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'PRODUCT_ROLE_MISMATCH',
+      originalRole: similarCheck.originalProductRole || similarCheck.productRoleComparison?.originalRoleLabel || '',
+      optimizedRole: similarCheck.optimizedProductRole || similarCheck.productRoleComparison?.candidateRoleLabel || '',
+      detail: similarCheck.productRoleComparison?.reason || 'Produktrolle nicht vergleichbar.'
+    });
+    optimizedChannelCache.lastSkipReason = 'PRODUCT_ROLE_MISMATCH';
+    return { sent: false, reason: 'PRODUCT_ROLE_MISMATCH' };
+  }
+
+  if (similarCheck.quantityComparable === false || similarCheck.quantityComparison?.allowed === false) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'PACK_SIZE_MISMATCH',
+      originalQuantity: similarCheck.originalQuantity || similarCheck.quantityComparison?.originalQuantityLabel || '',
+      optimizedQuantity: similarCheck.optimizedQuantity || similarCheck.quantityComparison?.candidateQuantityLabel || '',
+      originalUnitPrice: similarCheck.originalUnitPrice || similarCheck.quantityComparison?.originalUnitPrice || '',
+      optimizedUnitPrice: similarCheck.optimizedUnitPrice || similarCheck.quantityComparison?.candidateUnitPrice || ''
+    });
+    optimizedChannelCache.lastSkipReason = 'PACK_SIZE_MISMATCH';
+    return { sent: false, reason: 'PACK_SIZE_MISMATCH' };
+  }
+
+  const publishOptimizedPrice = resolveFirstSimilarPositivePrice(
+    similarCheck.optimizedPriceValue,
+    similarCheck.similarCheaperPriceValue,
+    similarCheck.alternativePriceValue,
+    similarCheck.candidate?.priceValue,
+    similarCheck.optimizedPrice,
+    similarCheck.similarCheaperPrice
+  );
+  const publishOriginalPrice = resolveFirstSimilarPositivePrice(similarCheck.originalPriceValue, similarCheck.originalPrice);
+
+  if (publishOptimizedPrice === null || publishOriginalPrice === null) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'PRICE_MISSING',
+      rawPriceObject: similarCheck.rawPriceObject || resolveSimilarCandidateRawPriceObject(similarCheck.candidate || {}),
+      extractedPrice: publishOptimizedPrice,
+      originalPrice: publishOriginalPrice,
+      priceValid: false
+    });
+    optimizedChannelCache.lastSkipReason = 'PRICE_MISSING';
+    return { sent: false, reason: 'PRICE_MISSING' };
+  }
+
+  if (publishOptimizedPrice >= publishOriginalPrice) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'PRICE_NOT_CHEAPER',
+      extractedPrice: publishOptimizedPrice,
+      originalPrice: publishOriginalPrice,
+      priceValid: true
+    });
+    optimizedChannelCache.lastSkipReason = 'PRICE_NOT_CHEAPER';
+    return { sent: false, reason: 'PRICE_NOT_CHEAPER' };
+  }
+
+  const publishDifferenceAmount = Math.max(0, publishOriginalPrice - publishOptimizedPrice);
+  const publishDifferencePercent = publishOriginalPrice > 0 ? Math.round((publishDifferenceAmount / publishOriginalPrice) * 1000) / 10 : 0;
+  const publishSimilarityScore = Number(similarCheck.similarityScore ?? similarCheck.similarCheaperScore ?? 0);
+
+  if (!Number.isFinite(publishSimilarityScore) || publishSimilarityScore < SIMILAR_PRODUCT_MIN_SCORE) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'SIMILARITY_TOO_LOW',
+      similarityScore: Number.isFinite(publishSimilarityScore) ? publishSimilarityScore : null,
+      threshold: SIMILAR_PRODUCT_MIN_SCORE
+    });
+    optimizedChannelCache.lastSkipReason = 'SIMILARITY_TOO_LOW';
+    return { sent: false, reason: 'SIMILARITY_TOO_LOW' };
+  }
+
+  if (publishDifferencePercent < 3) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'SAVING_TOO_LOW',
+      differencePercent: publishDifferencePercent,
+      minimumDifferencePercent: 3
+    });
+    optimizedChannelCache.lastSkipReason = 'SAVING_TOO_LOW';
+    return { sent: false, reason: 'SAVING_TOO_LOW' };
+  }
+
+  similarCheck.optimizedPriceValue = publishOptimizedPrice;
+  similarCheck.similarCheaperPriceValue = publishOptimizedPrice;
+  similarCheck.originalPriceValue = publishOriginalPrice;
+  similarCheck.optimizedPrice = formatPrice(publishOptimizedPrice);
+  similarCheck.similarCheaperPrice = formatPrice(publishOptimizedPrice);
+  similarCheck.originalPrice = formatPrice(publishOriginalPrice);
+  similarCheck.differenceAmount = formatPrice(publishDifferenceAmount);
+  similarCheck.differencePercent = publishDifferencePercent;
+  similarCheck.priceValid = true;
+  const optimizedCouponContext = resolveOptimizedCouponContext({
+    generatorInput,
+    similarCheck,
+    structuredMessage
+  });
+  similarCheck.couponCode = optimizedCouponContext.couponCode;
+  similarCheck.couponInfo = optimizedCouponContext.couponInfo;
+  similarCheck.couponDetected = optimizedCouponContext.couponDetected;
+  similarCheck.couponValue = optimizedCouponContext.couponValue;
+  similarCheck.subscribeDetected = optimizedCouponContext.subscribeDetected;
+  similarCheck.subscribeDiscount = optimizedCouponContext.subscribeDiscount;
+
+  if (optimizedCouponContext.couponDetected === true || optimizedCouponContext.subscribeDetected === true) {
+    console.info('[COUPON_APPLIED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      couponInfo: optimizedCouponContext.couponInfo,
+      codeDetected: Boolean(optimizedCouponContext.couponCode)
+    });
+  }
+  if (similarCheck.variantSelected === true) {
+    console.info('[VARIANT_SELECTED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      label: similarCheck.variantLabel || '',
+      previousCandidatePrice: similarCheck.previousCandidatePrice || '',
+      variantPrice: similarCheck.variantPrice || ''
+    });
+  }
+
+  if (!cleanText(similarCheck.affiliateUrl)) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'affiliate_link_missing'
+    });
+    optimizedChannelCache.lastSkipReason = 'affiliate_link_missing';
+    return { sent: false, reason: 'affiliate_link_missing' };
+  }
+
+  if (!OPTIMIZED_CHANNEL_ENABLED) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'optimized_channel_disabled'
+    });
+    optimizedChannelCache.lastSkipReason = 'optimized_channel_disabled';
+    return { sent: false, reason: 'optimized_channel_disabled' };
+  }
+
+  const chatId = await resolveOptimizedDealsChannelId();
+  if (!chatId) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: 'optimized_channel_missing_target'
+    });
+    optimizedChannelCache.lastSkipReason = 'optimized_channel_missing_target';
+    return { sent: false, reason: 'optimized_channel_missing_target' };
+  }
+
+  console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SEND]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: generatorInput?.asin || '',
+    similarCheaperAsin: similarCheck.similarCheaperAsin,
+    chatId,
+    score: similarCheck.similarCheaperScore
+  });
+
+  const optimizedPostText = buildOptimizedSimilarDealPost(similarCheck);
+  const finalSendDisabledReason = getOptimizedDealsDisabledReason();
+  if (finalSendDisabledReason) {
+    logOptimizedDealsDisabledSendBlocked({
+      context: 'similar_product_optimized_final_send',
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: similarCheck.similarCheaperAsin || '',
+      reason: finalSendDisabledReason
+    });
+    return { sent: false, reason: finalSendDisabledReason };
+  }
+
+  const result = await sendTelegramPost({
+    text: optimizedPostText,
+    chatId,
+    imageUrl: cleanText(similarCheck.optimizedImageUrl),
+    disableWebPagePreview: false,
+    titlePreview: similarCheck.similarCheaperTitle || 'Optimierter Deal',
+    hasAffiliateLink: true,
+    postContext: 'similar_product_optimized'
+  });
+  let couponCodeResult = null;
+  if (cleanText(similarCheck.couponCode)) {
+    try {
+      couponCodeResult = await sendTelegramPost({
+        text: ['\u{1F4CB} CODE:', cleanText(similarCheck.couponCode)].join('\n'),
+        chatId,
+        disableWebPagePreview: true,
+        titlePreview: 'Optimierter Deal Code',
+        hasAffiliateLink: false,
+        postContext: 'similar_product_optimized_code'
+      });
+    } catch (couponCodeError) {
+      console.warn('[OPTIMIZED_DEAL_CODE_SEND_FAILED]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: similarCheck.similarCheaperAsin || '',
+        reason: couponCodeError instanceof Error ? couponCodeError.message : 'Code-Nachricht konnte nicht gesendet werden.'
+      });
+    }
+  }
+
+  console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SENT]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: generatorInput?.asin || '',
+    similarCheaperAsin: similarCheck.similarCheaperAsin,
+    chatId,
+    telegramMessageId: result?.messageId || null,
+    couponCodeMessageId: couponCodeResult?.messageId || null
+  });
+  optimizedChannelCache.lastSkipReason = '';
+  optimizedChannelCache.lastOptimizedDeal = {
+    originalTitle: similarCheck.originalTitle || '',
+    originalPrice: similarCheck.originalPrice || '',
+    originalSourceGroup: similarCheck.originalSourceGroup || '',
+    optimizedTitle: similarCheck.optimizedTitle || similarCheck.similarCheaperTitle || '',
+    optimizedPrice: similarCheck.optimizedPrice || similarCheck.similarCheaperPrice || '',
+    optimizedAsin: similarCheck.optimizedAsin || similarCheck.similarCheaperAsin || '',
+    optimizedAffiliateUrl: similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl || '',
+    optimizedImageUrl: similarCheck.optimizedImageUrl || '',
+    optimizedSellerClass: similarCheck.optimizedSellerClass || similarCheck.similarCheaperSellerClass || '',
+    optimizedSellerSource: similarCheck.optimizedSellerSource || similarCheck.similarCheaperSellerSource || '',
+    optimizedMerchantName: similarCheck.optimizedMerchantName || similarCheck.similarCheaperMerchantName || '',
+    optimizedIsAmazonFulfilled: similarCheck.optimizedIsAmazonFulfilled ?? similarCheck.similarCheaperIsAmazonFulfilled ?? null,
+    optimizedIsPrimeEligible: similarCheck.optimizedIsPrimeEligible ?? similarCheck.similarCheaperIsPrimeEligible ?? null,
+    optimizedRawSellerKeysFound: similarCheck.optimizedRawSellerKeysFound || similarCheck.similarCheaperRawSellerKeysFound || [],
+    similarityScore: similarCheck.similarityScore ?? similarCheck.similarCheaperScore ?? null,
+    differenceAmount: similarCheck.differenceAmount || '',
+    differencePercent: similarCheck.differencePercent ?? null,
+    couponInfo: similarCheck.couponInfo || '',
+    couponCode: similarCheck.couponCode || '',
+    variantSelected: similarCheck.variantSelected === true,
+    variantLabel: similarCheck.variantLabel || '',
+    similarCheaperReason: similarCheck.similarCheaperReason || '',
+    sentAt: nowIso(),
+    messageId: result?.messageId || null,
+    couponCodeMessageId: couponCodeResult?.messageId || null
+  };
+  optimizedChannelCache.lastOriginalSourceGroup = similarCheck.originalSourceGroup || '';
+  optimizedChannelCache.lastComparisonPrice = similarCheck.optimizedPrice || similarCheck.similarCheaperPrice || '';
+  console.info('[OPTIMIZED_DEAL_SENT]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: generatorInput?.asin || '',
+    similarCheaperAsin: similarCheck.similarCheaperAsin,
+    chatId,
+    telegramMessageId: result?.messageId || null,
+    couponCodeMessageId: couponCodeResult?.messageId || null
+  });
+  console.info('[OPTIMIZED_DEAL_POSTED]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalAsin: generatorInput?.asin || '',
+    optimizedAsin: similarCheck.optimizedAsin || similarCheck.similarCheaperAsin || '',
+    chatId,
+    telegramMessageId: result?.messageId || null,
+    couponCodeMessageId: couponCodeResult?.messageId || null,
+    couponInfo: similarCheck.couponInfo || '',
+    variantInfo: resolveOptimizedVariantInfo(similarCheck)
+  });
+  console.info('[OPTIMIZED_DEAL_SENT_WITH_COMPARISON]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    originalTitle: similarCheck.originalTitle || '',
+    originalPrice: similarCheck.originalPrice || '',
+    originalSourceGroup: similarCheck.originalSourceGroup || '',
+    optimizedTitle: similarCheck.optimizedTitle || similarCheck.similarCheaperTitle || '',
+    optimizedPrice: similarCheck.optimizedPrice || similarCheck.similarCheaperPrice || '',
+    optimizedAsin: similarCheck.optimizedAsin || similarCheck.similarCheaperAsin || '',
+    optimizedAffiliateUrl: similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl || '',
+    optimizedImageUrl: similarCheck.optimizedImageUrl || '',
+    optimizedSellerClass: similarCheck.optimizedSellerClass || similarCheck.similarCheaperSellerClass || '',
+    optimizedSellerSource: similarCheck.optimizedSellerSource || similarCheck.similarCheaperSellerSource || '',
+    optimizedMerchantName: similarCheck.optimizedMerchantName || similarCheck.similarCheaperMerchantName || '',
+    optimizedIsAmazonFulfilled: similarCheck.optimizedIsAmazonFulfilled ?? similarCheck.similarCheaperIsAmazonFulfilled ?? null,
+    optimizedIsPrimeEligible: similarCheck.optimizedIsPrimeEligible ?? similarCheck.similarCheaperIsPrimeEligible ?? null,
+    optimizedRawSellerKeysFound: similarCheck.optimizedRawSellerKeysFound || similarCheck.similarCheaperRawSellerKeysFound || [],
+    similarityScore: similarCheck.similarityScore ?? similarCheck.similarCheaperScore ?? null,
+    differenceAmount: similarCheck.differenceAmount || '',
+    differencePercent: similarCheck.differencePercent ?? null,
+    couponInfo: similarCheck.couponInfo || '',
+    couponCode: similarCheck.couponCode || '',
+    variantSelected: similarCheck.variantSelected === true,
+    variantLabel: similarCheck.variantLabel || '',
+    similarCheaperReason: similarCheck.similarCheaperReason || '',
+    chatId,
+    telegramMessageId: result?.messageId || null
+  });
+
+  return { sent: true, messageId: result?.messageId || null };
 }
 
 function classifyRelaxedAmazonMatchScore(matchScore = 0, sourceFacts = {}, candidate = {}) {
@@ -3639,6 +7534,45 @@ function resolveReaderKeepaPriceCandidate(scrapedDeal = {}, pricing = {}) {
   );
 }
 
+function normalizeReaderTransparentPriceSource(rawPriceSource = '') {
+  const source = cleanText(rawPriceSource).toLowerCase();
+
+  if (source.includes('paapi')) {
+    return 'paapi';
+  }
+
+  if (source.includes('scrape') || source.includes('scraped') || source.includes('amazonfinal') || source.includes('amazonbuybox')) {
+    return 'scrape';
+  }
+
+  if (source.includes('keepa')) {
+    return 'keepa';
+  }
+
+  return 'fallback';
+}
+
+function logReaderTransparentPriceSource({ dealType = '', priceSource = '', rawPriceSource = '', price = '' } = {}) {
+  const normalizedSource = normalizeReaderTransparentPriceSource(priceSource || rawPriceSource);
+  const tagBySource = {
+    paapi: '[PRICE_SOURCE_PAAPI]',
+    scrape: '[PRICE_SOURCE_SCRAPE]',
+    keepa: '[PRICE_SOURCE_KEEPA]'
+  };
+  const tag = tagBySource[normalizedSource];
+
+  if (!tag) {
+    return;
+  }
+
+  console.info(tag, {
+    dealType: cleanText(dealType).toUpperCase() || 'AMAZON',
+    source: normalizedSource,
+    rawSource: cleanText(rawPriceSource) || 'unknown',
+    price: cleanText(price) || null
+  });
+}
+
 function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pricing = {} } = {}) {
   const normalizedDealType = cleanText(dealType).toUpperCase() || 'AMAZON';
   const amazonPriceCandidates = buildReaderAmazonPriceCandidates(scrapedDeal);
@@ -3670,8 +7604,11 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
     const selectedAmazonCandidate =
       [
         { source: 'paapiPrice', value: paapiPrice },
-        { source: 'telegramPrice', value: telegramPrice },
-        { source: 'keepaPrice', value: keepaPrice }
+        { source: 'amazonFinalPrice', value: amazonDealPrice },
+        { source: 'amazonScrapePrice', value: scrapedPrice },
+        { source: 'amazonBuyBox', value: amazonBuyBoxPrice },
+        { source: 'keepaPrice', value: keepaPrice },
+        { source: 'telegramPrice', value: telegramPrice }
       ].find((candidate) => candidate.value) || null;
 
     if (distinctAmazonPrices.length > 1) {
@@ -3686,12 +7623,7 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
 
     if (selectedAmazonCandidate?.value) {
       currentPrice = selectedAmazonCandidate.value;
-      priceSource =
-        selectedAmazonCandidate.source === 'telegramPrice'
-          ? 'telegram'
-          : selectedAmazonCandidate.source === 'keepaPrice'
-            ? 'keepa'
-            : 'amazon';
+      priceSource = normalizeReaderTransparentPriceSource(selectedAmazonCandidate.source);
       rawPriceSource = selectedAmazonCandidate.source;
     }
 
@@ -3724,12 +7656,12 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
     }
   } else if (scrapedPrice) {
     currentPrice = scrapedPrice;
-    priceSource = 'scraped';
+    priceSource = 'scrape';
     rawPriceSource = 'scraped';
   } else if (telegramPrice) {
     currentPrice = telegramPrice;
-    priceSource = 'telegram';
-      rawPriceSource = 'telegram';
+    priceSource = 'fallback';
+    rawPriceSource = 'telegram';
   }
 
   console.info('[FINAL_PRICE_SELECTED]', {
@@ -3743,6 +7675,12 @@ function resolveReaderPricePayload({ dealType = 'AMAZON', scrapedDeal = {}, pric
     source: priceSource,
     rawSource: rawPriceSource,
     price: currentPrice || null
+  });
+  logReaderTransparentPriceSource({
+    dealType: normalizedDealType,
+    priceSource,
+    rawPriceSource,
+    price: currentPrice
   });
 
   return {
@@ -4030,14 +7968,22 @@ async function formatTelegramMessage(message, fallbackGroup = '') {
     fallbackGroup ||
     chatId ||
     'Telegram';
+  const channelRef = username ? `@${username}` : '';
+  const channelTitle = group;
   const normalizedTimestamp = normalizeTelegramDate(message?.date);
+
+  console.log('[CHANNEL DETECTED]', {
+    chatId: chatId,
+    channelRef: channelRef,
+    channelTitle: channelTitle
+  });
 
   return {
     sessionName: '',
     messageId: message?.id ? String(message.id) : '',
     chatId,
-    channelRef: username ? `@${username}` : '',
-    channelTitle: group,
+    channelRef,
+    channelTitle,
     text,
     link: messageLink,
     externalLink,
@@ -4782,6 +8728,112 @@ function resolveReaderAiUsageMode(debugValues = {}) {
   return 'Nicht gestartet';
 }
 
+function formatDebugVisibleEuroPrice(value, fallback = 'n/a') {
+  const formatted = formatDebugPrice(value);
+  return formatted === 'n/a' ? fallback : formatted.replace(' EUR', '\u20AC');
+}
+
+function resolveDebugSourceGroupLabel(debugValues = {}) {
+  return (
+    cleanText(debugValues.channelRef) ||
+    cleanText(debugValues.channelTitle) ||
+    cleanText(debugValues.group) ||
+    'Unbekannt'
+  );
+}
+
+function normalizeVisibleReaderPriceSource(debugValues = {}) {
+  if (debugValues.couponDetected === true) {
+    return 'Amazon + Coupon';
+  }
+
+  const source = cleanText(debugValues.rawPriceSource || debugValues.priceSource).toLowerCase();
+
+  if (source.includes('paapi')) {
+    return 'PAAPI';
+  }
+
+  if (source.includes('creator')) {
+    return 'Creator API';
+  }
+
+  if (source.includes('scrape') || source.includes('scraped') || source.includes('amazonfinal') || source.includes('amazonbuybox')) {
+    return 'Scrape';
+  }
+
+  if (source.includes('telegram')) {
+    return 'Telegram';
+  }
+
+  if (source.includes('keepa')) {
+    return 'Keepa';
+  }
+
+  return cleanText(debugValues.priceSource) || 'Fallback';
+}
+
+function formatDebugDiscountLabel(value = '', fallback = 'Coupon') {
+  const text = cleanText(value);
+  if (!text) {
+    return fallback;
+  }
+
+  const numeric = parseDebugNumber(text, null);
+  if (numeric === null) {
+    return text;
+  }
+
+  if (/%/.test(text)) {
+    return `${Math.round(numeric * 10) / 10}%`;
+  }
+
+  if (/\u20AC|eur/i.test(text)) {
+    return formatDebugVisibleEuroPrice(numeric);
+  }
+
+  return text;
+}
+
+function resolveReaderPriceTransparency(debugValues = {}) {
+  const couponDetected = debugValues.couponDetected === true;
+  const subscribeDetected = debugValues.subscribeDetected === true;
+  const basePrice =
+    parseDebugNumber(debugValues.basePrice, null) ??
+    parseDebugNumber(debugValues.priceFromAmazonScrape, null) ??
+    parseDebugNumber(debugValues.detectedPrice, null);
+  const finalPrice =
+    parseDebugNumber(debugValues.finalPrice, null) ??
+    parseDebugNumber(debugValues.detectedPrice, null) ??
+    basePrice;
+  const visiblePrice = formatDebugVisibleEuroPrice(finalPrice);
+  const visibleSource = normalizeVisibleReaderPriceSource(debugValues);
+  const sourceGroup = resolveDebugSourceGroupLabel(debugValues);
+  let calculation = 'keine Coupon-Berechnung';
+
+  if (couponDetected) {
+    const basePriceText = formatDebugVisibleEuroPrice(basePrice);
+    const couponText = formatDebugDiscountLabel(debugValues.couponValue, 'unbekannter');
+    const finalPriceText = formatDebugVisibleEuroPrice(finalPrice);
+
+    calculation = subscribeDetected
+      ? `${basePriceText} minus ${couponText} Coupon minus ${formatDebugDiscountLabel(
+          debugValues.subscribeDiscount,
+          'Sparabo'
+        )} Sparabo = ${finalPriceText}`
+      : `${basePriceText} minus ${couponText} Coupon = ${finalPriceText}`;
+  }
+
+  return {
+    price: visiblePrice,
+    source: visibleSource,
+    calculation,
+    sourceGroup,
+    couponCalculationVisible: couponDetected,
+    basePrice: formatDebugVisibleEuroPrice(basePrice),
+    finalPrice: visiblePrice
+  };
+}
+
 function buildStructuredReaderDebugLines(debugValues = {}, options = {}) {
   const lines = [];
   const statusReason = shortenDebugReason(debugValues.reason || debugValues.invalidPriceReason || '-', '-');
@@ -4797,6 +8849,53 @@ function buildStructuredReaderDebugLines(debugValues = {}, options = {}) {
   const sellerUnknown =
     debugValues.sellerClass === 'UNKNOWN' ||
     (debugValues.soldByAmazon === null && debugValues.shippedByAmazon === null && cleanText(debugValues.sellerRecognitionMessage));
+  const priceTransparency = resolveReaderPriceTransparency(debugValues);
+
+  console.info('[PRICE_SOURCE_VISIBLE]', {
+    context: 'test_group_debug',
+    asin: cleanText(debugValues.asin).toUpperCase() || '',
+    sourceGroup: priceTransparency.sourceGroup,
+    price: priceTransparency.price,
+    priceSource: priceTransparency.source,
+    calculation: priceTransparency.calculation
+  });
+  if (priceTransparency.couponCalculationVisible === true) {
+    console.info('[PRICE_COUPON_CALCULATION_VISIBLE]', {
+      context: 'test_group_debug',
+      asin: cleanText(debugValues.asin).toUpperCase() || '',
+      sourceGroup: priceTransparency.sourceGroup,
+      basePrice: priceTransparency.basePrice,
+      couponValue: cleanText(debugValues.couponValue),
+      finalPrice: priceTransparency.finalPrice,
+      calculation: priceTransparency.calculation
+    });
+    console.info('[PRICE_FINAL_CALCULATED]', {
+      context: 'test_group_debug',
+      asin: cleanText(debugValues.asin).toUpperCase() || '',
+      basePrice: priceTransparency.basePrice,
+      couponValue: cleanText(debugValues.couponValue),
+      finalPrice: priceTransparency.finalPrice
+    });
+  }
+
+  lines.push('\u{1F4B6} <b>PREIS CHECK</b>');
+  lines.push(`\u{1F4B6} Preis: ${escapeTelegramHtml(priceTransparency.price)}`);
+  lines.push(`\u{1F50E} Preisquelle: ${escapeTelegramHtml(priceTransparency.source)}`);
+  lines.push(`\u{1F4CC} Berechnung: ${escapeTelegramHtml(priceTransparency.calculation)}`);
+  lines.push(`\u{1F4E2} Quellgruppe: ${escapeTelegramHtml(priceTransparency.sourceGroup)}`);
+  lines.push(`\u{1F50D} Aehnliche Produkte geprueft: ${escapeTelegramHtml(formatDebugBoolean(debugValues.similarProductsChecked === true))}`);
+  lines.push(`\u{1F4E6} Optimierte Alternative gefunden: ${escapeTelegramHtml(formatDebugBoolean(debugValues.similarCheaperFound === true))}`);
+  lines.push(`\u{1F4B6} Alternative Preis: ${escapeTelegramHtml(debugValues.similarCheaperPrice || 'n/a')}`);
+  lines.push(
+    `\u{1F4CA} Aehnlichkeit: ${escapeTelegramHtml(
+      debugValues.similarCheaperScore === null || debugValues.similarCheaperScore === undefined
+        ? 'n/a'
+        : `${debugValues.similarCheaperScore}/100`
+    )}`
+  );
+  lines.push(`\u{1F4E6} Versand Alternative: ${escapeTelegramHtml(debugValues.similarCheaperShipping || 'UNKNOWN')}`);
+  lines.push(`\u{1F6AB} FBM ausgeschlossen: ${escapeTelegramHtml(formatDebugBoolean(debugValues.similarFbmExcluded === true))}`);
+  lines.push('');
 
   if (options.diagnosticHeader === true) {
     lines.push('⚠️ <b>TESTPOST NICHT FREIGEGEBEN</b>');
@@ -4839,6 +8938,8 @@ function buildStructuredReaderDebugLines(debugValues = {}, options = {}) {
 
   lines.push('🏪 <b>SELLER CHECK</b>');
   lines.push(`🛒 Seller: ${escapeTelegramHtml(debugValues.sellerClass || 'UNKNOWN')}`);
+  lines.push(`🔎 Seller Quelle: ${escapeTelegramHtml(debugValues.sellerDetectionSource || 'unknown')}`);
+  lines.push(`📌 Seller Grund: ${escapeTelegramHtml(debugValues.sellerRecognitionMessage || 'Keine Zusatzinfo')}`);
   lines.push(`📦 Verkauf: ${escapeTelegramHtml(formatReaderSellerChannel(debugValues.soldByAmazon))}`);
   lines.push(`🚚 Versand: ${escapeTelegramHtml(formatReaderSellerChannel(debugValues.shippedByAmazon))}`);
   lines.push(`👤 Händlerprofil: ${escapeTelegramHtml(normalizeSellerProfileStatusLabel(debugValues.sellerProfileStatus))}`);
@@ -4971,6 +9072,7 @@ function collectReaderDebugValues({
   const invalidPrice = generatorInput?.invalidPrice === true;
   const invalidPriceReason = cleanText(generatorInput?.invalidPriceReason);
   const detectedPrice = pricing?.currentPrice ?? parseDebugNumber(generatorInput?.currentPrice, null);
+  const basePrice = parseDebugNumber(generatorInput?.basePrice || scrapedDeal?.basePrice, null);
   const scrapePrice = parseDebugNumber(scrapedDeal?.price, null);
   const keepaPrice = parseDebugNumber(keepa.currentPrice, null);
   const keepaReferencePrice = parseDebugNumber(keepa.referencePrice, null);
@@ -5016,6 +9118,10 @@ function collectReaderDebugValues({
       ? cleanText(internet.reason || learning.reason || keepa.strengthReason || 'Keepa-Fallback aktiv.')
       : '';
   const whyMarketNotUsed = internet.available === true ? '' : cleanText(internet.reason || internet.status || 'Marktvergleich nicht verfuegbar.');
+  const similarProductCheck =
+    generatorInput?.similarProductCheck && typeof generatorInput.similarProductCheck === 'object'
+      ? generatorInput.similarProductCheck
+      : {};
   const settingsAreas = {
     sampling: 'Sampling & Qualität',
     decision: 'Entscheidungslogik'
@@ -5095,8 +9201,10 @@ function collectReaderDebugValues({
     decisionSource: resolveReaderDecisionSource(generatorContext),
     asin: cleanText(generatorInput?.asin) || 'n/a',
     detectedPrice,
+    basePrice,
     marketPrice: comparisonPrice,
     priceSource,
+    rawPriceSource: cleanText(generatorInput?.rawPriceSource || scrapedDeal?.rawPriceSource),
     discountPercent: keepaDiscount,
     minDiscountPercent: thresholds.minDiscountPercent,
     score: finalScore,
@@ -5160,6 +9268,15 @@ function collectReaderDebugValues({
     subscribeDiscount: cleanText(generatorInput?.subscribeDiscount),
     finalPriceCalculated: generatorInput?.finalPriceCalculated === true,
     finalPrice: cleanText(generatorInput?.finalPrice),
+    similarProductsChecked: similarProductCheck.checked === true,
+    similarCheaperFound: similarProductCheck.similarCheaperFound === true,
+    similarCheaperPrice: cleanText(similarProductCheck.similarCheaperPrice || similarProductCheck.alternativePrice),
+    similarCheaperScore:
+      similarProductCheck.similarCheaperScore === null || similarProductCheck.similarCheaperScore === undefined
+        ? similarProductCheck.alternativeScore ?? null
+        : similarProductCheck.similarCheaperScore,
+    similarCheaperShipping: cleanText(similarProductCheck.similarCheaperShipping || similarProductCheck.alternativeShipping || 'UNKNOWN'),
+    similarFbmExcluded: similarProductCheck.fbmExcluded === true,
     comparisonPrice,
     scoreBase: keepaDealScore,
     scoreAdjustment,
@@ -6019,6 +10136,7 @@ function buildTelegramDealDebugInfoExtended(debugValues = {}) {
 
 function evaluateTelegramReaderGeneratorCandidate(generatorContext, readerConfig) {
   const learning = generatorContext?.learning || {};
+  const sellerClass = cleanText(generatorContext?.seller?.sellerClass).toUpperCase();
   const keepaAvailable = generatorContext?.keepa?.available === true;
   const dealLockBlocked = generatorContext?.dealLock?.blocked === true || learning?.dealLockBlocked === true;
 
@@ -6027,6 +10145,42 @@ function evaluateTelegramReaderGeneratorCandidate(generatorContext, readerConfig
       accepted: false,
       decision: 'review',
       reason: cleanText(generatorContext?.dealLock?.blockReason) || learning?.reason || 'Deal-Lock aktiv.'
+    };
+  }
+
+  if (
+    sellerClass === 'FBA_OR_AMAZON_UNKNOWN' &&
+    cleanText(learning?.routingDecision).toLowerCase() === 'approve' &&
+    cleanText(learning?.primaryDecisionSource).toLowerCase() === 'test_seller_routing'
+  ) {
+    const reason = learning?.reason || 'Testmodus: Amazon Produktdaten verifiziert, Seller noch nicht eindeutig.';
+
+    console.info('[TEST_APPROVE_FBA_OR_AMAZON_UNKNOWN]', {
+      sellerClass,
+      decision: 'APPROVE',
+      routingDecision: 'approve',
+      reason
+    });
+    console.info('[ROUTING_DECISION_FORCED_APPROVE]', {
+      sellerClass,
+      normalDecision: 'approve',
+      wouldPostNormally: true,
+      testGroupApproved: true
+    });
+    console.info('[APPROVED_CHANNEL_SEND_EXPECTED]', {
+      sellerClass,
+      routingDecision: 'approve',
+      reason
+    });
+
+    return {
+      accepted: true,
+      decision: 'approve',
+      decisionDisplay: 'APPROVE',
+      routingDecision: 'approve',
+      wouldPostNormally: true,
+      testGroupApproved: true,
+      reason
     };
   }
 
@@ -6257,7 +10411,7 @@ function validateMainPostSources(postData = {}) {
     issues.push('Link stammt aus ungesicherter Quelle.');
   }
 
-  if (!priceSource || ['unknown', 'missing', 'fallback_source'].includes(priceSource)) {
+  if (!priceSource || ['unknown', 'missing', 'fallback', 'fallback_source'].includes(priceSource)) {
     blockedFields.push('price');
     issues.push('Preisquelle ist nicht nachvollziehbar.');
   }
@@ -6784,7 +10938,7 @@ async function buildTelegramReaderGeneratorInput({
     sellerDetectionSource: sellerIdentity.details?.detectionSource || 'unknown',
     sellerDetectionSources: sellerIdentity.details?.detectionSources || [],
     sellerMatchedPatterns: sellerIdentity.details?.matchedPatterns || [],
-    sellerRawText: sellerIdentity.details?.merchantText || '',
+    sellerRawText: [sellerIdentity.details?.merchantText, structuredMessage?.text].map((value) => cleanText(value)).filter(Boolean).join(' | '),
     sellerDetails: {
       detectionSource: sellerIdentity.details?.detectionSource || 'unknown',
       detectionSources: sellerIdentity.details?.detectionSources || [],
@@ -6792,6 +10946,16 @@ async function buildTelegramReaderGeneratorInput({
       matchedDirectAmazonPatterns: sellerIdentity.details?.matchedDirectAmazonPatterns || [],
       hasCombinedAmazonMatch: sellerIdentity.details?.hasCombinedAmazonMatch === true,
       merchantText: sellerIdentity.details?.merchantText || '',
+      amazonDataset: {
+        asin: cleanText(normalizedAsin || scrapedDeal?.asin).toUpperCase(),
+        title: titlePayload.title || template.productTitle || '',
+        price: invalidPriceState.invalid ? '' : rawCurrentPrice,
+        imageUrl: imagePayload.generatedImagePath || imagePayload.uploadedImagePath || '',
+        affiliateUrl: cleanText(affiliateUrl),
+        normalizedUrl: cleanText(normalizedUrl),
+        productUrl: cleanText(normalizedUrl),
+        source: 'telegram_reader_verified_product'
+      },
       sellerProfile,
       dealType: cleanText(dealType).toUpperCase() || 'AMAZON',
       isAmazonDeal: cleanText(dealType).toUpperCase() === 'AMAZON'
@@ -6807,12 +10971,14 @@ async function buildTelegramReaderGeneratorInput({
     subscribeDiscount: cleanText(scrapedDeal?.subscribeDiscount),
     finalPriceCalculated: scrapedDeal?.finalPriceCalculated === true,
     finalPrice: cleanText(scrapedDeal?.finalPrice),
+    basePrice: cleanText(scrapedDealWithFallbacks?.basePrice || scrapedDeal?.basePrice),
     rawCurrentPrice,
     invalidPrice: invalidPriceState.invalid,
     invalidPriceReason: invalidPriceState.reason,
     currentPrice: invalidPriceState.invalid ? '' : rawCurrentPrice,
     oldPrice: rawOldPrice,
     priceSource: pricePayload.priceSource || 'unknown',
+    rawPriceSource: pricePayload.rawPriceSource || 'unknown',
     couponCode: cleanText(couponCode),
     dealType: cleanText(dealType).toUpperCase() || 'AMAZON',
     isAmazonDeal: cleanText(dealType).toUpperCase() === 'AMAZON',
@@ -7377,6 +11543,15 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
   const testGroupModeActive = isReaderTestGroupModeActive(readerConfig);
   const relaxedTestMode = isReaderTestGroupAllMode(readerConfig);
   const trigger = cleanText(options.trigger) || 'reader';
+  console.info('[PIPELINE_START]', {
+    sessionName,
+    sourceId: source?.id || null,
+    group: structuredMessage?.group || '',
+    messageId: structuredMessage?.messageId || '',
+    trigger,
+    readerTestMode: readerConfig.readerTestMode === true,
+    readerDebugMode: readerConfig.readerDebugMode === true
+  });
   const protectedDealSource = resolveProtectedDealSourceContext({
     source,
     structuredMessage,
@@ -8418,9 +12593,62 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       currentPrice: generatorInput.currentPrice,
       title: generatorInput.title,
       productUrl: generatorInput.normalizedUrl || generatorInput.link,
+      normalizedUrl: generatorInput.normalizedUrl,
+      affiliateUrl: generatorInput.link,
+      affiliateLink: generatorInput.link,
       imageUrl: generatorInput.generatedImagePath || generatorInput.uploadedImagePath,
       source: generatorInput.contextSource,
       origin: generatorInput.originOverride
+    });
+    if (readerConfig.readerTestMode === true && generatorContext?.seller) {
+      const resolvedSeller = generatorContext.seller;
+      const resolvedSellerDetails = resolvedSeller.details || {};
+      const resolvedSellerClass = cleanText(resolvedSeller.sellerClass);
+
+      if (resolvedSellerClass && resolvedSellerClass !== cleanText(generatorInput.sellerClass)) {
+        generatorInput.sellerClass = resolvedSellerClass;
+        generatorInput.sellerType = cleanText(resolvedSeller.sellerType) || generatorInput.sellerType;
+        generatorInput.soldByAmazon = resolvedSeller.soldByAmazon;
+        generatorInput.shippedByAmazon = resolvedSeller.shippedByAmazon;
+        generatorInput.sellerDetectionSource = cleanText(resolvedSellerDetails.detectionSource) || generatorInput.sellerDetectionSource;
+        generatorInput.sellerDetectionSources = Array.isArray(resolvedSellerDetails.detectionSources)
+          ? resolvedSellerDetails.detectionSources
+          : generatorInput.sellerDetectionSources;
+        generatorInput.sellerDetails = {
+          ...(generatorInput.sellerDetails && typeof generatorInput.sellerDetails === 'object' ? generatorInput.sellerDetails : {}),
+          ...resolvedSellerDetails
+        };
+        console.info('[SELLER_TESTMODE_INPUT_SYNCED]', {
+          asin: generatorInput.asin,
+          sellerClass: generatorInput.sellerClass,
+          sellerType: generatorInput.sellerType,
+          sellerDetectionSource: generatorInput.sellerDetectionSource,
+          reason: cleanText(resolvedSellerDetails.recognitionMessage || resolvedSellerDetails.sellerRecognitionMessage)
+        });
+      }
+    }
+    let similarProductCheck = null;
+    const similarProductCheckPromise = runSimilarProductOptimizationCheck({
+      sessionName,
+      source,
+      structuredMessage,
+      generatorInput,
+      generatorContext,
+      scrapedDeal: normalizedScrapedDeal
+    }).catch((error) => {
+      const reason = error instanceof Error ? error.message : 'Similar Product Check fehlgeschlagen.';
+      console.warn('[SIMILAR_PRODUCT_NO_CHEAPER_FOUND]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        asin: generatorInput.asin,
+        reason
+      });
+      return buildEmptySimilarProductCheck({
+        checked: false,
+        allowed: false,
+        reason
+      });
     });
     if (generatorContext?.learning?.marketComparisonStarted === true) {
       console.info('[MARKET_CHECK_STARTED]', {
@@ -8548,6 +12776,8 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
     let debugValues = null;
 
     if (debugPostEnabled) {
+      similarProductCheck = await similarProductCheckPromise;
+      generatorInput.similarProductCheck = similarProductCheck;
       debugValues = collectReaderDebugValues({
         sessionName,
         source,
@@ -8624,6 +12854,16 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       normalDecision: normalDecision.decision,
       readerTestMode: readerConfig.readerTestMode === true,
       readerDebugMode: readerConfig.readerDebugMode === true
+    });
+    console.info('[GENERATOR_POST_BUILT]', {
+      sessionName,
+      sourceId: source.id,
+      messageId: structuredMessage.messageId,
+      asin: generatorInput.asin,
+      title: generatorInput.title,
+      hasAffiliateLink: Boolean(cleanText(generatorInput.link)),
+      hasTelegramText: Boolean(cleanText(generatorInput.textByChannel?.telegram)),
+      hasImage: Boolean(generatorInput.generatedImagePath || generatorInput.uploadedImagePath)
     });
     console.info('[GENERATOR_FORCE_SUCCESS]', {
       sessionName,
@@ -8724,6 +12964,14 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       decision: decisionLabel,
       trigger
     });
+    console.info('[ROUTING_START]', {
+      sessionName,
+      sourceId: source.id,
+      messageId: structuredMessage.messageId,
+      asin: generatorInput.asin,
+      decision: decisionLabel,
+      routeStage: 'primary_test_group_and_secondary_routes'
+    });
     console.info('[READER_USING_GENERATOR_PUBLISHER]', {
       sessionName,
       sourceId: source.id,
@@ -8743,8 +12991,17 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
     } catch (publishError) {
       const publishErrorMessage =
         publishError instanceof Error ? publishError.message : 'Generator-Publisher konnte nicht ausgefuehrt werden.';
-      if (testGroupModeActive && isTestGroupPublisherDisabledError(publishError)) {
+      if ((testGroupModeActive || forceTestGroupPost) && (isTestGroupPublisherDisabledError(publishError) || forceTestGroupPost)) {
         testGroupDeliveryMode = 'direct_test_group_fallback';
+        console.warn('[PIPELINE_ERROR_CONTINUED]', {
+          sessionName,
+          sourceId: source.id,
+          messageId: structuredMessage.messageId,
+          asin: generatorInput.asin,
+          stage: 'publisher_queue',
+          fallback: testGroupDeliveryMode,
+          reason: publishErrorMessage
+        });
         console.info('[TEST_GROUP_POST_ENABLED]', {
           sessionName,
           sourceId: source.id,
@@ -8918,6 +13175,34 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
           liveAllowed: false
         });
       }
+      console.info('[ROUTING_SENT_TEST]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        asin: generatorInput.asin,
+        queueId,
+        telegramMessageId: postedMessageId,
+        deliveryMode: testGroupDeliveryMode
+      });
+    }
+    if (publishResult?.routingOutputs?.approved?.messageId) {
+      console.info('[ROUTING_SENT_APPROVED]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        asin: generatorInput.asin,
+        queueId: publishResult.routingOutputs.approved.queueId || null,
+        telegramMessageId: publishResult.routingOutputs.approved.messageId
+      });
+    }
+    if (publishResult?.routingOutputs?.rejected?.messageId) {
+      console.info('[ROUTING_SENT_REJECTED]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        asin: generatorInput.asin,
+        telegramMessageId: publishResult.routingOutputs.rejected.messageId
+      });
     }
     if (debugMessageIds.length) {
       console.info('[TEST_DEBUG_SENT_AFTER_GENERATOR]', {
@@ -8928,6 +13213,52 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
         queueId,
         mainTelegramMessageId: postedMessageId,
         debugMessageIds
+      });
+    }
+
+    let optimizedChannelResult = { sent: false, reason: 'not_checked' };
+    try {
+      if (!similarProductCheck) {
+        similarProductCheck = await similarProductCheckPromise;
+        generatorInput.similarProductCheck = similarProductCheck;
+      }
+      console.info('[ROUTING_START]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        asin: generatorInput.asin,
+        routeStage: 'optimized_channel',
+        similarCheaperFound: similarProductCheck?.similarCheaperFound === true
+      });
+      optimizedChannelResult = await publishSimilarProductOptimizedChannel({
+        sessionName,
+        source,
+        structuredMessage,
+        generatorInput,
+        similarCheck: similarProductCheck
+      });
+      if (optimizedChannelResult?.sent === true || optimizedChannelResult?.messageId) {
+        console.info('[ROUTING_SENT_OPTIMIZED]', {
+          sessionName,
+          sourceId: source.id,
+          messageId: structuredMessage.messageId,
+          asin: generatorInput.asin,
+          telegramMessageId: optimizedChannelResult?.messageId || null
+        });
+      }
+    } catch (optimizedError) {
+      optimizedChannelResult = {
+        sent: false,
+        status: 'error',
+        reason: optimizedError instanceof Error ? optimizedError.message : 'Optimierte Deals konnten nicht verarbeitet werden.'
+      };
+      console.error('[PIPELINE_ERROR_CONTINUED]', {
+        sessionName,
+        sourceId: source.id,
+        messageId: structuredMessage.messageId,
+        asin: generatorInput.asin,
+        stage: 'optimized_channel',
+        reason: optimizedChannelResult.reason
       });
     }
 
@@ -8942,6 +13273,8 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       messageId: postedMessageId,
       postedToTestGroup: Boolean(postedMessageId),
       forcedToTestGroup: forceTestGroupPost,
+      similarProductCheck,
+      optimizedChannelResult,
       trigger
     };
   } catch (error) {
@@ -8953,6 +13286,14 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
       messageId: structuredMessage.messageId,
       amazonLink,
       error: errorMessage
+    });
+    console.error('[PIPELINE_ERROR_CONTINUED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      amazonLink,
+      stage: 'processTelegramReaderPipeline',
+      reason: errorMessage
     });
     logReaderPipelineError(errorMessage, {
       sessionName,
@@ -8988,6 +13329,34 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
         messageId: structuredMessage.messageId,
         reason: 'Raw Reader Fallback bleibt deaktiviert und wird nicht mehr gepostet.'
       });
+    }
+
+    if (readerConfig.readerDebugMode === true || readerConfig.readerTestMode === true) {
+      try {
+        return await handleBlockedReaderDiagnostic({
+          sessionName,
+          source,
+          structuredMessage,
+          readerConfig,
+          trigger,
+          blockedCode: 'PIPELINE_ERROR_CONTINUED',
+          blockedReason: errorMessage,
+          sourceHost: normalizeUrlHost(originalLink || amazonLink),
+          forceDiagnosticPost: true,
+          mainPostBlocked: true,
+          titleSource: 'pipeline_error',
+          imageSource: 'pipeline_error',
+          affiliateLinkSource: 'pipeline_error'
+        });
+      } catch (diagnosticError) {
+        console.error('[PIPELINE_ERROR_CONTINUED]', {
+          sessionName,
+          sourceId: source?.id ?? null,
+          messageId: structuredMessage?.messageId || '',
+          stage: 'diagnostic_fallback',
+          reason: diagnosticError instanceof Error ? diagnosticError.message : 'Diagnosepost konnte nicht gesendet werden.'
+        });
+      }
     }
 
     return {
@@ -9109,6 +13478,14 @@ async function pollTelegramWatchedDialogs(sessionName, client, options = {}) {
     pollingIntervalMs: TELEGRAM_POLL_INTERVAL_MS,
     listenerActive: active.listenerAttached === true,
     pollingActive: active.pollingActive === true
+  });
+  console.info('[READER_ALIVE]', {
+    sessionName: normalizedSessionName,
+    trigger,
+    startedAt: pollStartedAt,
+    listenerActive: active.listenerAttached === true,
+    pollingActive: active.pollingActive === true,
+    watchedChannels: watchedChannels.length
   });
   console.info('[WATCHLIST_COUNT]', {
     sessionName: normalizedSessionName,
@@ -9537,6 +13914,7 @@ async function handleWatchedTelegramMessage(sessionName, message, options = {}) 
   };
 
   logTelegramRuntime('Telegram event received', logPayload);
+  console.info('[TELEGRAM_EVENT_RECEIVED]', logPayload);
   logTelegramRuntime('Telegram message received', logPayload);
   logTelegramReaderEvent({
     eventType: 'telegram.message.received',

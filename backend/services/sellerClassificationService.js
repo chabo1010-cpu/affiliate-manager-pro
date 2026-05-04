@@ -580,6 +580,46 @@ export function normalizeSellerClass(value = '') {
   return SELLER_CLASS.UNKNOWN;
 }
 
+function isVerifiedAmazonCatalogSource(value = '') {
+  const normalized = cleanText(value).toLowerCase();
+
+  return (
+    normalized.includes('paapi') ||
+    normalized.includes('creator') ||
+    normalized.includes('amazon_creator_api') ||
+    normalized.includes('amazon-creator-api')
+  );
+}
+
+function looksLikeVerifiedAmazonMerchantName(value = '') {
+  const normalized = normalizeSellerTextForMatching(value);
+
+  return (
+    normalized === 'amazon' ||
+    normalized === 'amazon.de' ||
+    normalized === 'amazon de' ||
+    normalized === 'amazon eu sarl' ||
+    normalized === 'amazon eu s.a.r.l.' ||
+    normalized === 'amazon services europe' ||
+    /^amazon(?:\.[a-z.]+)?$/.test(normalized) ||
+    /amazon eu s\.?a\.?r\.?l/.test(normalized)
+  );
+}
+
+function hasVerifiedAmazonMerchantHint({ sourceAvailability = {}, detectionSources = [], merchantText = '' } = {}) {
+  const sourceBackedAmazonName =
+    looksLikeVerifiedAmazonMerchantName(merchantText) && detectionSources.some((source) => isVerifiedAmazonCatalogSource(source));
+  const paapiMerchantValue = sourceAvailability.paapiMerchantInfo?.value || '';
+  const merchantSourceValue = sourceAvailability.merchantText?.value || '';
+  const merchantSource = sourceAvailability.merchantText?.source || '';
+
+  return (
+    sourceBackedAmazonName ||
+    (sourceAvailability.paapiMerchantInfo?.checked === true && looksLikeVerifiedAmazonMerchantName(paapiMerchantValue)) ||
+    (isVerifiedAmazonCatalogSource(merchantSource) && looksLikeVerifiedAmazonMerchantName(merchantSourceValue))
+  );
+}
+
 export function sellerClassToLegacySellerType(value = '') {
   const sellerClass = normalizeSellerClass(value);
 
@@ -732,8 +772,6 @@ export function resolveSellerIdentity(input = {}) {
   const merchantText = cleanText(
     derivedSignals.merchantText || input.merchantText || input.sellerRawText || sellerDetails.merchantText || sourceAvailability.scrapeText?.value
   );
-  const rawSoldByAmazon = inputSoldByAmazon !== null ? inputSoldByAmazon : derivedSignals.soldByAmazon ?? null;
-  const rawShippedByAmazon = inputShippedByAmazon !== null ? inputShippedByAmazon : derivedSignals.shippedByAmazon ?? null;
   const detectionSources = uniqueCleanValues([
     ...(Array.isArray(input.detectionSources) ? input.detectionSources : []),
     ...(Array.isArray(sellerDetails.detectionSources) ? sellerDetails.detectionSources : []),
@@ -744,6 +782,22 @@ export function resolveSellerIdentity(input = {}) {
     derivedSignals.detectionSource,
     ...textCandidateAnalyses.map((candidate) => candidate.detectionSource)
   ]);
+  const verifiedAmazonMerchantHint = hasVerifiedAmazonMerchantHint({
+    sourceAvailability,
+    detectionSources,
+    merchantText
+  });
+  if (verifiedAmazonMerchantHint) {
+    logSellerDetection('SELLER_VERIFIED_AMAZON_MERCHANT_HINT', {
+      detectionSource: primaryDetectionSource || 'unknown',
+      detectionSources,
+      merchantTextPreview: merchantText ? merchantText.slice(0, SELLER_LOG_TEXT_LIMIT) : ''
+    });
+  }
+  const rawSoldByAmazon =
+    inputSoldByAmazon !== null ? inputSoldByAmazon : derivedSignals.soldByAmazon ?? (verifiedAmazonMerchantHint ? true : null);
+  const rawShippedByAmazon =
+    inputShippedByAmazon !== null ? inputShippedByAmazon : derivedSignals.shippedByAmazon ?? (verifiedAmazonMerchantHint ? true : null);
   const matchedPatterns = uniqueCleanValues([
     ...(Array.isArray(input.matchedPatterns) ? input.matchedPatterns : []),
     ...(Array.isArray(sellerDetails.matchedPatterns) ? sellerDetails.matchedPatterns : []),
@@ -826,6 +880,7 @@ export function resolveSellerIdentity(input = {}) {
     shippedByAmazonInput: inputShippedByAmazon,
     soldByAmazonDerived: derivedSignals.soldByAmazon ?? null,
     shippedByAmazonDerived: derivedSignals.shippedByAmazon ?? null,
+    verifiedAmazonMerchantHint,
     matchedPatterns,
     matchedDirectAmazonPatterns,
     hasCombinedAmazonMatch,

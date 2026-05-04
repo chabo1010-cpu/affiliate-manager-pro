@@ -1,6 +1,7 @@
 import { getTelegramConfig } from '../env.js';
 import { buildAmazonAffiliateLinkRecord, getTelegramCopyButtonText } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
+import { buildTelegramTitle } from '../../frontend/src/lib/postGenerator.js';
 import sharp from 'sharp';
 
 const NORMALIZED_POST_IMAGE = {
@@ -218,6 +219,23 @@ function sanitizeMainPostTitle(title = '') {
     blockedBadges: [...new Set(blockedBadges)],
     removedSourcePriceLines: [...new Set(removedSourcePriceLines)]
   };
+}
+
+function resolveTelegramDisplayTitle(originalTitle = '') {
+  const safeOriginalTitle = cleanText(originalTitle);
+  if (!safeOriginalTitle) {
+    return '';
+  }
+
+  try {
+    return cleanText(buildTelegramTitle(safeOriginalTitle)) || safeOriginalTitle;
+  } catch (error) {
+    console.warn('[PIPELINE_ERROR_CONTINUED]', {
+      stage: 'resolveTelegramDisplayTitle',
+      error: error instanceof Error ? error.message : 'Telegram-Titel konnte nicht gekuerzt werden.'
+    });
+    return safeOriginalTitle;
+  }
 }
 
 function sanitizeMainPostPrice(price = '') {
@@ -1158,8 +1176,11 @@ export async function sendTelegramDealPost({
     ...(Array.isArray(sanitizedTitleResult.removedSourcePriceLines) ? sanitizedTitleResult.removedSourcePriceLines : []),
     ...(Array.isArray(sanitizedPriceResult.sourcePriceLines) ? sanitizedPriceResult.sourcePriceLines : [])
   ].filter(Boolean);
+  const originalDisplayTitle =
+    cleanText(sanitizedTitleResult.value) || cleanText(resolvedMainPostFields.title) || cleanText(title);
+  const telegramTitle = resolveTelegramDisplayTitle(originalDisplayTitle);
   const sanitizedMainPostFields = {
-    title: cleanText(sanitizedTitleResult.value),
+    title: telegramTitle,
     titleSource: resolvedMainPostFields.titleSource,
     price: cleanText(sanitizedPriceResult.value),
     priceSource: resolvedMainPostFields.priceSource,
@@ -1178,6 +1199,14 @@ export async function sendTelegramDealPost({
       removedLabels: sanitizedTitleResult.removedLabels,
       originalTitle: cleanText(resolvedMainPostFields.title) || null,
       sanitizedTitle: sanitizedMainPostFields.title || null
+    });
+  }
+  if (originalDisplayTitle && originalDisplayTitle !== telegramTitle) {
+    console.info('[TELEGRAM_TITLE_APPLIED]', {
+      originalLength: originalDisplayTitle.length,
+      telegramLength: telegramTitle.length,
+      originalTitle: originalDisplayTitle.slice(0, 140),
+      telegramTitle
     });
   }
   if (sanitizedTitleResult.blockedBadges.length > 0) {

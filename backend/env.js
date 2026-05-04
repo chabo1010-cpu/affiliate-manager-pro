@@ -159,6 +159,110 @@ export function getAmazonAffiliateConfig() {
   };
 }
 
+function resolveAmazonCreatorAuthEndpoint(version = '') {
+  const normalized = version.trim();
+
+  if (normalized === '2.1') {
+    return 'https://creatorsapi.auth.us-east-1.amazoncognito.com/oauth2/token';
+  }
+  if (normalized === '2.2') {
+    return 'https://creatorsapi.auth.eu-south-2.amazoncognito.com/oauth2/token';
+  }
+  if (normalized === '2.3') {
+    return 'https://creatorsapi.auth.us-west-2.amazoncognito.com/oauth2/token';
+  }
+  if (normalized === '3.1') {
+    return 'https://api.amazon.com/auth/o2/token';
+  }
+  if (normalized === '3.3') {
+    return 'https://api.amazon.co.jp/auth/o2/token';
+  }
+
+  return 'https://api.amazon.co.uk/auth/o2/token';
+}
+
+function mapAmazonCreatorMarketplace(value = '') {
+  const rawMarketplace = value.trim();
+  const normalizedCode = rawMarketplace.toUpperCase();
+  const marketplaceMap = {
+    DE: 'www.amazon.de',
+    UK: 'www.amazon.co.uk',
+    US: 'www.amazon.com',
+    FR: 'www.amazon.fr',
+    IT: 'www.amazon.it',
+    ES: 'www.amazon.es'
+  };
+  const mappedMarketplace = marketplaceMap[normalizedCode] || rawMarketplace;
+
+  if (rawMarketplace && mappedMarketplace !== rawMarketplace) {
+    console.info('[CREATOR_API_MARKETPLACE_MAPPED]', {
+      from: rawMarketplace,
+      to: mappedMarketplace
+    });
+  }
+  if (mappedMarketplace) {
+    console.info('[CREATOR_API_MARKETPLACE_USED]', {
+      marketplace: mappedMarketplace
+    });
+  }
+
+  return mappedMarketplace;
+}
+
+export function getAmazonCreatorApiConfig() {
+  const paapiConfig = getAmazonAffiliateConfig();
+  const credentialVersion = process.env.AMAZON_CREATOR_API_CREDENTIAL_VERSION?.trim() || '3.2';
+  const clientId = normalizeSecret(
+    process.env.AMAZON_CREATOR_API_KEY ||
+      process.env.AMAZON_CREATOR_API_CLIENT_ID ||
+      process.env.AMAZON_CREATOR_API_CREDENTIAL_ID,
+    [
+      'DEIN_CREATOR_API_KEY_HIER',
+      'DEIN_CREATOR_CLIENT_ID_HIER',
+      'DEIN_CREATOR_CREDENTIAL_ID_HIER',
+      'YOUR_CREATOR_API_KEY_HERE',
+      'YOUR_CREATOR_CLIENT_ID_HERE',
+      'YOUR_CREATOR_CREDENTIAL_ID_HERE',
+      'CHANGE_ME'
+    ]
+  );
+  const clientSecret = normalizeSecret(
+    process.env.AMAZON_CREATOR_API_SECRET ||
+      process.env.AMAZON_CREATOR_API_CLIENT_SECRET ||
+      process.env.AMAZON_CREATOR_API_CREDENTIAL_SECRET,
+    [
+      'DEIN_CREATOR_API_SECRET_HIER',
+      'DEIN_CREATOR_CLIENT_SECRET_HIER',
+      'DEIN_CREATOR_CREDENTIAL_SECRET_HIER',
+      'YOUR_CREATOR_API_SECRET_HERE',
+      'YOUR_CREATOR_CLIENT_SECRET_HERE',
+      'YOUR_CREATOR_CREDENTIAL_SECRET_HERE',
+      'CHANGE_ME'
+    ]
+  );
+
+  return {
+    enabled: (process.env.AMAZON_CREATOR_API_ENABLED?.trim() || '0') === '1',
+    clientId,
+    clientSecret,
+    partnerTag: normalizeSecret(process.env.AMAZON_CREATOR_API_PARTNER_TAG, [
+      'DEIN_PARTNER_TAG_HIER',
+      'YOUR_PARTNER_TAG_HERE',
+      'CHANGE_ME'
+    ]) || paapiConfig.partnerTag,
+    credentialVersion,
+    authEndpoint:
+      process.env.AMAZON_CREATOR_API_TOKEN_ENDPOINT?.trim() ||
+      process.env.AMAZON_CREATOR_API_AUTH_ENDPOINT?.trim() ||
+      resolveAmazonCreatorAuthEndpoint(credentialVersion),
+    endpoint: process.env.AMAZON_CREATOR_API_ENDPOINT?.trim() || 'https://creatorsapi.amazon/catalog/v1/getItems',
+    marketplace: mapAmazonCreatorMarketplace(
+      process.env.AMAZON_CREATOR_API_MARKETPLACE?.trim() || paapiConfig.marketplace || 'www.amazon.de'
+    ),
+    timeoutMs: Number.parseInt(process.env.AMAZON_CREATOR_API_TIMEOUT_MS || String(paapiConfig.timeoutMs || 12000), 10) || 12000
+  };
+}
+
 export function getApiPort() {
   return process.env.PORT || 4000;
 }

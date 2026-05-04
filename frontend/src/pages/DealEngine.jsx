@@ -139,9 +139,297 @@ function getToneClass(value) {
   return 'info';
 }
 
+const DEAL_ENGINE_DEFAULTS = {
+  amazon: {
+    dayMinMarketAdvantagePct: 15,
+    nightMinMarketAdvantagePct: 25
+  },
+  fbm: {
+    dayMinMarketAdvantagePct: 20,
+    nightMinMarketAdvantagePct: 30
+  },
+  global: {
+    keepaApproveScore: 70,
+    keepaQueueScore: 50,
+    queueMarginPct: 3,
+    queueEnabled: true,
+    nightModeEnabled: true,
+    cheapProductLimit: 20,
+    requireMarketForCheapProducts: true,
+    requireMarketForNoNameProducts: true
+  },
+  output: {
+    telegramEnabled: true,
+    whatsappEnabled: true
+  },
+  ai: {
+    resolverEnabled: false,
+    amazonDirectEnabled: true,
+    onlyOnUncertainty: true,
+    alwaysInDebug: true
+  },
+  quality: {
+    marketCompareAmazonDirectEnabled: true,
+    marketCompareAmazonDirectOnly: true,
+    aiAmazonDirectOnly: true,
+    allowFbaThirdPartyMarketCompare: false,
+    allowFbaThirdPartyAi: false,
+    allowFbmMarketCompare: false,
+    allowFbmAi: false,
+    unknownSellerMode: 'review'
+  }
+};
+
+function mergeDealEngineSettings(current, patch) {
+  if (!current) {
+    return current;
+  }
+
+  return {
+    ...current,
+    amazon: {
+      ...current.amazon,
+      ...(patch.amazon || {})
+    },
+    fbm: {
+      ...current.fbm,
+      ...(patch.fbm || {})
+    },
+    global: {
+      ...current.global,
+      ...(patch.global || {})
+    },
+    output: {
+      ...current.output,
+      ...(patch.output || {})
+    },
+    ai: {
+      ...current.ai,
+      ...(patch.ai || {})
+    },
+    quality: {
+      ...current.quality,
+      ...(patch.quality || {})
+    }
+  };
+}
+
+function applyQualityPreset(current, preset) {
+  const patches = {
+    locker: {
+      global: {
+        keepaApproveScore: 60,
+        keepaQueueScore: 45,
+        queueMarginPct: 6
+      },
+      ai: {
+        resolverEnabled: true
+      },
+      quality: {
+        marketCompareAmazonDirectOnly: false,
+        aiAmazonDirectOnly: false,
+        allowFbaThirdPartyMarketCompare: true,
+        allowFbaThirdPartyAi: true,
+        allowFbmMarketCompare: true,
+        allowFbmAi: true,
+        unknownSellerMode: 'review'
+      }
+    },
+    normal: DEAL_ENGINE_DEFAULTS,
+    streng: {
+      global: {
+        keepaApproveScore: 75,
+        keepaQueueScore: 55,
+        queueMarginPct: 2.5,
+        cheapProductLimit: 25,
+        requireMarketForCheapProducts: true,
+        requireMarketForNoNameProducts: true
+      },
+      quality: {
+        marketCompareAmazonDirectOnly: true,
+        aiAmazonDirectOnly: true,
+        allowFbaThirdPartyMarketCompare: false,
+        allowFbaThirdPartyAi: false,
+        allowFbmMarketCompare: false,
+        allowFbmAi: false,
+        unknownSellerMode: 'review'
+      }
+    },
+    profi: {
+      global: {
+        keepaApproveScore: 80,
+        keepaQueueScore: 60,
+        queueMarginPct: 1.5,
+        cheapProductLimit: 30,
+        requireMarketForCheapProducts: true,
+        requireMarketForNoNameProducts: true
+      },
+      ai: {
+        resolverEnabled: true,
+        onlyOnUncertainty: true,
+        alwaysInDebug: false
+      },
+      quality: {
+        marketCompareAmazonDirectEnabled: true,
+        marketCompareAmazonDirectOnly: true,
+        aiAmazonDirectOnly: true,
+        allowFbaThirdPartyMarketCompare: false,
+        allowFbaThirdPartyAi: false,
+        allowFbmMarketCompare: false,
+        allowFbmAi: false,
+        unknownSellerMode: 'block'
+      }
+    }
+  };
+
+  return mergeDealEngineSettings(current, patches[preset] || DEAL_ENGINE_DEFAULTS);
+}
+
+function detectQualityPreset(settings) {
+  if (!settings) {
+    return 'normal';
+  }
+
+  if (settings.quality.unknownSellerMode === 'block' && settings.global.keepaApproveScore >= 80) {
+    return 'profi';
+  }
+
+  if (settings.global.keepaApproveScore >= 75 || settings.global.queueMarginPct <= 2.5) {
+    return 'streng';
+  }
+
+  if (settings.quality.allowFbmMarketCompare || settings.quality.allowFbaThirdPartyMarketCompare || settings.global.keepaApproveScore < 70) {
+    return 'locker';
+  }
+
+  return 'normal';
+}
+
+function applyProductFilterPreset(current, preset) {
+  const patches = {
+    standard: {
+      global: {
+        cheapProductLimit: 20,
+        requireMarketForCheapProducts: true,
+        requireMarketForNoNameProducts: true
+      }
+    },
+    streng: {
+      global: {
+        cheapProductLimit: 25,
+        requireMarketForCheapProducts: true,
+        requireMarketForNoNameProducts: true
+      },
+      quality: {
+        allowFbaThirdPartyMarketCompare: false,
+        allowFbmMarketCompare: false
+      }
+    },
+    china_filter: {
+      global: {
+        cheapProductLimit: 30,
+        requireMarketForCheapProducts: true,
+        requireMarketForNoNameProducts: true
+      },
+      quality: {
+        allowFbaThirdPartyMarketCompare: false,
+        allowFbaThirdPartyAi: false,
+        allowFbmMarketCompare: false,
+        allowFbmAi: false
+      }
+    }
+  };
+
+  return mergeDealEngineSettings(current, patches[preset] || patches.standard);
+}
+
+function detectProductFilterPreset(settings) {
+  if (!settings) {
+    return 'standard';
+  }
+
+  if (settings.global.cheapProductLimit >= 30 && settings.quality.allowFbmAi === false && settings.quality.allowFbaThirdPartyAi === false) {
+    return 'china_filter';
+  }
+
+  if (settings.global.cheapProductLimit >= 25) {
+    return 'streng';
+  }
+
+  return 'standard';
+}
+
+function applyAutomationPreset(current, preset) {
+  const patches = {
+    testmodus: {
+      output: {
+        telegramEnabled: false,
+        whatsappEnabled: false
+      },
+      ai: {
+        alwaysInDebug: true
+      }
+    },
+    review_sammeln: {
+      output: {
+        telegramEnabled: false,
+        whatsappEnabled: false
+      },
+      global: {
+        queueEnabled: true
+      }
+    },
+    auto_posten: {
+      output: {
+        telegramEnabled: true,
+        whatsappEnabled: true
+      },
+      global: {
+        queueEnabled: true
+      }
+    }
+  };
+
+  return mergeDealEngineSettings(current, patches[preset] || patches.review_sammeln);
+}
+
+function detectAutomationPreset(settings) {
+  if (!settings) {
+    return 'review_sammeln';
+  }
+
+  if (settings.output.telegramEnabled && settings.output.whatsappEnabled) {
+    return 'auto_posten';
+  }
+
+  if (!settings.output.telegramEnabled && settings.ai.alwaysInDebug) {
+    return 'testmodus';
+  }
+
+  return 'review_sammeln';
+}
+
+function isWithinLastMinutes(value, minutes) {
+  if (!value) {
+    return false;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+
+  return Date.now() - date.getTime() <= minutes * 60 * 1000;
+}
+
+function openInternalRoute(path) {
+  window.location.assign(path);
+}
+
 function DealEnginePage() {
   const { user } = useAuth();
   const [dashboard, setDashboard] = useState(null);
+  const [botDashboard, setBotDashboard] = useState(null);
   const [settings, setSettings] = useState(null);
   const [samplePayload, setSamplePayload] = useState(null);
   const [form, setForm] = useState(() => buildFormFromSample({}));
@@ -150,6 +438,7 @@ function DealEnginePage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
+  const [expertMode, setExpertMode] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -176,8 +465,9 @@ function DealEnginePage() {
         setLoading(true);
         setStatus('');
 
-        const [dashboardData, settingsData, sampleData] = await Promise.all([
+        const [dashboardData, botDashboardData, settingsData, sampleData] = await Promise.all([
           apiFetch('/api/deal-engine/dashboard'),
+          apiFetch('/api/bot'),
           apiFetch('/api/deal-engine/settings'),
           apiFetch('/api/deal-engine/sample')
         ]);
@@ -187,6 +477,7 @@ function DealEnginePage() {
         }
 
         setDashboard(dashboardData);
+        setBotDashboard(botDashboardData);
         setSettings(settingsData.item);
         setSamplePayload(sampleData.item);
         setForm((current) => {
@@ -236,18 +527,25 @@ function DealEnginePage() {
   }
 
   async function refreshDashboard() {
-    const response = await fetch(`${API_BASE_URL}/api/deal-engine/dashboard`, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-User-Role': user?.role || ''
-      }
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(data?.error || 'Dashboard konnte nicht aktualisiert werden.');
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-User-Role': user?.role || ''
+    };
+    const [dashboardResponse, botResponse] = await Promise.all([
+      fetch(`${API_BASE_URL}/api/deal-engine/dashboard`, { headers }),
+      fetch(`${API_BASE_URL}/api/bot`, { headers })
+    ]);
+    const dashboardData = await dashboardResponse.json().catch(() => ({}));
+    const botData = await botResponse.json().catch(() => ({}));
+    if (!dashboardResponse.ok) {
+      throw new Error(dashboardData?.error || 'Dashboard konnte nicht aktualisiert werden.');
+    }
+    if (!botResponse.ok) {
+      throw new Error(botData?.error || 'Bot Dashboard konnte nicht aktualisiert werden.');
     }
 
-    setDashboard(data);
+    setDashboard(dashboardData);
+    setBotDashboard(botData);
   }
 
   async function handleSaveSettings() {
@@ -312,40 +610,187 @@ function DealEnginePage() {
   }
 
   const currentResult = result || dashboard?.runs?.[0] || null;
-  const overviewCards = useMemo(() => {
-    const metrics = dashboard?.metrics || {};
-    const outputSnapshot = dashboard?.outputs?.snapshot || {};
-    const systemStatus = dashboard?.systemStatus || {};
+  const productRules = currentResult?.analysis?.productRules || currentResult?.productRules || null;
+  const qualityPreset = detectQualityPreset(settings);
+  const productFilterPreset = detectProductFilterPreset(settings);
+  const automationPreset = detectAutomationPreset(settings);
 
-    return [
+  const recentDealCount = useMemo(
+    () => (dashboard?.timeline || []).filter((entry) => isWithinLastMinutes(entry.createdAt, 5)).length,
+    [dashboard]
+  );
+
+  const systemStatusCards = useMemo(
+    () => [
       {
-        title: 'Systemstatus',
-        value: systemStatus.label || '-',
-        detail: systemStatus.detail || 'Keine Details',
-        tone: systemStatus.tone || 'info'
+        title: 'Backend',
+        value: loading ? 'Laedt' : 'Online',
+        detail: dashboard?.systemStatus?.detail || 'API erreichbar',
+        tone: loading ? 'info' : 'success'
       },
       {
-        title: 'Internet entscheidet',
-        value: `${toNumber(metrics.marketRuns)} Markt-Runs`,
-        detail: 'Marktpreis bleibt die Hauptentscheidung, wenn die Seller-Regeln Marktvergleich erlauben.',
+        title: 'Telegram Reader',
+        value: botDashboard?.operationalStatus?.telegramReader?.label || 'unbekannt',
+        detail: botDashboard?.operationalStatus?.telegramReader?.detail || 'Reader-Status wird geladen.',
+        tone: getToneClass(botDashboard?.operationalStatus?.telegramReader?.status || botDashboard?.operationalStatus?.telegramReader?.label)
+      },
+      {
+        title: 'Queue',
+        value: botDashboard?.operationalStatus?.scheduler?.label || 'bereit',
+        detail:
+          botDashboard?.operationalStatus?.scheduler?.detail ||
+          `${dashboard?.outputs?.openQueueCount || 0} offene Queue-Eintraege fuer die Deal Engine`,
+        tone: getToneClass(botDashboard?.operationalStatus?.scheduler?.status || botDashboard?.operationalStatus?.scheduler?.label)
+      },
+      {
+        title: 'Fehlerstatus',
+        value: dashboard?.errors?.length ? `${dashboard.errors.length} offen` : 'keine',
+        detail: dashboard?.errors?.[0]?.detail || 'Keine aktuellen Blocker.',
+        tone: dashboard?.errors?.length ? 'danger' : 'success'
+      }
+    ],
+    [botDashboard, dashboard, loading]
+  );
+
+  const liveMetricCards = useMemo(
+    () => [
+      {
+        title: 'Neue Deals',
+        value: `${recentDealCount} / 5 min`,
+        detail: `${dashboard?.metrics?.totalRuns || 0} Gesamt-Runs`,
+        tone: recentDealCount > 0 ? 'success' : 'info'
+      },
+      {
+        title: 'Approve Count',
+        value: toNumber(dashboard?.metrics?.approvedRuns),
+        detail: 'Nur APPROVE geht weiter in die Publisher-Strecke.',
         tone: 'success'
       },
       {
-        title: 'Keepa Fallback',
-        value: `${toNumber(metrics.keepaFallbackRuns)} Fallbacks`,
-        detail: 'Keepa wird nur ohne brauchbaren Marktpreis genutzt.',
-        tone: toNumber(metrics.keepaFallbackRuns) > 0 ? 'info' : 'warning'
+        title: 'Review Count',
+        value: toNumber(dashboard?.metrics?.queuedRuns),
+        detail: 'QUEUE wird hier als Review-Sammelstrecke behandelt.',
+        tone: toNumber(dashboard?.metrics?.queuedRuns) > 0 ? 'warning' : 'info'
       },
       {
-        title: 'Outputs',
-        value: `${outputSnapshot.telegram?.configured ? 'Telegram bereit' : 'Telegram pruefen'} / ${
-          outputSnapshot.whatsapp?.configured ? 'WhatsApp bereit' : 'WhatsApp pruefen'
-        }`,
-        detail: `${toNumber(dashboard?.outputs?.openQueueCount)} offene Queue-Eintraege fuer die Deal Engine`,
-        tone: toNumber(dashboard?.outputs?.openQueueCount) > 0 ? 'warning' : 'success'
+        title: 'Block Count',
+        value: toNumber(dashboard?.metrics?.rejectedRuns),
+        detail: 'REJECT durch Validierung, Fake-Pattern oder Produktregeln.',
+        tone: toNumber(dashboard?.metrics?.rejectedRuns) > 0 ? 'danger' : 'success'
+      }
+    ],
+    [dashboard, recentDealCount]
+  );
+
+  const outputStatusCards = useMemo(() => {
+    const telegramReady = dashboard?.outputs?.snapshot?.telegram?.configured === true;
+    const baseTone = telegramReady ? 'success' : 'warning';
+    const baseDetail = telegramReady ? 'Telegram Bot ist bereit. Approved/Rejected laufen ueber ENV-Routen.' : 'Telegram Bot oder Zielgruppe pruefen.';
+
+    return [
+      {
+        title: 'Testgruppe',
+        value: telegramReady ? 'aktiv' : 'pruefen',
+        detail: 'Bestehender Generator-Post plus Analyse bleiben aktiv.',
+        tone: baseTone
+      },
+      {
+        title: 'Approved Gruppe',
+        value: telegramReady ? 'bereit' : 'inaktiv',
+        detail: baseDetail,
+        tone: baseTone
+      },
+      {
+        title: 'Rejected Gruppe',
+        value: telegramReady ? 'bereit' : 'inaktiv',
+        detail: baseDetail,
+        tone: baseTone
       }
     ];
   }, [dashboard]);
+
+  const flowCards = useMemo(
+    () => [
+      {
+        title: 'Reader',
+        value: botDashboard?.operationalStatus?.telegramReader?.label || 'vorbereitet',
+        detail: botDashboard?.operationalStatus?.telegramReader?.detail || 'Quelle nimmt Deals entgegen.',
+        tone: getToneClass(botDashboard?.operationalStatus?.telegramReader?.status || botDashboard?.operationalStatus?.telegramReader?.label)
+      },
+      {
+        title: 'Analyse',
+        value: productRules?.status === 'matched' ? 'Produktregel aktiv' : 'Produktregeln + Keepa',
+        detail:
+          productRules?.summary ||
+          'Marktvergleich zuerst, Keepa nur Fallback, Produktregeln greifen zusaetzlich.',
+        tone: productRules?.status === 'matched' ? 'warning' : 'success'
+      },
+      {
+        title: 'Decision',
+        value: currentResult?.decision || 'wartet',
+        detail: currentResult?.decisionReason || 'Noch keine finale Entscheidung.',
+        tone: getToneClass(currentResult?.decision || dashboard?.systemStatus?.label)
+      },
+      {
+        title: 'Output',
+        value: dashboard?.outputs?.openQueueCount ? `${dashboard.outputs.openQueueCount} offen` : 'bereit',
+        detail: 'Test / Approved / Rejected werden getrennt bedient.',
+        tone: dashboard?.outputs?.openQueueCount ? 'warning' : 'success'
+      }
+    ],
+    [botDashboard, currentResult, dashboard, productRules]
+  );
+
+  const moduleCards = [
+    { title: 'Scrapper', path: '/scraper', detail: 'Quellen und Importstrecke.' },
+    { title: 'Copybot', path: '/copybot', detail: 'Review Queue und Quellenmanagement.' },
+    { title: 'Templates', path: '/templates', detail: 'Bausteine und Generator-Vorlagen.' },
+    { title: 'Autobot', path: '/autobot', detail: 'Automatische Prozesse und Jobs.' },
+    { title: 'Logik-Zentrale', path: '/learning', detail: 'Keepa, Fake-Drop und Lernlogik.' },
+    { title: 'Sperrzeiten', path: '/sperrzeiten', detail: 'Deal-Lock und Cooldowns.' },
+    { title: 'Logs', path: '/logs', detail: 'Fehler, Queue und Laufzeit-Logs.' }
+  ];
+
+  const safetyChecks = [
+    'Hauptpost nutzt keine Telegram-Titel aus Fremdquellen.',
+    'Hauptpost nutzt keine Telegram-Bilder oder fremde Collagen.',
+    'Hauptpost nutzt keine fremden Links.',
+    'Hauptpost darf nur mit PAAPI-, Amazon- und verifizierten Daten gebaut werden.'
+  ];
+
+  const routingExamples = [
+    {
+      title: 'Testgruppe',
+      body: 'Nachricht 1: bestehender Generator-Post (unveraendert)\nNachricht 2: komplette Analyse'
+    },
+    {
+      title: 'Approved Gruppe',
+      body: 'Nur APPROVE\nNur Nachricht 1\nKeine Analyse'
+    },
+    {
+      title: 'Rejected Gruppe',
+      body: '\u26A0\uFE0F NICHT VEROEFFENTLICHT\n\u{1F4E2} Quelle: Beispielgruppe\n\u{1F4CC} Grund: Produktregel blockiert.\n\u{1F6E0} Loesung: Preislimit oder Daten pruefen.'
+    }
+  ];
+
+  const presetOptions = {
+    quality: [
+      ['locker', 'Locker'],
+      ['normal', 'Normal'],
+      ['streng', 'Streng'],
+      ['profi', 'Profi']
+    ],
+    productFilter: [
+      ['standard', 'Standard'],
+      ['streng', 'Streng'],
+      ['china_filter', 'China-Filter aktiv']
+    ],
+    automation: [
+      ['testmodus', 'Testmodus'],
+      ['review_sammeln', 'Review sammeln'],
+      ['auto_posten', 'Auto posten']
+    ]
+  };
 
   return (
     <Layout>
@@ -354,18 +799,16 @@ function DealEnginePage() {
           <div className="engine-hero-grid">
             <div className="engine-hero-copy">
               <p className="section-title">Deal Engine</p>
-              <h1 className="page-title">Internet zuerst, Keepa nur Fallback, KI nur im Unsicherheitsfall</h1>
+              <h1 className="page-title">Produktregeln, sauberes Routing und ein Dashboard ohne Scroll-Chaos</h1>
               <p className="page-subtitle">
-                Dashboard, Quellen, Regler und Output sind direkt an die bestehende App gekoppelt. Marktvergleich und
-                KI koennen jetzt seller-genau fuer Amazon Direct, FBA, FBM und Unknown gesteuert werden.
+                Die Seite zeigt jetzt zuerst Status, Metriken, Output und Schnellaktionen. Darunter kommen Presets,
+                Deal-Flow, Routing-Beispiele, Sicherheitscheck und erst dann die tieferen Expert-Regler.
               </p>
             </div>
             <div className="engine-hero-side">
-              <span className="badge">Umsetzbar im vorhandenen Stack</span>
-              <span className={`status-chip ${dashboard?.systemStatus?.tone || 'info'}`}>
-                {dashboard?.systemStatus?.label || 'loading'}
-              </span>
-              <span className="badge">System laeuft komplett ohne KI</span>
+              <span className="badge">Hauptpost bleibt unveraendert</span>
+              <span className={`status-chip ${dashboard?.systemStatus?.tone || 'info'}`}>{dashboard?.systemStatus?.label || 'loading'}</span>
+              <span className="badge">Keepa und Queue bleiben erhalten</span>
             </div>
           </div>
           {status ? (
@@ -382,16 +825,17 @@ function DealEnginePage() {
           </section>
         ) : (
           <>
-            <section className="card engine-panel">
+            <section className="card engine-panel" style={{ position: 'sticky', top: 16, zIndex: 4 }}>
               <div className="engine-panel-header">
                 <div>
-                  <p className="section-title">Dashboard</p>
-                  <h2 className="page-title">Live Uebersicht</h2>
+                  <p className="section-title">Sofortansicht</p>
+                  <h2 className="page-title">Alles Wichtige oben</h2>
                 </div>
                 <span className="engine-header-note">{dashboard?.feasibility?.detail || '-'}</span>
               </div>
+
               <div className="engine-card-grid">
-                {overviewCards.map((card) => (
+                {systemStatusCards.map((card) => (
                   <article key={card.title} className={`engine-card engine-tone-${card.tone}`}>
                     <div className="engine-card-head">
                       <p className="section-title">{card.title}</p>
@@ -402,17 +846,51 @@ function DealEnginePage() {
                   </article>
                 ))}
               </div>
-              <div className="engine-flow-grid">
-                {(dashboard?.liveFlow || []).map((step) => (
-                  <article key={step.id} className={`engine-flow-card engine-tone-${step.tone}`}>
+
+              <div className="engine-card-grid">
+                {liveMetricCards.map((card) => (
+                  <article key={card.title} className={`engine-card engine-tone-${card.tone}`}>
                     <div className="engine-card-head">
-                      <strong>{step.label}</strong>
-                      <span className={`status-chip ${step.tone}`}>{step.tone}</span>
+                      <p className="section-title">{card.title}</p>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
                     </div>
-                    <h3>{step.title}</h3>
-                    <p>{step.detail}</p>
+                    <h3>{card.value}</h3>
+                    <p>{card.detail}</p>
                   </article>
                 ))}
+              </div>
+
+              <div className="engine-card-grid">
+                {outputStatusCards.map((card) => (
+                  <article key={card.title} className={`engine-card engine-tone-${card.tone}`}>
+                    <div className="engine-card-head">
+                      <p className="section-title">{card.title}</p>
+                      <span className={`status-chip ${card.tone}`}>{card.tone}</span>
+                    </div>
+                    <h3>{card.value}</h3>
+                    <p>{card.detail}</p>
+                  </article>
+                ))}
+                <article className="engine-card engine-tone-info">
+                  <div className="engine-card-head">
+                    <p className="section-title">Quick Actions</p>
+                    <span className="status-chip info">go</span>
+                  </div>
+                  <div style={{ display: 'grid', gap: 10 }}>
+                    <button type="button" className="secondary" onClick={() => openInternalRoute('/generator')}>
+                      Generator oeffnen
+                    </button>
+                    <button type="button" className="secondary" onClick={() => openInternalRoute('/publishing/telegram')}>
+                      Testgruppe oeffnen
+                    </button>
+                    <button type="button" className="secondary" onClick={() => openInternalRoute('/logs')}>
+                      Logs oeffnen
+                    </button>
+                    <button type="button" className="secondary" onClick={() => openInternalRoute('/settings')}>
+                      Settings oeffnen
+                    </button>
+                  </div>
+                </article>
               </div>
             </section>
 
@@ -420,425 +898,485 @@ function DealEnginePage() {
               <section className="card engine-panel">
                 <div className="engine-panel-header">
                   <div>
-                    <p className="section-title">Quellen</p>
-                    <h2 className="page-title">Aktive Inputs</h2>
+                    <p className="section-title">Vereinfachte UI</p>
+                    <h2 className="page-title">3 Hauptmodi statt Regler-Flut</h2>
                   </div>
-                  <span className="engine-header-note">
-                    {dashboard?.sources?.activeCount || 0} aktiv | {dashboard?.sources?.telegramCount || 0} Telegram |{' '}
-                    {dashboard?.sources?.whatsappCount || 0} WhatsApp
-                  </span>
-                </div>
-                <div className="engine-list">
-                  {(dashboard?.sources?.items || []).length ? (
-                    dashboard.sources.items.map((item) => (
-                      <article key={item.id} className="engine-list-item">
-                        <div className="engine-card-head">
-                          <strong>{item.name}</strong>
-                          <span className={`status-chip ${getToneClass(item.platform)}`}>{item.platform}</span>
-                        </div>
-                        <p>
-                          Typ {item.source_type || 'manual'} | Prioritaet {item.priority || 0} | Letzter Import{' '}
-                          {formatDateTime(item.last_import_at)}
-                        </p>
-                      </article>
-                    ))
-                  ) : (
-                    <p className="engine-empty">Keine aktiven Quellen vorhanden.</p>
-                  )}
-                </div>
-              </section>
-
-              <section className="card engine-panel">
-                <div className="engine-panel-header">
-                  <div>
-                    <p className="section-title">Regler</p>
-                    <h2 className="page-title">Steuerung</h2>
-                  </div>
-                  <span className="engine-header-note">
-                    {user?.role === 'admin' ? 'Admin darf speichern' : 'Nur Lesemodus'}
-                  </span>
+                  <span className="engine-header-note">{user?.role === 'admin' ? 'Admin darf speichern' : 'Nur Lesemodus'}</span>
                 </div>
 
                 {settings ? (
-                  <div className="engine-settings-grid">
-                    <label>
-                      <span>Amazon Tag %</span>
-                      <input
-                        type="number"
-                        value={settings.amazon.dayMinMarketAdvantagePct}
-                        onChange={(event) =>
-                          updateSettings('amazon', {
-                            dayMinMarketAdvantagePct: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>Amazon Nacht %</span>
-                      <input
-                        type="number"
-                        value={settings.amazon.nightMinMarketAdvantagePct}
-                        onChange={(event) =>
-                          updateSettings('amazon', {
-                            nightMinMarketAdvantagePct: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>FBM Tag %</span>
-                      <input
-                        type="number"
-                        value={settings.fbm.dayMinMarketAdvantagePct}
-                        onChange={(event) =>
-                          updateSettings('fbm', {
-                            dayMinMarketAdvantagePct: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>FBM Nacht %</span>
-                      <input
-                        type="number"
-                        value={settings.fbm.nightMinMarketAdvantagePct}
-                        onChange={(event) =>
-                          updateSettings('fbm', {
-                            nightMinMarketAdvantagePct: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>Keepa Approve Score</span>
-                      <input
-                        type="number"
-                        value={settings.global.keepaApproveScore}
-                        onChange={(event) =>
-                          updateSettings('global', {
-                            keepaApproveScore: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>Keepa Queue Score</span>
-                      <input
-                        type="number"
-                        value={settings.global.keepaQueueScore}
-                        onChange={(event) =>
-                          updateSettings('global', {
-                            keepaQueueScore: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>Queue Margin %</span>
-                      <input
-                        type="number"
-                        value={settings.global.queueMarginPct}
-                        onChange={(event) =>
-                          updateSettings('global', {
-                            queueMarginPct: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>Cheap Product Limit</span>
-                      <input
-                        type="number"
-                        value={settings.global.cheapProductLimit}
-                        onChange={(event) =>
-                          updateSettings('global', {
-                            cheapProductLimit: Number(event.target.value)
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
+                  <div style={{ display: 'grid', gap: 18 }}>
+                    <article className="engine-card engine-tone-info">
+                      <div className="engine-card-head">
+                        <p className="section-title">Qualitaet</p>
+                        <span className="status-chip info">{qualityPreset}</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        {presetOptions.quality.map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            className={qualityPreset === value ? 'primary' : 'secondary'}
+                            disabled={user?.role !== 'admin'}
+                            onClick={() => setSettings((current) => applyQualityPreset(current, value))}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </article>
 
-                    <label className="engine-checkbox">
-                      <span>Queue aktiv</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.global.queueEnabled}
-                        onChange={(event) =>
-                          updateSettings('global', {
-                            queueEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>Nachtmodus aktiv</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.global.nightModeEnabled}
-                        onChange={(event) =>
-                          updateSettings('global', {
-                            nightModeEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>Telegram Output</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.output.telegramEnabled}
-                        onChange={(event) =>
-                          updateSettings('output', {
-                            telegramEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>WhatsApp Output</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.output.whatsappEnabled}
-                        onChange={(event) =>
-                          updateSettings('output', {
-                            whatsappEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>AI Resolver optional aktiv</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.ai.resolverEnabled}
-                        onChange={(event) =>
-                          updateSettings('ai', {
-                            resolverEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>KI fuer Amazon Direct</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.ai.amazonDirectEnabled}
-                        onChange={(event) =>
-                          updateSettings('ai', {
-                            amazonDirectEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>KI nur bei Unsicherheit</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.ai.onlyOnUncertainty}
-                        onChange={(event) =>
-                          updateSettings('ai', {
-                            onlyOnUncertainty: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>KI immer im Debugmodus</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.ai.alwaysInDebug}
-                        onChange={(event) =>
-                          updateSettings('ai', {
-                            alwaysInDebug: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <div className="engine-settings-section engine-span-2">
-                      <p className="section-title">Qualitaet</p>
-                      <p className="engine-header-note">Seller-Gates fuer Marktvergleich, KI und unbekannte Verkaeufer.</p>
+                    <article className="engine-card engine-tone-info">
+                      <div className="engine-card-head">
+                        <p className="section-title">Produktfilter</p>
+                        <span className="status-chip info">{productFilterPreset}</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        {presetOptions.productFilter.map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            className={productFilterPreset === value ? 'primary' : 'secondary'}
+                            disabled={user?.role !== 'admin'}
+                            onClick={() => setSettings((current) => applyProductFilterPreset(current, value))}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <p style={{ margin: '12px 0 0' }}>Beispielregeln aktiv: Powerbank-Limits und China-Kopfhoerer-Block ueber 25 EUR.</p>
+                    </article>
+
+                    <article className="engine-card engine-tone-info">
+                      <div className="engine-card-head">
+                        <p className="section-title">Automatik</p>
+                        <span className="status-chip info">{automationPreset}</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        {presetOptions.automation.map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            className={automationPreset === value ? 'primary' : 'secondary'}
+                            disabled={user?.role !== 'admin'}
+                            onClick={() => setSettings((current) => applyAutomationPreset(current, value))}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <p style={{ margin: '12px 0 0' }}>Testgruppenrouting laeuft separat im Publisher. Dieses Preset steuert die Deal-Engine-Outputs.</p>
+                    </article>
+
+                    <div className="engine-actions">
+                      <button type="button" className="secondary" onClick={() => setExpertMode((current) => !current)}>
+                        {expertMode ? 'Expert Mode ausblenden' : 'Expert Mode einblenden'}
+                      </button>
+                      <button type="button" className="secondary" disabled={user?.role !== 'admin' || saving} onClick={handleSaveSettings}>
+                        {saving ? 'Speichert...' : 'Regler speichern'}
+                      </button>
                     </div>
-                    <label className="engine-checkbox">
-                      <span>Marktvergleich fuer Amazon Direct</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.marketCompareAmazonDirectEnabled}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            marketCompareAmazonDirectEnabled: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>Marktvergleich nur bei Verkauf & Versand durch Amazon</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.marketCompareAmazonDirectOnly}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            marketCompareAmazonDirectOnly: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>KI nur bei Verkauf & Versand durch Amazon</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.aiAmazonDirectOnly}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            aiAmazonDirectOnly: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>FBA Drittanbieter fuer Marktvergleich erlauben</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.allowFbaThirdPartyMarketCompare}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            allowFbaThirdPartyMarketCompare: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>FBA Drittanbieter fuer KI erlauben</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.allowFbaThirdPartyAi}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            allowFbaThirdPartyAi: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>FBM fuer Marktvergleich erlauben</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.allowFbmMarketCompare}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            allowFbmMarketCompare: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label className="engine-checkbox">
-                      <span>FBM fuer KI erlauben</span>
-                      <input
-                        type="checkbox"
-                        checked={settings.quality.allowFbmAi}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            allowFbmAi: event.target.checked
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      />
-                    </label>
-                    <label>
-                      <span>Unbekannte Verkaeufer</span>
-                      <select
-                        value={settings.quality.unknownSellerMode}
-                        onChange={(event) =>
-                          updateSettings('quality', {
-                            unknownSellerMode: event.target.value
-                          })
-                        }
-                        disabled={user?.role !== 'admin'}
-                      >
-                        <option value="review">REVIEW</option>
-                        <option value="block">BLOCK</option>
-                      </select>
-                    </label>
+
+                    {expertMode ? (
+                      <div className="engine-settings-grid">
+                        <label>
+                          <span>Amazon Tag %</span>
+                          <input
+                            type="number"
+                            value={settings.amazon.dayMinMarketAdvantagePct}
+                            onChange={(event) =>
+                              updateSettings('amazon', {
+                                dayMinMarketAdvantagePct: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>Amazon Nacht %</span>
+                          <input
+                            type="number"
+                            value={settings.amazon.nightMinMarketAdvantagePct}
+                            onChange={(event) =>
+                              updateSettings('amazon', {
+                                nightMinMarketAdvantagePct: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>FBM Tag %</span>
+                          <input
+                            type="number"
+                            value={settings.fbm.dayMinMarketAdvantagePct}
+                            onChange={(event) =>
+                              updateSettings('fbm', {
+                                dayMinMarketAdvantagePct: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>FBM Nacht %</span>
+                          <input
+                            type="number"
+                            value={settings.fbm.nightMinMarketAdvantagePct}
+                            onChange={(event) =>
+                              updateSettings('fbm', {
+                                nightMinMarketAdvantagePct: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>Keepa Approve Score</span>
+                          <input
+                            type="number"
+                            value={settings.global.keepaApproveScore}
+                            onChange={(event) =>
+                              updateSettings('global', {
+                                keepaApproveScore: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>Keepa Queue Score</span>
+                          <input
+                            type="number"
+                            value={settings.global.keepaQueueScore}
+                            onChange={(event) =>
+                              updateSettings('global', {
+                                keepaQueueScore: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>Queue Margin %</span>
+                          <input
+                            type="number"
+                            value={settings.global.queueMarginPct}
+                            onChange={(event) =>
+                              updateSettings('global', {
+                                queueMarginPct: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>Cheap Product Limit</span>
+                          <input
+                            type="number"
+                            value={settings.global.cheapProductLimit}
+                            onChange={(event) =>
+                              updateSettings('global', {
+                                cheapProductLimit: Number(event.target.value)
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>Queue aktiv</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.global.queueEnabled}
+                            onChange={(event) =>
+                              updateSettings('global', {
+                                queueEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>Nachtmodus aktiv</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.global.nightModeEnabled}
+                            onChange={(event) =>
+                              updateSettings('global', {
+                                nightModeEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>Telegram Output</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.output.telegramEnabled}
+                            onChange={(event) =>
+                              updateSettings('output', {
+                                telegramEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>WhatsApp Output</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.output.whatsappEnabled}
+                            onChange={(event) =>
+                              updateSettings('output', {
+                                whatsappEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>AI Resolver optional aktiv</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.ai.resolverEnabled}
+                            onChange={(event) =>
+                              updateSettings('ai', {
+                                resolverEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>KI fuer Amazon Direct</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.ai.amazonDirectEnabled}
+                            onChange={(event) =>
+                              updateSettings('ai', {
+                                amazonDirectEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>KI nur bei Unsicherheit</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.ai.onlyOnUncertainty}
+                            onChange={(event) =>
+                              updateSettings('ai', {
+                                onlyOnUncertainty: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>KI immer im Debugmodus</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.ai.alwaysInDebug}
+                            onChange={(event) =>
+                              updateSettings('ai', {
+                                alwaysInDebug: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>Marktvergleich fuer Amazon Direct</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.marketCompareAmazonDirectEnabled}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                marketCompareAmazonDirectEnabled: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>Nur Amazon Direct fuer Marktvergleich</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.marketCompareAmazonDirectOnly}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                marketCompareAmazonDirectOnly: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>AI nur Amazon Direct</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.aiAmazonDirectOnly}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                aiAmazonDirectOnly: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>FBA fuer Marktvergleich erlauben</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.allowFbaThirdPartyMarketCompare}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                allowFbaThirdPartyMarketCompare: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>FBA fuer KI erlauben</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.allowFbaThirdPartyAi}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                allowFbaThirdPartyAi: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>FBM fuer Marktvergleich erlauben</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.allowFbmMarketCompare}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                allowFbmMarketCompare: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label className="engine-checkbox">
+                          <span>FBM fuer KI erlauben</span>
+                          <input
+                            type="checkbox"
+                            checked={settings.quality.allowFbmAi}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                allowFbmAi: event.target.checked
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          />
+                        </label>
+                        <label>
+                          <span>Unbekannte Verkaeufer</span>
+                          <select
+                            value={settings.quality.unknownSellerMode}
+                            onChange={(event) =>
+                              updateSettings('quality', {
+                                unknownSellerMode: event.target.value
+                              })
+                            }
+                            disabled={user?.role !== 'admin'}
+                          >
+                            <option value="review">REVIEW</option>
+                            <option value="block">BLOCK</option>
+                          </select>
+                        </label>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
+              </section>
 
-                <div className="engine-actions">
-                  <button type="button" className="secondary" disabled={user?.role !== 'admin' || saving} onClick={handleSaveSettings}>
-                    {saving ? 'Speichert...' : 'Regler speichern'}
-                  </button>
+              <section className="card engine-panel">
+                <div className="engine-panel-header">
+                  <div>
+                    <p className="section-title">Deal Flow</p>
+                    <h2 className="page-title">{'Reader -> Analyse -> Decision -> Output'}</h2>
+                  </div>
+                  <span className="engine-header-note">{dashboard?.sources?.activeCount || 0} aktive Quellen</span>
+                </div>
+
+                <div className="engine-card-grid">
+                  {flowCards.map((card) => (
+                    <article key={card.title} className={`engine-card engine-tone-${card.tone}`}>
+                      <div className="engine-card-head">
+                        <p className="section-title">{card.title}</p>
+                        <span className={`status-chip ${card.tone}`}>{card.tone}</span>
+                      </div>
+                      <h3>{card.value}</h3>
+                      <p>{card.detail}</p>
+                    </article>
+                  ))}
+                </div>
+
+                <div className="engine-flow-grid">
+                  {moduleCards.map((item) => (
+                    <article key={item.title} className="engine-flow-card engine-tone-info">
+                      <div className="engine-card-head">
+                        <strong>{item.title}</strong>
+                        <span className="status-chip info">modul</span>
+                      </div>
+                      <p>{item.detail}</p>
+                      <button type="button" className="secondary" onClick={() => openInternalRoute(item.path)}>
+                        Oeffnen
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            </section>
+
+            <section className="engine-mandatory-grid">
+              <section className="card engine-panel">
+                <div className="engine-panel-header">
+                  <div>
+                    <p className="section-title">Telegram Routing</p>
+                    <h2 className="page-title">3 Gruppen klar getrennt</h2>
+                  </div>
+                  <span className="engine-header-note">Test / Approved / Rejected</span>
+                </div>
+                <div className="engine-card-grid">
+                  {routingExamples.map((example) => (
+                    <article key={example.title} className="engine-card engine-tone-info">
+                      <div className="engine-card-head">
+                        <p className="section-title">{example.title}</p>
+                        <span className="status-chip info">beispiel</span>
+                      </div>
+                      <pre className="engine-code" style={{ margin: 0 }}>
+                        {example.body}
+                      </pre>
+                    </article>
+                  ))}
                 </div>
               </section>
 
               <section className="card engine-panel">
                 <div className="engine-panel-header">
                   <div>
-                    <p className="section-title">Output</p>
-                    <h2 className="page-title">Telegram und WhatsApp</h2>
+                    <p className="section-title">Sicherheitscheck</p>
+                    <h2 className="page-title">Hauptpost bleibt sauber</h2>
                   </div>
-                  <span className="engine-header-note">
-                    {dashboard?.outputs?.openQueueCount || 0} offene Deal-Engine-Queues
-                  </span>
-                </div>
-                <div className="engine-card-grid">
-                  <article className={`engine-card engine-tone-${dashboard?.outputs?.snapshot?.telegram?.configured ? 'success' : 'warning'}`}>
-                    <div className="engine-card-head">
-                      <p className="section-title">Telegram</p>
-                      <span className={`status-chip ${dashboard?.outputs?.snapshot?.telegram?.configured ? 'success' : 'warning'}`}>
-                        {dashboard?.outputs?.snapshot?.telegram?.configured ? 'ready' : 'check'}
-                      </span>
-                    </div>
-                    <h3>{dashboard?.outputs?.snapshot?.telegram?.targets || 0} Ziele</h3>
-                    <p>Engine {dashboard?.outputs?.snapshot?.telegram?.enabledByEngine ? 'aktiv' : 'deaktiviert'}</p>
-                  </article>
-                  <article className={`engine-card engine-tone-${dashboard?.outputs?.snapshot?.whatsapp?.configured ? 'success' : 'warning'}`}>
-                    <div className="engine-card-head">
-                      <p className="section-title">WhatsApp</p>
-                      <span className={`status-chip ${dashboard?.outputs?.snapshot?.whatsapp?.configured ? 'success' : 'warning'}`}>
-                        {dashboard?.outputs?.snapshot?.whatsapp?.configured ? 'ready' : 'check'}
-                      </span>
-                    </div>
-                    <h3>{dashboard?.outputs?.snapshot?.whatsapp?.sender || 'kein Sender'}</h3>
-                    <p>Retry Limit {dashboard?.outputs?.snapshot?.whatsapp?.retryLimit || 0}</p>
-                  </article>
+                  <span className="engine-header-note">PAAPI / Amazon / verifizierte Daten only</span>
                 </div>
                 <div className="engine-list">
-                  {(dashboard?.outputs?.latestQueues || []).length ? (
-                    dashboard.outputs.latestQueues.map((queue) => (
-                      <article key={queue.id} className="engine-list-item">
-                        <div className="engine-card-head">
-                          <strong>{queue.payload?.title || `Queue ${queue.id}`}</strong>
-                          <span className={`status-chip ${getToneClass(queue.status)}`}>{queue.status}</span>
-                        </div>
-                        <p>
-                          {queue.targets?.map((target) => `${target.channel_type}:${target.status}`).join(' | ') || 'Keine Targets'} |{' '}
-                          {formatDateTime(queue.created_at)}
-                        </p>
-                      </article>
-                    ))
-                  ) : (
-                    <p className="engine-empty">Noch keine Deal-Engine Outputs vorhanden.</p>
-                  )}
+                  {safetyChecks.map((line) => (
+                    <article key={line} className="engine-list-item">
+                      <strong>Check</strong>
+                      <p>{line}</p>
+                    </article>
+                  ))}
                 </div>
               </section>
             </section>
@@ -849,7 +1387,7 @@ function DealEnginePage() {
                   <p className="section-title">Analyse Engine</p>
                   <h2 className="page-title">Kompletter Deal-Durchlauf</h2>
                 </div>
-                <span className="engine-header-note">Amazon Direct kann Markt + KI nutzen, andere Seller fallen standardmaessig auf Keepa zurueck</span>
+                <span className="engine-header-note">Produktregeln greifen zusaetzlich zu Marktvergleich und Keepa.</span>
               </div>
 
               <div className="engine-form-grid">
@@ -938,14 +1476,9 @@ function DealEnginePage() {
                     <option value="night">night</option>
                   </select>
                 </label>
-
                 <label className="engine-checkbox">
                   <span>Markenprodukt</span>
-                  <input
-                    type="checkbox"
-                    checked={form.isBrandProduct}
-                    onChange={(event) => updateForm('isBrandProduct', event.target.checked)}
-                  />
+                  <input type="checkbox" checked={form.isBrandProduct} onChange={(event) => updateForm('isBrandProduct', event.target.checked)} />
                 </label>
                 <label className="engine-checkbox">
                   <span>No-Name</span>
@@ -953,13 +1486,8 @@ function DealEnginePage() {
                 </label>
                 <label className="engine-checkbox">
                   <span>China Produkt</span>
-                  <input
-                    type="checkbox"
-                    checked={form.isChinaProduct}
-                    onChange={(event) => updateForm('isChinaProduct', event.target.checked)}
-                  />
+                  <input type="checkbox" checked={form.isChinaProduct} onChange={(event) => updateForm('isChinaProduct', event.target.checked)} />
                 </label>
-
                 <label className="engine-span-2">
                   <span>Marktangebote JSON</span>
                   <textarea value={form.marketOffersJson} onChange={(event) => updateForm('marketOffersJson', event.target.value)} rows={12} />
@@ -975,11 +1503,7 @@ function DealEnginePage() {
               </div>
 
               <div className="engine-actions">
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => setForm(buildFormFromSample(samplePayload || {}))}
-                >
+                <button type="button" className="secondary" onClick={() => setForm(buildFormFromSample(samplePayload || {}))}>
                   Sample laden
                 </button>
                 <button type="button" className="primary" disabled={analyzing} onClick={handleAnalyze}>
@@ -995,9 +1519,7 @@ function DealEnginePage() {
                     <p className="section-title">Analyse Output</p>
                     <h2 className="page-title">Finale Entscheidung</h2>
                   </div>
-                  <span className="engine-header-note">
-                    Letztes Ergebnis {currentResult ? formatDateTime(currentResult.createdAt) : '-'}
-                  </span>
+                  <span className="engine-header-note">Letztes Ergebnis {currentResult ? formatDateTime(currentResult.createdAt) : '-'}</span>
                 </div>
                 {currentResult ? (
                   <>
@@ -1010,6 +1532,14 @@ function DealEnginePage() {
                         <h3>{currentResult.analysis?.decisionSourceLabel || currentResult.analysis?.decisionSource || '-'}</h3>
                         <p>{currentResult.decisionReason}</p>
                       </article>
+                      <article className={`engine-card engine-tone-${productRules?.status === 'matched' ? 'warning' : 'info'}`}>
+                        <div className="engine-card-head">
+                          <p className="section-title">Produktregeln</p>
+                          <span className={`status-chip ${productRules?.status === 'matched' ? 'warning' : 'info'}`}>{productRules?.status || 'clear'}</span>
+                        </div>
+                        <h3>{productRules?.action || 'none'}</h3>
+                        <p>{productRules?.summary || 'Keine Produktregel ausgelost.'}</p>
+                      </article>
                       <article className="engine-card engine-tone-info">
                         <div className="engine-card-head">
                           <p className="section-title">Markt</p>
@@ -1020,30 +1550,11 @@ function DealEnginePage() {
                       </article>
                       <article className="engine-card engine-tone-info">
                         <div className="engine-card-head">
-                          <p className="section-title">Seller</p>
-                          <span className="status-chip info">{currentResult.analysis?.seller?.sellerClass || currentResult.sellerArea || 'UNKNOWN'}</span>
-                        </div>
-                        <h3>{currentResult.analysis?.seller?.sellerType || currentResult.sellerArea || '-'}</h3>
-                        <p>
-                          Verkauf Amazon {currentResult.analysis?.seller?.soldByAmazonLabel || '-'} | Versand Amazon{' '}
-                          {currentResult.analysis?.seller?.shippedByAmazonLabel || '-'}
-                        </p>
-                      </article>
-                      <article className="engine-card engine-tone-info">
-                        <div className="engine-card-head">
                           <p className="section-title">Keepa</p>
                           <span className="status-chip info">{currentResult.analysis?.fallbackUsed ? 'fallback' : 'idle'}</span>
                         </div>
                         <h3>{currentResult.keepaScore ?? '-'}</h3>
                         <p>avg90 {currentResult.keepaDiscount90 ?? '-'}% | avg180 {currentResult.keepaDiscount180 ?? '-'}%</p>
-                      </article>
-                      <article className="engine-card engine-tone-info">
-                        <div className="engine-card-head">
-                          <p className="section-title">Output</p>
-                          <span className={`status-chip ${getToneClass(currentResult.outputStatus)}`}>{currentResult.outputStatus}</span>
-                        </div>
-                        <h3>Queue {currentResult.outputQueueId ?? '-'}</h3>
-                        <p>{currentResult.outputTargetCount || 0} Targets | {currentResult.dayPart}</p>
                       </article>
                     </div>
                     <div className="engine-list">
@@ -1093,9 +1604,7 @@ function DealEnginePage() {
                     <p className="engine-empty">Noch keine Runs vorhanden.</p>
                   )}
                 </div>
-
                 <div className="engine-divider" />
-
                 <div className="engine-list">
                   {(dashboard?.errors || []).length ? (
                     dashboard.errors.map((entry) => (

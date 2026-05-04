@@ -1,5 +1,10 @@
 import { Router } from 'express';
-import { getAmazonAffiliateStatus, loadAmazonAffiliateContext, runAmazonAffiliateApiTest } from '../services/amazonAffiliateService.js';
+import {
+  getAmazonAffiliateStatus,
+  loadAmazonAffiliateContext,
+  runAmazonAffiliateApiTest,
+  testCreatorApi
+} from '../services/amazonAffiliateService.js';
 import { buildAmazonAffiliateLinkRecord, classifySellerType, extractAsin, normalizeAmazonLink } from '../services/dealHistoryService.js';
 import { logGeneratorDebug } from '../services/generatorFlowService.js';
 import { extractSellerSignalsFromText, resolveSellerIdentity } from '../services/sellerClassificationService.js';
@@ -2329,6 +2334,21 @@ router.get('/test', async (req, res) => {
     res.status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 400).json({
       error: error instanceof Error ? error.message : 'Amazon API Test fehlgeschlagen.',
       code: error instanceof Error ? error.code || 'AMAZON_API_TEST_FAILED' : 'AMAZON_API_TEST_FAILED'
+    });
+  }
+});
+
+router.get('/creator-test', async (req, res) => {
+  try {
+    res.json(
+      await testCreatorApi({
+        asin: req.query.asin
+      })
+    );
+  } catch (error) {
+    res.status(error?.statusCode && Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : 400).json({
+      error: error instanceof Error ? error.message : 'Creator API Test fehlgeschlagen.',
+      code: error instanceof Error ? error.code || 'CREATOR_API_TEST_FAILED' : 'CREATOR_API_TEST_FAILED'
     });
   }
 });

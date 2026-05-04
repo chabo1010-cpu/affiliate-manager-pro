@@ -11,6 +11,7 @@ const sourceSection = [
 const regulatorSection = [
   { label: 'Autobot', path: '/autobot', icon: '\u2699\uFE0F' },
   { label: 'Deal Engine', path: '/deal-engine', icon: '\u2696\uFE0F' },
+  { label: 'Produkt-Intelligenz', path: '/product-intelligence', icon: '\u{1F4E6}' },
   { label: 'Logik-Zentrale', path: '/learning', icon: '\u{1F9E0}', adminOnly: true }
 ];
 const outputSection = [

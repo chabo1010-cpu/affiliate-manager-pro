@@ -1,7 +1,8 @@
 import { Router } from 'express';
-import { getReaderRuntimeConfig, getTelegramTestGroupConfig } from '../env.js';
+import { getReaderRuntimeConfig, getTelegramConfig, getTelegramTestGroupConfig } from '../env.js';
 import { buildAmazonAffiliateLinkRecord, normalizeSellerType, resetDealLockHistory } from '../services/dealHistoryService.js';
 import { publishGeneratorPostDirect } from '../services/directPublisher.js';
+import { getTelegramBotClientConfig } from '../services/telegramBotClientService.js';
 import { forceScanTelegramReader, forceTestgroupFeed, getTelegramUserClientStatus } from '../services/telegramUserClientService.js';
 import { sendTelegramPost } from '../services/telegramSenderService.js';
 import { generatePostText } from '../../frontend/src/lib/postGenerator.js';
@@ -40,6 +41,114 @@ function resolveTestgroupTargetMeta() {
     targetChatId,
     targetSource
   };
+}
+
+function normalizeTelegramUsername(value = '') {
+  const username = cleanText(value).replace(/^@+/, '');
+  return username ? `@${username}` : '';
+}
+
+function pushTelegramChannelDebugCandidate(candidates, seen, input = {}) {
+  const key = cleanText(input.key);
+  const chatId = cleanText(input.chatId);
+  const username = normalizeTelegramUsername(input.username);
+  const title = cleanText(input.title || input.label);
+  const dedupeKey = [key, chatId, username, title].filter(Boolean).join('|');
+
+  if (!dedupeKey || seen.has(dedupeKey)) {
+    return;
+  }
+
+  seen.add(dedupeKey);
+  candidates.push({
+    key,
+    label: cleanText(input.label) || title || username || chatId || 'Telegram Ziel',
+    title,
+    username,
+    chatId
+  });
+}
+
+function getTelegramChannelDebugCandidates() {
+  const candidates = [];
+  const seen = new Set();
+  const botConfig = getTelegramBotClientConfig();
+  const testGroupConfig = getTelegramTestGroupConfig();
+
+  pushTelegramChannelDebugCandidate(candidates, seen, {
+    key: 'test',
+    label: 'Testgruppe',
+    title: 'Testgruppe',
+    chatId: testGroupConfig.chatId
+  });
+  pushTelegramChannelDebugCandidate(candidates, seen, {
+    key: 'approved',
+    label: 'Approved Channel',
+    title: 'Ver\u00F6ffentlicht Test',
+    chatId: process.env.TELEGRAM_APPROVED_CHANNEL_ID,
+    username: process.env.TELEGRAM_APPROVED_CHANNEL_USERNAME
+  });
+  pushTelegramChannelDebugCandidate(candidates, seen, {
+    key: 'rejected',
+    label: 'Rejected Channel',
+    title: 'Geblockt Test',
+    chatId: process.env.TELEGRAM_REJECTED_CHANNEL_ID,
+    username: process.env.TELEGRAM_REJECTED_CHANNEL_USERNAME
+  });
+
+  [...(botConfig.targets || []), ...(botConfig.effectiveTargets || [])].forEach((target) => {
+    pushTelegramChannelDebugCandidate(candidates, seen, {
+      key: `bot_target_${target.id || target.chatId || target.name || 'unknown'}`,
+      label: target.name,
+      title: target.name,
+      chatId: target.chatId
+    });
+  });
+
+  return candidates;
+}
+
+async function resolveTelegramChannelDebugCandidate(token, candidate = {}) {
+  const chatRef = cleanText(candidate.username) || cleanText(candidate.chatId);
+
+  if (!chatRef) {
+    return {
+      ...candidate,
+      ok: false,
+      error: 'Kein Username oder Chat-ID konfiguriert.'
+    };
+  }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${token}/getChat?chat_id=${encodeURIComponent(chatRef)}`
+  );
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok || data?.ok !== true) {
+    return {
+      ...candidate,
+      ok: false,
+      error: data?.description || `Telegram getChat fehlgeschlagen (${response.status}).`
+    };
+  }
+
+  const chat = data.result || {};
+  const username = normalizeTelegramUsername(chat.username) || candidate.username || '';
+  const result = {
+    ...candidate,
+    ok: true,
+    title: cleanText(chat.title || chat.first_name || candidate.title || candidate.label),
+    username,
+    chatId: chat.id === undefined || chat.id === null ? candidate.chatId : String(chat.id)
+  };
+
+  console.log('[TELEGRAM_CHANNEL_ID_DEBUG]', {
+    title: result.title,
+    username: result.username,
+    chatId: result.chatId
+  });
+
+  return result;
 }
 
 function classifyTelegramSendError(error) {
@@ -352,6 +461,52 @@ router.post('/send-testgroup-ping', async (req, res) => {
       error: error instanceof Error ? error.message : 'Telegram API Fehler'
     });
   }
+});
+
+router.post('/telegram-channel-id-debug', requireAdmin, async (req, res) => {
+  const telegramConfig = getTelegramConfig();
+  const candidates = getTelegramChannelDebugCandidates();
+
+  if (!cleanText(telegramConfig.token)) {
+    return res.status(400).json({
+      success: false,
+      error: 'TELEGRAM_BOT_TOKEN fehlt im Backend.'
+    });
+  }
+
+  const results = [];
+
+  for (const candidate of candidates) {
+    const result = await resolveTelegramChannelDebugCandidate(telegramConfig.token, candidate);
+    results.push(result);
+
+    if (!result.ok) {
+      console.warn('[TELEGRAM_CHANNEL_ID_DEBUG_ERROR]', {
+        title: result.title || result.label || '',
+        username: result.username || '',
+        chatId: result.chatId || '',
+        error: result.error
+      });
+    }
+  }
+
+  const approved = results.find((item) => item.key === 'approved') || null;
+  const rejected = results.find((item) => item.key === 'rejected') || null;
+  const envOutput = {
+    TELEGRAM_APPROVED_CHANNEL_ID: approved?.ok ? approved.chatId : '',
+    TELEGRAM_REJECTED_CHANNEL_ID: rejected?.ok ? rejected.chatId : ''
+  };
+
+  console.log(`TELEGRAM_APPROVED_CHANNEL_ID=${envOutput.TELEGRAM_APPROVED_CHANNEL_ID}`);
+  console.log(`TELEGRAM_REJECTED_CHANNEL_ID=${envOutput.TELEGRAM_REJECTED_CHANNEL_ID}`);
+
+  return res.json({
+    success: true,
+    endpoint: '/api/debug/telegram-channel-id-debug',
+    candidates: candidates.length,
+    results,
+    envOutput
+  });
 });
 
 export default router;

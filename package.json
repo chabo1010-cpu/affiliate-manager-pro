@@ -7,6 +7,9 @@
     "dev": "node scripts/dev.mjs",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:backend": "npm --prefix backend run dev",
+    "restart:backend": "node scripts/restart-dev-service.mjs backend",
+    "restart:frontend": "node scripts/restart-dev-service.mjs frontend",
+    "restart:all": "node scripts/restart-dev-service.mjs all",
     "build": "npm --prefix frontend run build"
   }
 }

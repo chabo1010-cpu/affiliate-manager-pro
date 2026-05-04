@@ -1,13 +1,50 @@
 import { getDb } from '../db.js';
-import { getReaderRuntimeConfig, getTelegramTestGroupConfig } from '../env.js';
+import { getReaderRuntimeConfig, getTelegramConfig, getTelegramTestGroupConfig } from '../env.js';
 import { assertDealNotLocked, cleanText } from './dealHistoryService.js';
 import { buildGeneratorDealContext } from './generatorDealScoringService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
 import { createPublishingEntry, processPublishingQueueEntry } from './publisherService.js';
 import { isFailedPublishingQueueStatus, normalizePublishingQueueStatus } from './publishingQueueStateService.js';
+import { sendTelegramPost } from './telegramSenderService.js';
 
 const db = getDb();
 const DEBUG_QUEUE_ID_PLACEHOLDER = '__QUEUE_ID__';
+const APPROVED_ENABLED = process.env.TELEGRAM_APPROVED_CHANNEL_ENABLED === '1';
+const REJECTED_ENABLED = process.env.TELEGRAM_REJECTED_CHANNEL_ENABLED === '1';
+const APPROVED_CHANNEL = cleanText(process.env.TELEGRAM_APPROVED_CHANNEL_ID);
+const REJECTED_CHANNEL = cleanText(process.env.TELEGRAM_REJECTED_CHANNEL_ID);
+const APPROVED_CHANNEL_USERNAME = normalizeTelegramChannelUsername(process.env.TELEGRAM_APPROVED_CHANNEL_USERNAME);
+const REJECTED_CHANNEL_USERNAME = normalizeTelegramChannelUsername(process.env.TELEGRAM_REJECTED_CHANNEL_USERNAME);
+const ROUTING_TEST_FORCE_APPROVE = process.env.ROUTING_TEST_FORCE_APPROVE === '1';
+const telegramRoutingChannelCache = {
+  approved: {
+    chatId: APPROVED_CHANNEL,
+    resolvedFromUsername: false,
+    resolveAttempted: false,
+    error: ''
+  },
+  rejected: {
+    chatId: REJECTED_CHANNEL,
+    resolvedFromUsername: false,
+    resolveAttempted: false,
+    error: ''
+  }
+};
+
+console.info('[APPROVED_CHANNEL_READY]', {
+  enabled: APPROVED_ENABLED,
+  configured: Boolean(APPROVED_CHANNEL || APPROVED_CHANNEL_USERNAME),
+  chatIdConfigured: Boolean(APPROVED_CHANNEL),
+  usernameConfigured: Boolean(APPROVED_CHANNEL_USERNAME),
+  ready: APPROVED_ENABLED && Boolean(APPROVED_CHANNEL || APPROVED_CHANNEL_USERNAME)
+});
+console.info('[REJECTED_CHANNEL_READY]', {
+  enabled: REJECTED_ENABLED,
+  configured: Boolean(REJECTED_CHANNEL || REJECTED_CHANNEL_USERNAME),
+  chatIdConfigured: Boolean(REJECTED_CHANNEL),
+  usernameConfigured: Boolean(REJECTED_CHANNEL_USERNAME),
+  ready: REJECTED_ENABLED && Boolean(REJECTED_CHANNEL || REJECTED_CHANNEL_USERNAME)
+});
 
 function getDealLockBypassMeta(explicitSkipDealLock = false) {
   const runtimeConfig = getReaderRuntimeConfig();
@@ -141,6 +178,1088 @@ function validatePublishingPrice(input = {}) {
     parsedPrice,
     reason: cleanText(input.currentPrice) ? 'Preis ist 0,00€ oder ungueltig.' : 'Preis fehlt oder ist ungueltig.'
   };
+}
+
+function normalizeTelegramChannelUsername(value = '') {
+  const username = cleanText(value).replace(/^@+/, '');
+  return username ? `@${username}` : '';
+}
+
+async function resolveTelegramRoutingChannel({
+  routeKey = '',
+  username = '',
+  chatId = '',
+  resolvedLogTag = '',
+  failedLogTag = ''
+} = {}) {
+  const cache = telegramRoutingChannelCache[routeKey] || {
+    chatId: '',
+    resolvedFromUsername: false,
+    resolveAttempted: false,
+    error: ''
+  };
+  const cleanChatId = cleanText(chatId);
+  const cleanUsername = normalizeTelegramChannelUsername(username);
+
+  if (cleanChatId) {
+    cache.chatId = cleanChatId;
+    cache.error = '';
+    telegramRoutingChannelCache[routeKey] = cache;
+    return cleanChatId;
+  }
+
+  if (cache.chatId) {
+    return cache.chatId;
+  }
+
+  if (!cleanUsername) {
+    return '';
+  }
+
+  if (cache.resolveAttempted) {
+    return cache.chatId || '';
+  }
+
+  cache.resolveAttempted = true;
+
+  try {
+    const telegramConfig = getTelegramConfig();
+    const token = cleanText(telegramConfig.token);
+
+    if (!token) {
+      throw new Error('TELEGRAM_BOT_TOKEN fehlt im Backend.');
+    }
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${token}/getChat?chat_id=${encodeURIComponent(cleanUsername)}`
+    );
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok || data?.ok !== true) {
+      throw new Error(data?.description || `Telegram getChat fehlgeschlagen (${response.status}).`);
+    }
+
+    const resolvedChatId = data?.result?.id === undefined || data?.result?.id === null ? '' : String(data.result.id);
+    if (!resolvedChatId) {
+      throw new Error('Telegram getChat hat keine chat.id geliefert.');
+    }
+
+    cache.chatId = resolvedChatId;
+    cache.resolvedFromUsername = true;
+    cache.error = '';
+    console.info(resolvedLogTag, {
+      username: cleanUsername,
+      chatId: resolvedChatId
+    });
+    console.log(`TELEGRAM_${routeKey.toUpperCase()}_CHANNEL_ID=${resolvedChatId}`);
+  } catch (error) {
+    cache.error = error instanceof Error ? error.message : 'Telegram Channel Username konnte nicht aufgeloest werden.';
+    console.warn(failedLogTag, {
+      username: cleanUsername,
+      error: cache.error
+    });
+  }
+
+  telegramRoutingChannelCache[routeKey] = cache;
+  return cache.chatId || '';
+}
+
+async function getTelegramRoutingConfig() {
+  const approvedChannel = APPROVED_ENABLED
+    ? await resolveTelegramRoutingChannel({
+        routeKey: 'approved',
+        username: APPROVED_CHANNEL_USERNAME,
+        chatId: APPROVED_CHANNEL,
+        resolvedLogTag: '[APPROVED_CHANNEL_USERNAME_RESOLVED]',
+        failedLogTag: '[APPROVED_CHANNEL_USERNAME_RESOLVE_FAILED]'
+      })
+    : APPROVED_CHANNEL;
+  const rejectedChannel = REJECTED_ENABLED
+    ? await resolveTelegramRoutingChannel({
+        routeKey: 'rejected',
+        username: REJECTED_CHANNEL_USERNAME,
+        chatId: REJECTED_CHANNEL,
+        resolvedLogTag: '[REJECTED_CHANNEL_USERNAME_RESOLVED]',
+        failedLogTag: '[REJECTED_CHANNEL_USERNAME_RESOLVE_FAILED]'
+      })
+    : REJECTED_CHANNEL;
+
+  return {
+    approved: {
+      enabled: APPROVED_ENABLED && Boolean(approvedChannel),
+      configured: Boolean(approvedChannel),
+      flagEnabled: APPROVED_ENABLED,
+      chatId: approvedChannel,
+      username: APPROVED_CHANNEL_USERNAME,
+      resolveError: telegramRoutingChannelCache.approved.error
+    },
+    rejected: {
+      enabled: REJECTED_ENABLED && Boolean(rejectedChannel),
+      configured: Boolean(rejectedChannel),
+      flagEnabled: REJECTED_ENABLED,
+      chatId: rejectedChannel,
+      username: REJECTED_CHANNEL_USERNAME,
+      resolveError: telegramRoutingChannelCache.rejected.error
+    }
+  };
+}
+
+function buildRoutingSkipReason(config = {}, inactiveDecisionReason = 'decision_not_matching') {
+  if (config.flagEnabled !== true) {
+    return 'enabled_flag_off';
+  }
+
+  if (!config.configured) {
+    return 'channel_id_missing';
+  }
+
+  return inactiveDecisionReason;
+}
+
+function resolveTelegramRoutingReason(input = {}, generatorContext = {}) {
+  return (
+    cleanText(input.telegramRoutingReason) ||
+    cleanText(generatorContext?.learning?.reason) ||
+    cleanText(generatorContext?.evaluation?.reason) ||
+    (Array.isArray(generatorContext?.evaluation?.reasons) ? cleanText(generatorContext.evaluation.reasons.join(' | ')) : '') ||
+    'Keine Begruendung vorhanden.'
+  );
+}
+
+function resolveTelegramRoutingSourceLabel(input = {}) {
+  return cleanText(input.sourceName) || cleanText(input.contextSource) || cleanText(input.queueSourceType) || 'System';
+}
+
+function isReaderTestModeFinalRoutingActive() {
+  const runtimeConfig = getReaderRuntimeConfig();
+  return runtimeConfig.readerTestMode === true || process.env.READER_TEST_MODE === '1';
+}
+
+function resolveFinalRoutingSellerClass(input = {}, generatorContext = {}) {
+  return cleanText(
+    input.sellerClass ||
+      generatorContext?.seller?.sellerClass ||
+      generatorContext?.learning?.sellerClass ||
+      generatorContext?.evaluation?.sellerClass ||
+      generatorContext?.decisionPolicy?.seller?.sellerClass
+  ).toUpperCase();
+}
+
+function resolveFinalRoutingSellerType(input = {}, generatorContext = {}) {
+  return cleanText(
+    input.sellerType ||
+      generatorContext?.seller?.sellerType ||
+      generatorContext?.learning?.sellerType ||
+      generatorContext?.evaluation?.sellerType ||
+      generatorContext?.decisionPolicy?.seller?.sellerType
+  ).toUpperCase();
+}
+
+function isFbmFinalRoutingSeller(input = {}, generatorContext = {}) {
+  const sellerClass = resolveFinalRoutingSellerClass(input, generatorContext);
+  const sellerType = resolveFinalRoutingSellerType(input, generatorContext);
+
+  return sellerClass === 'FBM' || sellerClass.includes('FBM') || sellerType === 'FBM' || sellerType.includes('FBM');
+}
+
+function buildFinalRoutingInputState(input = {}, generatorContext = {}) {
+  const finalInput = { ...input };
+  const finalGeneratorContext = {
+    ...generatorContext,
+    learning: { ...(generatorContext?.learning || {}) },
+    evaluation: { ...(generatorContext?.evaluation || {}) },
+    seller: { ...(generatorContext?.seller || {}) }
+  };
+  const sellerClass = resolveFinalRoutingSellerClass(finalInput, finalGeneratorContext);
+  const shouldHardBlockFbm = isFbmFinalRoutingSeller(finalInput, finalGeneratorContext);
+  const shouldForceApprove =
+    shouldHardBlockFbm !== true && isReaderTestModeFinalRoutingActive() === true && sellerClass === 'FBA_OR_AMAZON_UNKNOWN';
+
+  if (shouldHardBlockFbm) {
+    const reason = 'FBM/Drittanbieter darf nicht automatisch veroeffentlicht werden.';
+
+    finalInput.sellerClass = 'FBM';
+    finalInput.sellerType = 'FBM';
+    finalInput.decision = 'BLOCK';
+    finalInput.decisionDisplay = 'BLOCK';
+    finalInput.telegramRoutingDecision = 'block';
+    finalInput.decisionStatus = 'block';
+    finalInput.routingDecision = 'block';
+    finalInput.normalDecision = 'block';
+    finalInput.wouldPostNormally = false;
+    finalInput.testGroupApproved = false;
+    finalInput.accepted = false;
+    finalInput.telegramRoutingReason = reason;
+
+    finalGeneratorContext.seller = {
+      ...finalGeneratorContext.seller,
+      sellerClass: 'FBM',
+      sellerType: 'FBM'
+    };
+    finalGeneratorContext.learning = {
+      ...finalGeneratorContext.learning,
+      routingDecision: 'block',
+      normalDecision: 'block',
+      wouldPostNormally: false,
+      testGroupApproved: false,
+      canReachTestGroup: false,
+      accepted: false,
+      blocked: true,
+      reason
+    };
+    finalGeneratorContext.evaluation = {
+      ...finalGeneratorContext.evaluation,
+      decision: 'BLOCK',
+      decisionLabel: 'BLOCK',
+      testGroupApproved: false,
+      accepted: false,
+      blocked: true,
+      reason
+    };
+
+    console.info('[FBM_HARD_BLOCK_ACTIVE]', {
+      sellerClass: finalInput.sellerClass,
+      sellerType: finalInput.sellerType,
+      routingDecision: finalInput.routingDecision,
+      reason
+    });
+    console.info('[FBM_BLOCK_OVERRIDES_TEST_APPROVE]', {
+      sellerClass: finalInput.sellerClass,
+      sellerType: finalInput.sellerType,
+      wouldPostNormally: false,
+      testGroupApproved: false
+    });
+  }
+
+  if (shouldForceApprove) {
+    const reason = 'Testmodus: Amazon Produktdaten verifiziert, Seller noch nicht eindeutig.';
+
+    finalInput.sellerClass = 'FBA_OR_AMAZON_UNKNOWN';
+    finalInput.decision = 'APPROVE';
+    finalInput.decisionDisplay = 'APPROVE';
+    finalInput.telegramRoutingDecision = 'approve';
+    finalInput.decisionStatus = 'approve';
+    finalInput.routingDecision = 'approve';
+    finalInput.normalDecision = 'approve';
+    finalInput.wouldPostNormally = true;
+    finalInput.testGroupApproved = true;
+    finalInput.accepted = true;
+    finalInput.telegramRoutingReason = cleanText(finalInput.telegramRoutingReason) || reason;
+
+    finalGeneratorContext.seller.sellerClass = 'FBA_OR_AMAZON_UNKNOWN';
+    finalGeneratorContext.learning = {
+      ...finalGeneratorContext.learning,
+      routingDecision: 'approve',
+      normalDecision: 'approve',
+      wouldPostNormally: true,
+      testGroupApproved: true,
+      canReachTestGroup: true,
+      accepted: true,
+      blocked: false,
+      reason: cleanText(finalGeneratorContext.learning.reason) || reason
+    };
+    finalGeneratorContext.evaluation = {
+      ...finalGeneratorContext.evaluation,
+      decision: 'APPROVE',
+      decisionLabel: 'APPROVE',
+      testGroupApproved: true,
+      accepted: true,
+      blocked: false,
+      reason: cleanText(finalGeneratorContext.evaluation.reason) || reason
+    };
+
+    console.info('[FINAL_FORCE_APPROVE_FOR_VERIFIED_AMAZON_UNKNOWN]', {
+      sellerClass: finalInput.sellerClass,
+      decision: finalInput.decision,
+      routingDecision: finalInput.routingDecision,
+      reason
+    });
+  }
+
+  return {
+    input: finalInput,
+    generatorContext: finalGeneratorContext,
+    sellerClass: resolveFinalRoutingSellerClass(finalInput, finalGeneratorContext),
+    forcedApprove: shouldForceApprove,
+    hardBlockedFbm: shouldHardBlockFbm
+  };
+}
+
+function buildFinalRoutingInputLog(finalRoutingState = {}, routingDecision = {}) {
+  const routingInput = finalRoutingState.input || {};
+  const routingGeneratorContext = finalRoutingState.generatorContext || {};
+  const learning = routingGeneratorContext.learning || {};
+  const evaluation = routingGeneratorContext.evaluation || {};
+
+  return {
+    sellerClass: finalRoutingState.sellerClass || resolveFinalRoutingSellerClass(routingInput, routingGeneratorContext),
+    sellerType: resolveFinalRoutingSellerType(routingInput, routingGeneratorContext),
+    decision: cleanText(routingInput.decision || evaluation.decision) || routingDecision.label || '',
+    decisionDisplay: cleanText(routingInput.decisionDisplay || evaluation.decisionLabel) || routingDecision.label || '',
+    routingDecision:
+      cleanText(routingInput.routingDecision || routingInput.telegramRoutingDecision || learning.routingDecision) ||
+      routingDecision.bucket ||
+      '',
+    normalDecision: cleanText(routingInput.normalDecision || learning.normalDecision) || '',
+    wouldPostNormally:
+      routingInput.wouldPostNormally === true ||
+      learning.wouldPostNormally === true ||
+      routingDecision.bucket === 'approved',
+    testGroupApproved:
+      routingInput.testGroupApproved === true ||
+      learning.testGroupApproved === true ||
+      evaluation.testGroupApproved === true,
+    fbmProtection: finalRoutingState.hardBlockedFbm === true ? 'AKTIV' : 'nicht noetig'
+  };
+}
+
+function resolveTelegramRoutingDecision(input = {}, generatorContext = {}) {
+  const explicitDecision = cleanText(input.telegramRoutingDecision || input.decisionStatus).toLowerCase();
+  const learningDecision = cleanText(generatorContext?.learning?.routingDecision).toLowerCase();
+  const evaluationDecision = cleanText(generatorContext?.evaluation?.decision).toLowerCase();
+  const evaluationApproved = generatorContext?.evaluation?.testGroupApproved === true;
+  const hasValidGeneratorPost =
+    Boolean(cleanText(input.title)) &&
+    Boolean(cleanText(input.link || input.normalizedUrl)) &&
+    Boolean(cleanText(input.currentPrice));
+
+  if (isFbmFinalRoutingSeller(input, generatorContext)) {
+    return { bucket: 'rejected', label: 'BLOCK' };
+  }
+
+  if (ROUTING_TEST_FORCE_APPROVE === true && hasValidGeneratorPost) {
+    console.info('[ROUTING_TEST_FORCE_APPROVE_ACTIVE]', {
+      asin: cleanText(input.asin).toUpperCase() || '',
+      titlePreview: cleanText(input.title).slice(0, 120),
+      hasPrice: Boolean(cleanText(input.currentPrice)),
+      hasLink: Boolean(cleanText(input.link || input.normalizedUrl))
+    });
+    return { bucket: 'approved', label: 'APPROVE' };
+  }
+
+  if (['block', 'blocked', 'reject', 'rejected', 'hold'].includes(explicitDecision)) {
+    return { bucket: 'rejected', label: 'BLOCK' };
+  }
+  if (['review', 'manual_review'].includes(explicitDecision)) {
+    return { bucket: 'rejected', label: 'REVIEW' };
+  }
+  if (['block', 'hold'].includes(learningDecision) || ['hold', 'blocked', 'reject'].includes(evaluationDecision)) {
+    return { bucket: 'rejected', label: 'BLOCK' };
+  }
+  if (learningDecision === 'review' || evaluationDecision === 'manual_review') {
+    return { bucket: 'rejected', label: 'REVIEW' };
+  }
+  if (
+    ['approve', 'approved', 'approved_for_test_group', 'test_group'].includes(explicitDecision) ||
+    ['approve', 'approved', 'approved_for_test_group', 'test_group'].includes(learningDecision) ||
+    ['approve', 'approved', 'approved_for_test_group'].includes(evaluationDecision) ||
+    evaluationApproved === true ||
+    generatorContext?.learning?.canReachTestGroup === true
+  ) {
+    return { bucket: 'approved', label: 'APPROVE' };
+  }
+
+  return { bucket: 'neutral', label: 'NEUTRAL' };
+}
+
+function shortenRoutingText(value = '', maxLength = 140) {
+  const normalized = cleanText(String(value || '').replace(/\s+/g, ' '));
+  if (!normalized || normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 3).trim()}...`;
+}
+
+function formatRoutingValue(value, fallback = 'n/a') {
+  if (value === null || value === undefined || value === '') {
+    return fallback;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(Math.round(value * 10) / 10);
+  }
+
+  return cleanText(String(value)) || fallback;
+}
+
+function formatRoutingPercent(value, fallback = 'n/a') {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return `${Math.round(numeric * 10) / 10}%`;
+}
+
+function formatRoutingPriceText(value, fallback = 'n/a') {
+  const text = cleanText(value);
+  if (!text) {
+    return fallback;
+  }
+
+  if (/\u20AC|eur/i.test(text)) {
+    return text;
+  }
+
+  const numeric = parsePublishingPriceValue(text);
+  if (numeric !== null) {
+    const formatted = new Intl.NumberFormat('de-DE', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(numeric);
+    return `${formatted}\u20AC`;
+  }
+
+  return text;
+}
+
+function resolveRoutingPriceSourceLabel(input = {}, generatorContext = {}) {
+  const rawSource = cleanText(
+    input.rawPriceSource ||
+      input.priceRawSource ||
+      input.priceSource ||
+      generatorContext?.pricing?.rawPriceSource ||
+      generatorContext?.pricing?.priceSource
+  ).toLowerCase();
+
+  if (rawSource.includes('paapi')) {
+    return { label: 'PAAPI', logTag: '[PRICE_SOURCE_PAAPI]', rawSource };
+  }
+
+  if (rawSource.includes('creator')) {
+    return { label: 'Creator API', logTag: '', rawSource };
+  }
+
+  if (rawSource.includes('scrape') || rawSource.includes('scraped') || rawSource.includes('amazonfinal') || rawSource.includes('amazonbuybox')) {
+    return { label: 'Scrape', logTag: '[PRICE_SOURCE_SCRAPE]', rawSource };
+  }
+
+  if (rawSource.includes('keepa')) {
+    return { label: 'Keepa', logTag: '[PRICE_SOURCE_KEEPA]', rawSource };
+  }
+
+  if (rawSource.includes('telegram')) {
+    return { label: 'Telegram', logTag: '', rawSource };
+  }
+
+  return { label: 'Fallback', logTag: '', rawSource: rawSource || 'fallback' };
+}
+
+function parseRoutingDiscountDescriptor(value = '') {
+  const text = cleanText(value);
+  if (!text) {
+    return null;
+  }
+
+  const numeric = parsePublishingPriceValue(text);
+  if (numeric === null) {
+    return null;
+  }
+
+  if (/%/.test(text)) {
+    return { type: 'percent', value: numeric };
+  }
+
+  if (/\u20AC|eur/i.test(text)) {
+    return { type: 'amount', value: numeric };
+  }
+
+  return null;
+}
+
+function calculateRoutingFinalPrice(basePriceText = '', couponValue = '', subscribeDiscount = '') {
+  const basePrice = parsePublishingPriceValue(basePriceText);
+  if (basePrice === null) {
+    return {
+      calculated: false,
+      finalPrice: '',
+      finalPriceValue: null
+    };
+  }
+
+  const couponDescriptor = parseRoutingDiscountDescriptor(couponValue);
+  const subscribeDescriptor = parseRoutingDiscountDescriptor(subscribeDiscount);
+  let finalPriceValue = basePrice;
+  let appliedDiscount = false;
+
+  if (couponDescriptor) {
+    appliedDiscount = true;
+    finalPriceValue =
+      couponDescriptor.type === 'percent'
+        ? finalPriceValue * (1 - couponDescriptor.value / 100)
+        : finalPriceValue - couponDescriptor.value;
+  }
+
+  if (subscribeDescriptor) {
+    appliedDiscount = true;
+    finalPriceValue =
+      subscribeDescriptor.type === 'percent'
+        ? finalPriceValue * (1 - subscribeDescriptor.value / 100)
+        : finalPriceValue - subscribeDescriptor.value;
+  }
+
+  if (!appliedDiscount || !Number.isFinite(finalPriceValue) || finalPriceValue <= 0) {
+    return {
+      calculated: false,
+      finalPrice: '',
+      finalPriceValue: null
+    };
+  }
+
+  return {
+    calculated: true,
+    finalPrice: formatRoutingPriceText(String(finalPriceValue)),
+    finalPriceValue
+  };
+}
+
+function formatRoutingDiscountLabel(value = '', fallback = 'Coupon') {
+  const text = cleanText(value);
+  if (!text) {
+    return fallback;
+  }
+
+  const numeric = parsePublishingPriceValue(text);
+  if (numeric === null) {
+    return text;
+  }
+
+  if (/%/.test(text)) {
+    return `${Math.round(numeric * 10) / 10}%`;
+  }
+
+  if (/\u20AC|eur/i.test(text)) {
+    return formatRoutingPriceText(text);
+  }
+
+  return text;
+}
+
+function buildRoutingPriceCalculation({
+  couponDetected = false,
+  subscribeDetected = false,
+  basePrice = '',
+  couponValue = '',
+  subscribeDiscount = '',
+  finalPrice = ''
+} = {}) {
+  if (couponDetected) {
+    const basePriceText = formatRoutingPriceText(basePrice);
+    const couponText = formatRoutingDiscountLabel(couponValue, 'unbekannter');
+    const finalPriceText = formatRoutingPriceText(finalPrice);
+
+    if (subscribeDetected) {
+      const subscribeText = formatRoutingDiscountLabel(subscribeDiscount, 'Sparabo');
+      return `${basePriceText} minus ${couponText} Coupon minus ${subscribeText} Sparabo = ${finalPriceText}`;
+    }
+
+    return `${basePriceText} minus ${couponText} Coupon = ${finalPriceText}`;
+  }
+
+  return 'keine Coupon-Berechnung';
+}
+
+function resolveRoutingPriceType({
+  couponDetected = false,
+  subscribeDetected = false,
+  finalPriceCalculated = false
+} = {}) {
+  if (couponDetected && subscribeDetected) {
+    return 'Coupon + Sparabo';
+  }
+
+  if (couponDetected) {
+    return 'Coupon';
+  }
+
+  if (subscribeDetected) {
+    return 'Sparabo';
+  }
+
+  if (finalPriceCalculated) {
+    return 'Rabatt';
+  }
+
+  return 'Standard';
+}
+
+function resolveRoutingPriceInfo(input = {}, generatorContext = {}, sourceLabel = '') {
+  const source = resolveRoutingPriceSourceLabel(input, generatorContext);
+  const couponValue = cleanText(input.couponValue);
+  const couponLabelValue = couponValue || cleanText(input.couponCode);
+  const subscribeDiscount = cleanText(input.subscribeDiscount);
+  const couponDetected = input.couponDetected === true || Boolean(couponValue);
+  const subscribeDetected = input.subscribeDetected === true || Boolean(subscribeDiscount);
+  const explicitFinalPrice = cleanText(input.finalPrice);
+  const hasExplicitFinalPrice = input.finalPriceCalculated === true && Boolean(explicitFinalPrice);
+  const basePrice = cleanText(input.basePrice || input.currentPrice || generatorContext?.keepa?.currentPrice);
+  const calculatedFinalPrice =
+    hasExplicitFinalPrice || couponDetected || subscribeDetected
+      ? calculateRoutingFinalPrice(basePrice, couponValue, subscribeDiscount)
+      : { calculated: false, finalPrice: '', finalPriceValue: null };
+  const finalPriceCalculated = hasExplicitFinalPrice || calculatedFinalPrice.calculated === true;
+  const displayPrice = hasExplicitFinalPrice
+    ? explicitFinalPrice
+    : calculatedFinalPrice.finalPrice || basePrice || generatorContext?.keepa?.currentPrice;
+  const priceType = resolveRoutingPriceType({
+    couponDetected,
+    subscribeDetected,
+    finalPriceCalculated
+  });
+  const visibleSource = couponDetected ? 'Amazon + Coupon' : source.label;
+  const visiblePrice = formatRoutingPriceText(displayPrice);
+  const calculation = buildRoutingPriceCalculation({
+    couponDetected,
+    subscribeDetected,
+    basePrice,
+    couponValue: couponLabelValue,
+    subscribeDiscount,
+    finalPrice: visiblePrice
+  });
+
+  if (source.logTag) {
+    console.info(source.logTag, {
+      asin: cleanText(input.asin).toUpperCase() || '',
+      rawSource: source.rawSource,
+      price: visiblePrice,
+      priceType
+    });
+  }
+
+  if (finalPriceCalculated) {
+    console.info('[PRICE_FINAL_CALCULATED]', {
+      asin: cleanText(input.asin).toUpperCase() || '',
+      basePrice: formatRoutingPriceText(basePrice),
+      couponDetected,
+      couponValue: couponLabelValue,
+      subscribeDetected,
+      subscribeDiscount,
+      finalPrice: visiblePrice,
+      priceType,
+      providedBySource: hasExplicitFinalPrice
+    });
+  }
+
+  console.info('[PRICE_SOURCE_VISIBLE]', {
+    asin: cleanText(input.asin).toUpperCase() || '',
+    context: 'routing_shortcheck',
+    sourceGroup: sourceLabel || resolveRoutingSourceLabel(input),
+    price: visiblePrice,
+    priceSource: visibleSource,
+    calculation
+  });
+
+  if (couponDetected) {
+    console.info('[PRICE_COUPON_CALCULATION_VISIBLE]', {
+      asin: cleanText(input.asin).toUpperCase() || '',
+      context: 'routing_shortcheck',
+      basePrice: formatRoutingPriceText(basePrice),
+      couponValue: couponLabelValue,
+      subscribeDiscount,
+      finalPrice: visiblePrice,
+      calculation
+    });
+  }
+
+  return {
+    price: visiblePrice,
+    source: visibleSource,
+    type: priceType,
+    calculation
+  };
+}
+
+function buildRejectedRoutingSolution(reason = '') {
+  const normalized = cleanText(reason).toLowerCase();
+
+  if (normalized.includes('affiliate') || normalized.includes('partnerlink')) {
+    return 'Amazon-Link oder PAAPI-Daten pruefen.';
+  }
+  if (normalized.includes('amazon-link') || normalized.includes('amazon link')) {
+    return 'Amazon-Link validieren.';
+  }
+  if (normalized.includes('preis')) {
+    return 'Preis mit Amazon und Keepa abgleichen.';
+  }
+  if (normalized.includes('produktregel') || normalized.includes('powerbank') || normalized.includes('kopfho')) {
+    return 'Produktregel und Preislimit pruefen.';
+  }
+  if (normalized.includes('review') || normalized.includes('unknown')) {
+    return 'Produktdaten manuell verifizieren.';
+  }
+
+  return 'Kurze manuelle Pruefung noetig.';
+}
+
+function resolveRoutingSourceLabel(input = {}) {
+  return (
+    cleanText(input.channelRef) ||
+    cleanText(input.channelTitle) ||
+    cleanText(input.group) ||
+    cleanText(input.sourceName) ||
+    cleanText(input.contextSource) ||
+    cleanText(input.queueSourceType) ||
+    'Unbekannt'
+  );
+}
+
+function getGeneratorPostTextFromPayload(payload = {}) {
+  return cleanText(payload.textByChannel?.telegram || payload.textByChannel?.whatsapp || payload.title);
+}
+
+function resolveGeneratorPostImagePayload(payload = {}, preferredSource = 'standard') {
+  const imageVariants = payload.imageVariants && typeof payload.imageVariants === 'object' ? payload.imageVariants : {};
+  const preferred = cleanText(preferredSource);
+  const uploadImage = cleanText(imageVariants.upload);
+  const standardImage = cleanText(imageVariants.standard);
+
+  if (preferred === 'upload' && uploadImage) {
+    return { uploadedImage: uploadImage, imageUrl: '', imageSource: 'upload' };
+  }
+
+  if (preferred === 'standard' && standardImage) {
+    return standardImage.startsWith('data:image')
+      ? { uploadedImage: standardImage, imageUrl: '', imageSource: 'standard_upload' }
+      : { uploadedImage: '', imageUrl: standardImage, imageSource: 'standard' };
+  }
+
+  if (uploadImage) {
+    return { uploadedImage: uploadImage, imageUrl: '', imageSource: 'upload' };
+  }
+
+  if (standardImage) {
+    return standardImage.startsWith('data:image')
+      ? { uploadedImage: standardImage, imageUrl: '', imageSource: 'standard_upload' }
+      : { uploadedImage: '', imageUrl: standardImage, imageSource: 'standard' };
+  }
+
+  return { uploadedImage: '', imageUrl: '', imageSource: 'none' };
+}
+
+function buildRejectedShortcheck({
+  input = {},
+  generatorContext = {},
+  decisionLabel = 'REVIEW',
+  reason = ''
+} = {}) {
+  const metrics = generatorContext?.evaluation?.metrics || {};
+  const learning = generatorContext?.learning || {};
+  const seller = generatorContext?.seller || {};
+  const sellerClass = cleanText(input.sellerClass || seller.sellerClass || seller.sellerType) || 'UNKNOWN';
+  const sellerSource =
+    cleanText(input.sellerDetectionSource || seller.details?.detectionSource || seller.detectionSource || learning.sellerDetectionSource) ||
+    'unknown';
+  const routingLabel =
+    decisionLabel === 'BLOCK' || decisionLabel === 'REJECT'
+      ? 'BLOCK'
+      : decisionLabel === 'APPROVE'
+        ? 'APPROVE'
+        : 'REVIEW';
+  const fbmProtection = isFbmFinalRoutingSeller(input, generatorContext) ? 'AKTIV' : 'nicht noetig';
+  const sourceLabel = resolveRoutingSourceLabel(input);
+  const displayDecision = decisionLabel === 'BLOCK' || decisionLabel === 'REJECT' ? 'ABGELEHNT' : 'PR\u00DCFEN';
+  const keepaDiscount = metrics.keepaDiscount ?? generatorContext?.keepa?.keepaDiscount ?? null;
+  const score = metrics.finalScore ?? metrics.keepaDealScore ?? null;
+  const fakeRisk = metrics.fakeDropRisk ?? null;
+  const marketStatus = cleanText(learning.marketComparisonStatus || generatorContext?.internet?.status) || 'skipped';
+  const shortReason = shortenRoutingText(reason || learning.reason || 'Keine Begruendung vorhanden.', 150);
+  const solution = buildRejectedRoutingSolution(reason || learning.reason);
+  const priceInfo = resolveRoutingPriceInfo(input, generatorContext, sourceLabel);
+
+  return [
+    '\u{1F4CA} KURZCHECK',
+    `\u{1F4E2} Quellgruppe: ${sourceLabel}`,
+    `\u{1F4CC} Entscheidung: ${displayDecision}`,
+    `\u{1F6D2} Seller: ${sellerClass}`,
+    `\u{1F50E} Seller Quelle: ${sellerSource}`,
+    `\u{1F4CC} Routing: ${routingLabel}`,
+    `\u{1F6E1} FBM Schutz: ${fbmProtection}`,
+    `\u{1F4B6} Preis: ${priceInfo.price}`,
+    `\u{1F50E} Preisquelle: ${priceInfo.source}`,
+    `\u{1F4CC} Preis-Typ: ${priceInfo.type}`,
+    `\u{1F4CC} Berechnung: ${priceInfo.calculation}`,
+    `\u{1F4C8} Keepa: ${formatRoutingPercent(keepaDiscount)} / Score ${formatRoutingValue(score)}`,
+    `\u{1F30D} Marktvergleich: ${marketStatus}`,
+    `\u26A0\uFE0F Fake-Risiko: ${formatRoutingPercent(fakeRisk)}`,
+    `\u{1F4CC} Grund: ${shortReason}`,
+    `\u{1F6E0} L\u00F6sung: ${solution}`
+  ].join('\n');
+}
+
+function buildRejectedCombinedPost({ generatorPostText = '', shortcheckText = '' } = {}) {
+  const safeGeneratorPost = cleanText(generatorPostText);
+  const safeShortcheck = cleanText(shortcheckText);
+
+  if (!safeGeneratorPost) {
+    return ['\u26A0\uFE0F NICHT VER\u00D6FFENTLICHT', safeShortcheck].filter(Boolean).join('\n\n');
+  }
+
+  return ['\u26A0\uFE0F NICHT VER\u00D6FFENTLICHT', safeGeneratorPost, '\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501', safeShortcheck]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function buildRejectedRoutingMessage({ sourceLabel = '', reason = '' } = {}) {
+  const shortReason = shortenRoutingText(reason || 'Keine Begruendung vorhanden.', 110);
+  const solution = buildRejectedRoutingSolution(reason);
+
+  return [
+    '\u26A0\uFE0F NICHT VER\u00D6FFENTLICHT',
+    `\u{1F4E2} Quelle: ${sourceLabel || 'System'}`,
+    `\u{1F4CC} Grund: ${shortReason}`,
+    `\u{1F6E0} L\u00F6sung: ${solution}`
+  ].join('\n');
+}
+
+async function publishSecondaryTelegramRoute({
+  routeKey = '',
+  targetChatId = '',
+  queueSourceType = '',
+  generatorPostId = null,
+  payload = {},
+  imageSource = 'none'
+} = {}) {
+  const queueEntry = createPublishingEntry({
+    sourceType: queueSourceType,
+    sourceId: generatorPostId,
+    originOverride: 'automatic',
+    skipDealLock: true,
+    payload: {
+      ...payload,
+      skipDealLock: true,
+      skipPostedDealHistory: true
+    },
+    targets: [{ channelType: 'telegram', isEnabled: true, imageSource }]
+  });
+
+  const queueProcessingResult = await processPublishingQueueEntry(queueEntry.id);
+  const summary = summarizeQueueResults(
+    queueProcessingResult,
+    {
+      telegramImageSource: imageSource
+    },
+    generatorPostId
+  );
+
+  return {
+    routeKey,
+    queueId: summary.queue?.id || queueEntry?.id || null,
+    queueStatus: summary.queue?.status || queueEntry?.status || 'pending',
+    messageId: summary.results.telegram?.messageId || null,
+    chatId: summary.results.telegram?.chatId || targetChatId || null
+  };
+}
+
+async function publishTelegramRoutingOutputs({
+  input = {},
+  generatorContext = {},
+  publishingPayload = {},
+  generatorPostId = null
+} = {}) {
+  const routingConfig = await getTelegramRoutingConfig();
+  const finalRoutingState = buildFinalRoutingInputState(input, generatorContext);
+  const routingInput = finalRoutingState.input;
+  const routingGeneratorContext = finalRoutingState.generatorContext;
+  const routingDecision = resolveTelegramRoutingDecision(routingInput, routingGeneratorContext);
+  const routingReason = resolveTelegramRoutingReason(routingInput, routingGeneratorContext);
+  const baseImageSource = cleanText(routingInput.telegramImageSource) || 'standard';
+  const generatorPostText = getGeneratorPostTextFromPayload(publishingPayload);
+  const generatorImagePayload = resolveGeneratorPostImagePayload(publishingPayload, baseImageSource);
+  const hasGeneratorPost = Boolean(
+    generatorPostText || generatorImagePayload.uploadedImage || generatorImagePayload.imageUrl
+  );
+  const results = {
+    decision: routingDecision.label,
+    reason: routingReason,
+    approved: {
+      enabled: routingConfig.approved.enabled,
+      chatId: routingConfig.approved.chatId || null,
+      status: 'skipped'
+    },
+    rejected: {
+      enabled: routingConfig.rejected.enabled,
+      chatId: routingConfig.rejected.chatId || null,
+      status: 'skipped'
+    }
+  };
+
+  console.info('[FINAL_ROUTING_INPUT]', buildFinalRoutingInputLog(finalRoutingState, routingDecision));
+  console.info('[TELEGRAM_ROUTING_DECISION]', {
+    generatorPostId,
+    queueSourceType: cleanText(routingInput.queueSourceType) || 'generator_direct',
+    bucket: routingDecision.bucket,
+    label: routingDecision.label,
+    approvedEnabled: routingConfig.approved.enabled,
+    rejectedEnabled: routingConfig.rejected.enabled
+  });
+  if (routingDecision.bucket === 'approved' && routingConfig.approved.enabled) {
+    try {
+      if (hasGeneratorPost) {
+        console.info('[ROUTING_USE_GENERATOR_POST]', {
+          routeKey: 'approved',
+          generatorPostId,
+          hasText: Boolean(generatorPostText),
+          imageSource: generatorImagePayload.imageSource
+        });
+      }
+      const approvedPayload = {
+        ...publishingPayload,
+        telegramChatIds: [routingConfig.approved.chatId],
+        debugInfoByChannel: {
+          ...(publishingPayload.debugInfoByChannel || {}),
+          telegram: ''
+        },
+        testMode: false,
+        meta: {
+          ...(publishingPayload.meta || {}),
+          telegramRoutingChannel: 'approved',
+          telegramRoutingDecision: routingDecision.label
+        }
+      };
+      console.info('[APPROVED_CHANNEL_SEND]', {
+        generatorPostId,
+        decision: routingDecision.label,
+        debugSuppressed: true
+      });
+      console.info('[APPROVED_CHANNEL_MAIN_ONLY]', {
+        generatorPostId,
+        decision: routingDecision.label,
+        debugSuppressed: true,
+        extraAnalysisMessage: false
+      });
+      const approvedResult = await publishSecondaryTelegramRoute({
+        routeKey: 'approved',
+        targetChatId: routingConfig.approved.chatId,
+        queueSourceType: `${cleanText(routingInput.queueSourceType) || 'generator_direct'}_approved_route`,
+        generatorPostId,
+        payload: approvedPayload,
+        imageSource: baseImageSource
+      });
+      results.approved = {
+        ...results.approved,
+        status: normalizePublishingQueueStatus(approvedResult.queueStatus, approvedResult.queueStatus || 'sent'),
+        queueId: approvedResult.queueId,
+        messageId: approvedResult.messageId
+      };
+      console.info('[TELEGRAM_ROUTING_CHANNEL_SENT]', {
+        routeKey: 'approved',
+        generatorPostId,
+        queueId: approvedResult.queueId,
+        chatId: routingConfig.approved.chatId
+      });
+    } catch (error) {
+      results.approved = {
+        ...results.approved,
+        status: 'failed',
+        error: error instanceof Error ? error.message : 'Approved-Route fehlgeschlagen.'
+      };
+      console.error('[TELEGRAM_ROUTING_CHANNEL_FAILED]', {
+        routeKey: 'approved',
+        generatorPostId,
+        error: results.approved.error
+      });
+    }
+  } else {
+    const reason = buildRoutingSkipReason(routingConfig.approved, 'decision_not_approved');
+    if (finalRoutingState.hardBlockedFbm === true || isFbmFinalRoutingSeller(routingInput, routingGeneratorContext)) {
+      console.info('[APPROVED_CHANNEL_SKIP_FBM]', {
+        generatorPostId,
+        decision: routingDecision.label,
+        sellerClass: finalRoutingState.sellerClass || resolveFinalRoutingSellerClass(routingInput, routingGeneratorContext),
+        sellerType: resolveFinalRoutingSellerType(routingInput, routingGeneratorContext),
+        reason: 'fbm_hard_block'
+      });
+    }
+    console.info('[APPROVED_CHANNEL_SKIP]', {
+      generatorPostId,
+      decision: routingDecision.label,
+      reason
+    });
+  }
+
+  if (routingDecision.bucket === 'rejected' && routingConfig.rejected.enabled) {
+    try {
+      const shortcheckText = buildRejectedShortcheck({
+        input: routingInput,
+        generatorContext: routingGeneratorContext,
+        decisionLabel: routingDecision.label,
+        reason: routingReason
+      });
+      const rejectedText = buildRejectedCombinedPost({
+        generatorPostText,
+        shortcheckText
+      });
+      if (hasGeneratorPost) {
+        console.info('[ROUTING_USE_GENERATOR_POST]', {
+          routeKey: 'rejected',
+          generatorPostId,
+          hasText: Boolean(generatorPostText),
+          imageSource: generatorImagePayload.imageSource
+        });
+        console.info('[REJECTED_CHANNEL_WITH_MAIN_POST]', {
+          generatorPostId,
+          decision: routingDecision.label,
+          imageSource: generatorImagePayload.imageSource
+        });
+        console.info('[DEBUG_MERGED_INTO_CAPTION]', {
+          generatorPostId,
+          decision: routingDecision.label,
+          shortcheckLength: shortcheckText.length
+        });
+      }
+      console.info('[REJECTED_OLD_TEMPLATE_DISABLED]', {
+        generatorPostId,
+        textOnlyTemplate: false,
+        combinedCaption: hasGeneratorPost
+      });
+      console.info('[REJECTED_CHANNEL_SEND]', {
+        generatorPostId,
+        decision: routingDecision.label,
+        reasonPreview: shortenRoutingText(routingReason, 96)
+      });
+      const rejectedResult = await sendTelegramPost({
+        text: rejectedText,
+        uploadedImage: hasGeneratorPost ? generatorImagePayload.uploadedImage : '',
+        imageUrl: hasGeneratorPost ? generatorImagePayload.imageUrl : '',
+        disableWebPagePreview: !hasGeneratorPost,
+        chatId: routingConfig.rejected.chatId,
+        titlePreview: cleanText(routingInput.title) || 'NICHT VER\u00D6FFENTLICHT',
+        hasAffiliateLink: hasGeneratorPost && Boolean(cleanText(publishingPayload.link)),
+        postContext: 'deal_routing_rejected_combined'
+      });
+      results.rejected = {
+        ...results.rejected,
+        status: 'sent',
+        messageId: rejectedResult.messageId
+      };
+      console.info('[TELEGRAM_ROUTING_CHANNEL_SENT]', {
+        routeKey: 'rejected',
+        generatorPostId,
+        chatId: routingConfig.rejected.chatId
+      });
+    } catch (error) {
+      results.rejected = {
+        ...results.rejected,
+        status: 'failed',
+        error: error instanceof Error ? error.message : 'Rejected-Route fehlgeschlagen.'
+      };
+      console.error('[TELEGRAM_ROUTING_CHANNEL_FAILED]', {
+        routeKey: 'rejected',
+        generatorPostId,
+        error: results.rejected.error
+      });
+    }
+  } else {
+    const reason = buildRoutingSkipReason(routingConfig.rejected, 'decision_not_rejected_or_review');
+    console.info('[REJECTED_CHANNEL_SKIP]', {
+      generatorPostId,
+      decision: routingDecision.label,
+      reason
+    });
+  }
+
+  return results;
 }
 
 function buildDirectPublishingPayload(input = {}, generatorPostId, generatorContext) {
@@ -633,13 +1752,21 @@ export async function publishGeneratorPostDirect(input = {}) {
     });
   }
 
+  const routingOutputs = await publishTelegramRoutingOutputs({
+    input,
+    generatorContext,
+    publishingPayload: finalizedPublishingPayload,
+    generatorPostId
+  });
+
   return {
     success: true,
     postedAt: summary.postedAt || null,
     queue: summary.queue || queueEntry,
     results: summary.results,
     deliveries: summary.deliveries,
-    generatorContext
+    generatorContext,
+    routingOutputs
   };
 }
 
