@@ -4193,6 +4193,29 @@ function resolveSimilarVariantLabel(variant = {}) {
   return cleanText(variant.variationLabel) || attributeLabel || shortenSimilarText(variant.title, 70) || cleanText(variant.asin).toUpperCase();
 }
 
+function extractSimilarVariantDebugDetails(variant = {}) {
+  const attributes = Array.isArray(variant.variationAttributes) ? variant.variationAttributes : [];
+  const resolveAttributeValue = (patterns = []) => {
+    for (const attribute of attributes) {
+      const name = cleanText(attribute?.name || attribute?.Name || attribute?.displayName || attribute?.DisplayName).toLowerCase();
+      const value = cleanText(attribute?.value || attribute?.Value || attribute?.displayValue || attribute?.DisplayValue);
+      if (!name || !value) {
+        continue;
+      }
+      if (patterns.some((pattern) => pattern.test(name))) {
+        return value;
+      }
+    }
+    return '';
+  };
+
+  return {
+    color: resolveAttributeValue([/color/, /farbe/, /colour/]) || '',
+    size: resolveAttributeValue([/size/, /groesse/, /größe/, /dimension/]) || '',
+    model: resolveAttributeValue([/model/, /modell/, /style/, /ausfuehrung/, /ausführung/]) || ''
+  };
+}
+
 function applyVariantToSimilarResult(result = {}, variantPayload = {}) {
   const variant = variantPayload.variant || {};
   const variantPrice = normalizeSimilarPositivePrice(variantPayload.variantPrice);
@@ -4291,29 +4314,38 @@ async function findCheapestAllowedVariation({
   testMode = false,
   sessionName = '',
   sourceId = null,
-  messageId = ''
+  messageId = '',
+  variationLoader = loadAmazonAffiliateVariations
 } = {}) {
   if ((process.env.SIMILAR_VARIANT_CHECK_ENABLED || '0') !== '1') {
     return null;
   }
 
   const candidateAsin = cleanText(finalCandidate.asin || currentResult.optimizedAsin || currentResult.similarCheaperAsin).toUpperCase();
-  const currentPrice = normalizeSimilarPositivePrice(currentResult.optimizedPriceValue || finalCandidate.priceValue);
+  const currentPrice = normalizeSimilarPositivePrice(
+    currentResult.optimizedPriceValue ||
+      finalCandidate.priceValue ||
+      resolveSimilarCandidatePrice(finalCandidate) ||
+      currentResult.similarCheaperPriceValue ||
+      currentResult.similarCheaperPrice
+  );
+  const variantLimit = Math.max(1, Math.min(10, Number.parseInt(process.env.SIMILAR_VARIANT_LIMIT || '10', 10) || 10));
   if (!candidateAsin || currentPrice === null) {
     return null;
   }
 
-  console.info('[VARIANT_SCAN_START]', {
+  console.info('[VARIANT_CHECK_START]', {
     sessionName,
     sourceId,
     messageId,
     asin: candidateAsin,
-    currentPrice: formatPrice(currentPrice)
+    currentPrice: formatPrice(currentPrice),
+    limit: variantLimit
   });
 
-  const variationResult = await loadAmazonAffiliateVariations({
+  const variationResult = await variationLoader({
     asin: candidateAsin,
-    limit: Number.parseInt(process.env.SIMILAR_VARIANT_LIMIT || '10', 10) || 10
+    limit: variantLimit
   });
 
   if (variationResult.status === 'throttled') {
@@ -4335,6 +4367,7 @@ async function findCheapestAllowedVariation({
     const variantAsin = cleanText(variant.asin).toUpperCase();
     const variantPrice = resolveSimilarCandidatePrice(variant);
     const variantPriceValid = Number.isFinite(variantPrice) && variantPrice > 0;
+    const variantDebug = extractSimilarVariantDebugDetails(variant);
     const sellerDetection = detectSimilarSellerClass(variant, { testMode });
     const sellerAllowed = isOptimizedVariationSellerAllowed(sellerDetection.sellerClass, testMode);
     const candidateRoleInfo = extractProductRole(variant.title, variant.features || []);
@@ -4381,10 +4414,24 @@ async function findCheapestAllowedVariation({
 
     const allowed = !rejectReason;
     const label = resolveSimilarVariantLabel(variant);
+    console.info('[VARIANT_FOUND]', {
+      asin: variantAsin,
+      label,
+      price: variantPriceValid ? formatPrice(variantPrice) : null,
+      color: variantDebug.color || '',
+      size: variantDebug.size || '',
+      model: variantDebug.model || '',
+      sellerClass: sellerDetection.sellerClass,
+      allowed,
+      rejectReason
+    });
     console.info('[VARIANT_CANDIDATE]', {
       asin: variantAsin,
       label,
       price: variantPriceValid ? formatPrice(variantPrice) : null,
+      color: variantDebug.color || '',
+      size: variantDebug.size || '',
+      model: variantDebug.model || '',
       sellerClass: sellerDetection.sellerClass,
       allowed,
       rejectReason,
@@ -4412,6 +4459,15 @@ async function findCheapestAllowedVariation({
   }
 
   if (bestVariantPayload && bestVariantPayload.variantPrice < currentPrice) {
+    const bestVariantDebug = extractSimilarVariantDebugDetails(bestVariantPayload.variant);
+    console.info('[VARIANT_BEST_SELECTED]', {
+      asin: cleanText(bestVariantPayload.variant.asin).toUpperCase(),
+      label: bestVariantPayload.label,
+      price: formatPrice(bestVariantPayload.variantPrice),
+      color: bestVariantDebug.color || '',
+      size: bestVariantDebug.size || '',
+      model: bestVariantDebug.model || ''
+    });
     console.info('[VARIANT_CHEAPER_FOUND]', {
       oldPrice: formatPrice(currentPrice),
       newPrice: formatPrice(bestVariantPayload.variantPrice),
@@ -16001,6 +16057,7 @@ export const __testablesTelegramUserClient = {
   collectProtectedSourceMatches,
   classifyRelaxedAmazonMatchScore,
   extractSourceProductFacts,
+  findCheapestAllowedVariation,
   resolveProductVerification,
   isOwnAmazonAffiliateLink,
   buildReaderCompactDebugBlockV3,

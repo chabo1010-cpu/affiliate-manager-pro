@@ -157,7 +157,7 @@ await test('sendTelegramDealPost sendet den Hauptdeal als Foto-Caption und Debug
     assert.match(requests[1].url, /\/sendMessage$/);
 
     const photoCaption = requests[0].init.body.get('caption');
-    assert.match(photoCaption, /Bosch Professional Akku-Bohrschrauber 18V-55/);
+    assert.match(photoCaption, /Bosch Professional GSR 18V-55 Akku-Bohrschrauber/);
     assert.match(photoCaption, /29,99€/);
     assert.match(photoCaption, /https:\/\/www\.amazon\.de\/dp\/B012345678\?tag=codeundcoup08-21/);
     assert.match(photoCaption, /Anzeige\/Partnerlink/);
@@ -168,7 +168,7 @@ await test('sendTelegramDealPost sendet den Hauptdeal als Foto-Caption und Debug
     assert.match(debugPayload.text, /TESTPOST/);
     assert.match(debugPayload.text, /DEAL STATUS/);
     assert.match(debugPayload.text, /PRÜFUNGEN/);
-    assert.doesNotMatch(debugPayload.text, /Bosch Professional Akku-Bohrschrauber 18V-55/);
+    assert.doesNotMatch(debugPayload.text, /Bosch Professional GSR 18V-55 Akku-Bohrschrauber/);
     assert.doesNotMatch(debugPayload.text, /29,99€/);
     assert.doesNotMatch(debugPayload.text, /amazon\.de\/dp\/B012345678/);
 
