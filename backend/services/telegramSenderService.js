@@ -1,6 +1,11 @@
 import { getTelegramConfig } from '../env.js';
 import { buildAmazonAffiliateLinkRecord, getTelegramCopyButtonText } from './dealHistoryService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
+import {
+  checkAndReserveTelegramDuplicate,
+  releaseTelegramDuplicateReservation,
+  saveTelegramDuplicateAfterSend
+} from './telegramDuplicateGuardService.js';
 import { buildTelegramTitle } from '../../frontend/src/lib/postGenerator.js';
 import sharp from 'sharp';
 
@@ -30,6 +35,34 @@ const MAIN_POST_SOURCE_PRICE_LINE_PATTERNS = [
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+export function buildTelegramCouponFollowUpText(couponCode = '') {
+  const normalizedCouponCode = cleanText(couponCode);
+  return normalizedCouponCode ? ['CODE:', normalizedCouponCode].join('\n') : '';
+}
+
+export async function sendTelegramCouponFollowUp({
+  couponCode = '',
+  chatId = '',
+  titlePreview = 'Rabattcode',
+  postContext = 'coupon_follow_up'
+} = {}) {
+  const normalizedCouponCode = cleanText(couponCode);
+  const followUpText = buildTelegramCouponFollowUpText(normalizedCouponCode);
+  if (!followUpText) {
+    return null;
+  }
+
+  return await sendTelegramPost({
+    text: followUpText,
+    rabattgutscheinCode: normalizedCouponCode,
+    chatId,
+    disableWebPagePreview: true,
+    titlePreview,
+    hasAffiliateLink: false,
+    postContext
+  });
 }
 
 function escapeTelegramHtml(value = '') {
@@ -1124,7 +1157,8 @@ export async function sendTelegramDealPost({
   imageUrl = '',
   chatId,
   fallbackText = '',
-  rabattgutscheinCode = ''
+  rabattgutscheinCode = '',
+  duplicateContext = null
 } = {}) {
   const resolvedAffiliate = resolveTelegramAffiliateLink({
     affiliateLink,
@@ -1385,6 +1419,33 @@ export async function sendTelegramDealPost({
   }
 
   let mainDeliveryResult;
+  const handleDuplicateBlockedMainDelivery = (deliveryResult) => {
+    if (deliveryResult?.duplicateBlocked !== true) {
+      return null;
+    }
+
+    console.info('[MAIN_POST_DUPLICATE_BLOCKED]', {
+      chatId: deliveryResult.chatId || cleanText(String(chatId || '')) || null,
+      titlePreview: cleanText(title).slice(0, 120) || null,
+      duplicateKey: cleanText(deliveryResult.duplicateKey) || null,
+      lastSentAt: deliveryResult.lastSentAt || null
+    });
+
+    return {
+      ...deliveryResult,
+      extraMessageIds: [],
+      captionInfo: {
+        beforeLength: captionResult.beforeLength,
+        afterLength: captionResult.afterLength,
+        cutAt: captionResult.cutAt,
+        cutContext: captionResult.cutContext,
+        trimmed: captionResult.trimmed,
+        limit: TELEGRAM_SAFE_CAPTION_LIMIT
+      },
+      affiliateLink: resolvedAffiliate.affiliateLink,
+      strippedForeignLink: resolvedAffiliate.strippedForeignLink
+    };
+  };
 
   if (hasImage) {
     console.info('[MAIN_POST_SENDPHOTO_START]', {
@@ -1427,8 +1488,22 @@ export async function sendTelegramDealPost({
         chatId,
         titlePreview: title,
         hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
-        postContext: 'deal_main_photo'
+        postContext: 'deal_main_photo',
+        duplicateContext:
+          duplicateContext && typeof duplicateContext === 'object'
+            ? {
+                ...duplicateContext,
+                title,
+                price,
+                affiliateLink: resolvedAffiliate.affiliateLink || affiliateLink,
+                asin
+              }
+            : null
       });
+      const duplicateBlockedResult = handleDuplicateBlockedMainDelivery(mainDeliveryResult);
+      if (duplicateBlockedResult) {
+        return duplicateBlockedResult;
+      }
       console.info('[TELEGRAM_MAIN_PHOTO_POST_SUCCESS]', {
         chatId: mainDeliveryResult.chatId,
         messageId: mainDeliveryResult.messageId,
@@ -1472,8 +1547,22 @@ export async function sendTelegramDealPost({
         chatId,
         titlePreview: title,
         hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
-        postContext: 'deal_main_text_fallback'
+        postContext: 'deal_main_text_fallback',
+        duplicateContext:
+          duplicateContext && typeof duplicateContext === 'object'
+            ? {
+                ...duplicateContext,
+                title,
+                price,
+                affiliateLink: resolvedAffiliate.affiliateLink || affiliateLink,
+                asin
+              }
+            : null
       });
+      const duplicateBlockedResult = handleDuplicateBlockedMainDelivery(mainDeliveryResult);
+      if (duplicateBlockedResult) {
+        return duplicateBlockedResult;
+      }
       console.info('[PHOTO_SEND_FAILED_TEXT_FALLBACK_SENT]', {
         chatId: mainDeliveryResult.chatId,
         messageId: mainDeliveryResult.messageId,
@@ -1497,8 +1586,22 @@ export async function sendTelegramDealPost({
       chatId,
       titlePreview: title,
       hasAffiliateLink: Boolean(resolvedAffiliate.affiliateLink),
-      postContext: 'deal_main_text_only'
+      postContext: 'deal_main_text_only',
+      duplicateContext:
+        duplicateContext && typeof duplicateContext === 'object'
+          ? {
+              ...duplicateContext,
+              title,
+              price,
+              affiliateLink: resolvedAffiliate.affiliateLink || affiliateLink,
+              asin
+            }
+          : null
     });
+    const duplicateBlockedResult = handleDuplicateBlockedMainDelivery(mainDeliveryResult);
+    if (duplicateBlockedResult) {
+      return duplicateBlockedResult;
+    }
     mainPostSent = true;
   }
 
@@ -1620,7 +1723,8 @@ export async function sendTelegramPost({
   chatId,
   titlePreview = '',
   hasAffiliateLink = false,
-  postContext = 'generic'
+  postContext = 'generic',
+  duplicateContext = null
 }) {
   const { token, chatId: envChatId } = getTelegramConfig();
   const finalChatId = (chatId || envChatId || '').toString().trim();
@@ -1778,7 +1882,55 @@ export async function sendTelegramPost({
     });
     throw new Error('TELEGRAM_CHAT_ID fehlt im Backend');
   }
-  if (parsedUploadedImage || effectiveImageUrl) {
+
+  const duplicateCheck =
+    duplicateContext && typeof duplicateContext === 'object'
+      ? checkAndReserveTelegramDuplicate({
+          ...duplicateContext,
+          chatId: finalChatId,
+          titlePreview: cleanText(duplicateContext.titlePreview || titlePreview),
+          postContext
+        })
+      : null;
+  let duplicateSaved = false;
+  const persistSuccessfulDuplicateSend = (deliveryResult = null) => {
+    if (!duplicateCheck?.reservationTaken || duplicateSaved !== false) {
+      return deliveryResult;
+    }
+
+    saveTelegramDuplicateAfterSend({
+      descriptor: duplicateCheck.descriptor,
+      messageId: deliveryResult?.messageId || null,
+      postContext
+    });
+    duplicateSaved = true;
+    return deliveryResult;
+  };
+  const releaseDuplicateReservation = () => {
+    if (!duplicateCheck?.reservationTaken || duplicateSaved === true) {
+      return;
+    }
+
+    releaseTelegramDuplicateReservation(duplicateCheck.descriptor);
+  };
+
+  if (duplicateCheck?.blocked) {
+    return {
+      method: 'duplicate_blocked',
+      messageId: null,
+      chatId: finalChatId,
+      imageUrl: null,
+      extraMessageIds: [],
+      duplicateBlocked: true,
+      duplicateKey: duplicateCheck.descriptor?.duplicateKey || '',
+      lastSentAt: duplicateCheck.lastSentAt || null,
+      duplicateReason: duplicateCheck.reason || 'DUPLICATE_WINDOW_ACTIVE',
+      previousMessageId: duplicateCheck.previousMessageId || null
+    };
+  }
+
+  try {
+    if (parsedUploadedImage || effectiveImageUrl) {
     const photoPostContent = splitTelegramPhotoPostText(trimmedText);
     const captionResult = trimTelegramPhotoCaption(photoPostContent.mainText, TELEGRAM_SAFE_CAPTION_LIMIT);
     const captionText = captionResult.text || photoPostContent.mainText || trimmedText;
@@ -1846,116 +1998,131 @@ export async function sendTelegramPost({
       hasExtraInfo: Boolean(photoPostContent.extraText)
     });
 
-    const extraTextChunks = splitTelegramTextIntoChunks(photoPostContent.extraText, TELEGRAM_MESSAGE_LIMIT);
-    const extraTextResults = [];
+      persistSuccessfulDuplicateSend(photoResult);
+      const extraTextChunks = splitTelegramTextIntoChunks(photoPostContent.extraText, TELEGRAM_MESSAGE_LIMIT);
+      const extraTextResults = [];
 
-    for (const chunk of extraTextChunks) {
-      const textResult = await sendSingleTelegramDelivery({
-        token,
-        finalChatId,
-        text: chunk,
-        parsedUploadedImage: null,
-        effectiveImageUrl: '',
-        resolvedDisableWebPagePreview: true,
-        replyMarkup: undefined,
-        deliveryMeta: {
-          titlePreview,
-          captionLength: cleanText(chunk).length,
-          hasAffiliateLink: false
-        }
-      });
-      extraTextResults.push(textResult);
-    }
-
-    if (extraTextResults.length) {
-      console.info('[DEBUG_INFO_SENT_SEPARATE]', {
-        chatId: finalChatId,
-        parts: extraTextResults.length,
-        messageIds: extraTextResults.map((item) => item.messageId),
-        extraInfoLength: photoPostContent.extraText.length,
-        splitMarker: photoPostContent.splitMarker || null
-      });
-      console.info('[DEBUG_SENT_SEPARATE]', {
-        chatId: finalChatId,
-        parts: extraTextResults.length,
-        messageIds: extraTextResults.map((item) => item.messageId),
-        extraInfoLength: photoPostContent.extraText.length,
-        splitMarker: photoPostContent.splitMarker || null
-      });
-    }
-
-    return {
-      method: photoResult.method,
-      messageId: photoResult.messageId,
-      chatId: photoResult.chatId,
-      imageUrl: photoResult.imageUrl,
-      extraMessageIds: extraTextResults.map((item) => item.messageId),
-      captionInfo: {
-        originalTextLength: trimmedText.length,
-        mainContentLength: photoPostContent.mainText.length,
-        extraInfoLength: photoPostContent.extraText.length,
-        beforeLength: captionResult.beforeLength,
-        afterLength: captionResult.afterLength,
-        cutAt: captionResult.cutAt,
-        cutContext: captionResult.cutContext,
-        trimmed: captionResult.trimmed,
-        limit: TELEGRAM_SAFE_CAPTION_LIMIT,
-        splitMarker: photoPostContent.splitMarker || null
+      for (const chunk of extraTextChunks) {
+        const textResult = await sendSingleTelegramDelivery({
+          token,
+          finalChatId,
+          text: chunk,
+          parsedUploadedImage: null,
+          effectiveImageUrl: '',
+          resolvedDisableWebPagePreview: true,
+          replyMarkup: undefined,
+          deliveryMeta: {
+            titlePreview,
+            captionLength: cleanText(chunk).length,
+            hasAffiliateLink: false
+          }
+        });
+        extraTextResults.push(textResult);
       }
-    };
-  }
 
-  if (!parsedUploadedImage && !effectiveImageUrl && trimmedText.length > TELEGRAM_MESSAGE_LIMIT) {
-    const textChunks = splitTelegramTextIntoChunks(trimmedText, TELEGRAM_MESSAGE_LIMIT);
-    const textResults = [];
+      if (extraTextResults.length) {
+        console.info('[DEBUG_INFO_SENT_SEPARATE]', {
+          chatId: finalChatId,
+          parts: extraTextResults.length,
+          messageIds: extraTextResults.map((item) => item.messageId),
+          extraInfoLength: photoPostContent.extraText.length,
+          splitMarker: photoPostContent.splitMarker || null
+        });
+        console.info('[DEBUG_SENT_SEPARATE]', {
+          chatId: finalChatId,
+          parts: extraTextResults.length,
+          messageIds: extraTextResults.map((item) => item.messageId),
+          extraInfoLength: photoPostContent.extraText.length,
+          splitMarker: photoPostContent.splitMarker || null
+        });
+      }
 
-    for (let index = 0; index < textChunks.length; index += 1) {
-      const textResult = await sendSingleTelegramDelivery({
-        token,
-        finalChatId,
-        text: textChunks[index],
-        parsedUploadedImage: null,
-        effectiveImageUrl: '',
-        resolvedDisableWebPagePreview: true,
-        replyMarkup: index === 0 ? replyMarkup : undefined,
-        deliveryMeta: {
-          titlePreview,
-          captionLength: cleanText(textChunks[index]).length,
-          hasAffiliateLink
+      return {
+        method: photoResult.method,
+        messageId: photoResult.messageId,
+        chatId: photoResult.chatId,
+        imageUrl: photoResult.imageUrl,
+        extraMessageIds: extraTextResults.map((item) => item.messageId),
+        duplicateKey: duplicateCheck?.descriptor?.duplicateKey || '',
+        captionInfo: {
+          originalTextLength: trimmedText.length,
+          mainContentLength: photoPostContent.mainText.length,
+          extraInfoLength: photoPostContent.extraText.length,
+          beforeLength: captionResult.beforeLength,
+          afterLength: captionResult.afterLength,
+          cutAt: captionResult.cutAt,
+          cutContext: captionResult.cutContext,
+          trimmed: captionResult.trimmed,
+          limit: TELEGRAM_SAFE_CAPTION_LIMIT,
+          splitMarker: photoPostContent.splitMarker || null
         }
+      };
+    }
+
+    if (!parsedUploadedImage && !effectiveImageUrl && trimmedText.length > TELEGRAM_MESSAGE_LIMIT) {
+      const textChunks = splitTelegramTextIntoChunks(trimmedText, TELEGRAM_MESSAGE_LIMIT);
+      const textResults = [];
+
+      for (let index = 0; index < textChunks.length; index += 1) {
+        const textResult = await sendSingleTelegramDelivery({
+          token,
+          finalChatId,
+          text: textChunks[index],
+          parsedUploadedImage: null,
+          effectiveImageUrl: '',
+          resolvedDisableWebPagePreview: true,
+          replyMarkup: index === 0 ? replyMarkup : undefined,
+          deliveryMeta: {
+            titlePreview,
+            captionLength: cleanText(textChunks[index]).length,
+            hasAffiliateLink
+          }
+        });
+        if (index === 0) {
+          persistSuccessfulDuplicateSend(textResult);
+        }
+        textResults.push(textResult);
+      }
+
+      console.info('[TEXT_SPLIT_SENT]', {
+        chatId: finalChatId,
+        parts: textResults.length,
+        messageIds: textResults.map((item) => item.messageId)
       });
-      textResults.push(textResult);
+
+      return {
+        method: 'sendMessage',
+        messageId: textResults[0]?.messageId || null,
+        chatId: textResults[0]?.chatId || finalChatId,
+        imageUrl: null,
+        extraMessageIds: textResults.slice(1).map((item) => item.messageId),
+        duplicateKey: duplicateCheck?.descriptor?.duplicateKey || ''
+      };
     }
 
-    console.info('[TEXT_SPLIT_SENT]', {
-      chatId: finalChatId,
-      parts: textResults.length,
-      messageIds: textResults.map((item) => item.messageId)
+    const singleResult = await sendSingleTelegramDelivery({
+      token,
+      finalChatId,
+      text: trimmedText,
+      parsedUploadedImage,
+      effectiveImageUrl,
+      resolvedDisableWebPagePreview,
+      replyMarkup,
+      deliveryMeta: {
+        titlePreview,
+        captionLength: trimmedText.length,
+        hasAffiliateLink
+      }
     });
-
+    persistSuccessfulDuplicateSend(singleResult);
     return {
-      method: 'sendMessage',
-      messageId: textResults[0]?.messageId || null,
-      chatId: textResults[0]?.chatId || finalChatId,
-      imageUrl: null,
-      extraMessageIds: textResults.slice(1).map((item) => item.messageId)
+      ...singleResult,
+      duplicateKey: duplicateCheck?.descriptor?.duplicateKey || ''
     };
+  } catch (error) {
+    releaseDuplicateReservation();
+    throw error;
   }
-
-  return await sendSingleTelegramDelivery({
-    token,
-    finalChatId,
-    text: trimmedText,
-    parsedUploadedImage,
-    effectiveImageUrl,
-    resolvedDisableWebPagePreview,
-    replyMarkup,
-    deliveryMeta: {
-      titlePreview,
-      captionLength: trimmedText.length,
-      hasAffiliateLink
-    }
-  });
 }
 
 export const __testablesTelegramSender = {

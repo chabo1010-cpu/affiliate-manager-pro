@@ -16,6 +16,7 @@ import { processTelegramPublishingTarget } from './telegramWorkerService.js';
 import { processWhatsappPublishingTarget } from './whatsappWorkerService.js';
 import { getWhatsappClientConfig, getWhatsappClientRetryLimit } from './whatsappClientService.js';
 import { processFacebookPublishingTarget } from './facebookWorkerService.js';
+import { getCopybotRuntimeState, isCopybotControlledSourceType } from './copybotControlService.js';
 
 const db = getDb();
 const PUBLISHER_LOOP_INTERVAL_MS = 15 * 1000;
@@ -465,6 +466,20 @@ export function createGeneratorPublishingEntry(input = {}) {
 }
 
 export function enqueueCopybotPublishing(input = {}) {
+  const copybotState = getCopybotRuntimeState();
+  if (copybotState.enabled !== true) {
+    console.warn('[COPYBOT_SKIP_PIPELINE_DISABLED]', {
+      sourceType: 'copybot',
+      sourceId: input.sourceId ?? null,
+      reason: copybotState.reason,
+      envEnabled: copybotState.envEnabled,
+      settingEnabled: copybotState.settingEnabled
+    });
+    const error = new Error('Copybot ist deaktiviert. Queue-Eintrag wurde nicht erstellt.');
+    error.retryable = false;
+    throw error;
+  }
+
   return createPublishingEntry({
     sourceType: 'copybot',
     sourceId: input.sourceId ?? null,
@@ -483,21 +498,91 @@ export function getPublishingQueueEntry(queueId) {
   return mapPublishingQueueRow(queue, targets);
 }
 
-export function listPublishingQueue() {
-  return db
-    .prepare(`SELECT * FROM publishing_queue ORDER BY created_at DESC`)
-    .all()
-    .map((queue) =>
-      mapPublishingQueueRow(
-        queue,
-        db.prepare(`SELECT * FROM publishing_targets WHERE queue_id = ? ORDER BY id ASC`).all(queue.id)
-      )
-    );
+function buildPublishingQueueQuery({ sourceType = '', limit = null } = {}) {
+  const clauses = [];
+  const params = [];
+
+  if (cleanText(sourceType)) {
+    clauses.push(`source_type = ?`);
+    params.push(cleanText(sourceType));
+  }
+
+  let sql = `SELECT * FROM publishing_queue`;
+  if (clauses.length) {
+    sql += ` WHERE ${clauses.join(' AND ')}`;
+  }
+
+  sql += ` ORDER BY created_at DESC`;
+
+  const normalizedLimit = Number(limit);
+  if (Number.isFinite(normalizedLimit) && normalizedLimit > 0) {
+    sql += ` LIMIT ${Math.max(1, Math.trunc(normalizedLimit))}`;
+  }
+
+  return { sql, params };
 }
 
-export function listPublishingLogs() {
+export function listPublishingQueue(options = {}) {
+  const { sql, params } = buildPublishingQueueQuery(options);
+  const queueRows = db.prepare(sql).all(...params);
+  if (!queueRows.length) {
+    return [];
+  }
+
+  const queueIds = queueRows.map((queue) => Number(queue.id)).filter((id) => Number.isFinite(id) && id > 0);
+  const placeholders = queueIds.map(() => '?').join(', ');
+  const targetRows = placeholders
+    ? db
+        .prepare(`SELECT * FROM publishing_targets WHERE queue_id IN (${placeholders}) ORDER BY queue_id ASC, id ASC`)
+        .all(...queueIds)
+    : [];
+  const targetsByQueueId = new Map();
+
+  for (const row of targetRows) {
+    const queueId = Number(row.queue_id);
+    if (!targetsByQueueId.has(queueId)) {
+      targetsByQueueId.set(queueId, []);
+    }
+    targetsByQueueId.get(queueId).push(row);
+  }
+
+  return queueRows.map((queue) => mapPublishingQueueRow(queue, targetsByQueueId.get(Number(queue.id)) || []));
+}
+
+export function getPublishingQueueCounts({ sourceType = '' } = {}) {
+  const clauses = [];
+  const params = [];
+
+  if (cleanText(sourceType)) {
+    clauses.push(`source_type = ?`);
+    params.push(cleanText(sourceType));
+  }
+
+  let sql = `
+    SELECT
+      COUNT(*) AS total_count,
+      SUM(CASE WHEN status IN ('pending', 'queued', 'retry', 'sending', 'processing') THEN 1 ELSE 0 END) AS open_count
+    FROM publishing_queue
+  `;
+
+  if (clauses.length) {
+    sql += ` WHERE ${clauses.join(' AND ')}`;
+  }
+
+  const row = db.prepare(sql).get(...params) || {};
+
+  return {
+    totalCount: Number(row.total_count || 0),
+    openCount: Number(row.open_count || 0)
+  };
+}
+
+export function listPublishingLogs(options = {}) {
+  const normalizedLimit = Number(options?.limit);
+  const limit = Number.isFinite(normalizedLimit) && normalizedLimit > 0 ? Math.max(1, Math.trunc(normalizedLimit)) : 200;
+
   return db
-    .prepare(`SELECT * FROM publishing_logs ORDER BY created_at DESC LIMIT 200`)
+    .prepare(`SELECT * FROM publishing_logs ORDER BY created_at DESC LIMIT ${limit}`)
     .all()
     .map((row) => ({
       ...row,
@@ -730,6 +815,47 @@ function markTargetSent(target, workerType, workerResult = {}) {
   });
 }
 
+function deferTargetDueToCopybotDisabled(target, reason = 'Copybot deaktiviert.') {
+  const nextRetryAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const timestamp = nowIso();
+
+  runWithSqliteWriteRetry(() => {
+    db.prepare(
+      `
+        UPDATE publishing_targets
+        SET status = ?,
+            error_message = ?,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.retry, reason, timestamp, target.id);
+
+    db.prepare(
+      `
+        UPDATE publishing_queue
+        SET status = ?,
+            next_retry_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.retry, nextRetryAt, timestamp, target.queue_id);
+  });
+
+  safeLogPublishing({
+    queueId: target.queue_id,
+    targetId: target.id,
+    workerType: target.channel_type,
+    level: 'warning',
+    eventType: 'copybot.disabled.defer',
+    message: reason,
+    payload: {
+      nextRetryAt
+    }
+  });
+
+  return nextRetryAt;
+}
+
 function getTargetProcessor(target, processorOverrides = {}) {
   const processors = {
     telegram: processTelegramPublishingTarget,
@@ -754,6 +880,45 @@ async function processTarget(target, processorOverrides = {}) {
       [target.channel_type]: channelPayload.text
     }
   };
+
+  if (isCopybotControlledSourceType(queue?.source_type || '')) {
+    const copybotState = getCopybotRuntimeState();
+    if (copybotState.enabled !== true) {
+      const reason = `Copybot deaktiviert (${copybotState.reason}). Versand pausiert.`;
+      console.warn('[COPYBOT_SKIP_SEND_DISABLED]', {
+        queueId: target.queue_id,
+        targetId: target.id,
+        sourceType: queue?.source_type || '',
+        channelType: target.channel_type,
+        reason: copybotState.reason,
+        envEnabled: copybotState.envEnabled,
+        settingEnabled: copybotState.settingEnabled
+      });
+      const nextRetryAt = deferTargetDueToCopybotDisabled(target, reason);
+      safeSyncDealStatusWithQueue({
+        queueId: target.queue_id,
+        queueStatus: PUBLISHING_QUEUE_STATUS.retry,
+        payload,
+        sourceType: queue?.source_type || '',
+        sourceId: queue?.source_id ?? null,
+        target,
+        message: reason,
+        origin,
+        meta: {
+          nextRetryAt,
+          copybotState
+        }
+      });
+
+      return {
+        targetId: target.id,
+        channelType: target.channel_type,
+        status: PUBLISHING_QUEUE_STATUS.retry,
+        skipped: true,
+        reason
+      };
+    }
+  }
 
   markTargetProcessing(target);
 

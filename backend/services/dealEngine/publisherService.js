@@ -20,7 +20,7 @@ function buildDealEngineMessage(analysis = {}) {
 export function getDealEngineOutputSnapshot(settings) {
   const telegramConfig = getTelegramBotClientConfig();
   const whatsappConfig = getWhatsappClientConfig();
-  const engineQueues = listPublishingQueue().filter((item) => item.source_type === 'deal_engine').slice(0, 8);
+  const engineQueues = listPublishingQueue({ sourceType: 'deal_engine', limit: 8 });
 
   return {
     telegram: {
@@ -121,4 +121,3 @@ export function enqueueApprovedDeal(analysis = {}, settings) {
     reason: 'APPROVED Deal wurde an die bestehende Publishing Queue uebergeben.'
   };
 }
-

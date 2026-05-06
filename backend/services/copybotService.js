@@ -20,6 +20,7 @@ import {
 } from './keepaService.js';
 import { evaluateLearningRoute } from './learningLogicService.js';
 import { enqueueCopybotPublishing } from './publisherService.js';
+import { getCopybotRuntimeState, getCopybotStatusAudit } from './copybotControlService.js';
 
 const db = getDb();
 
@@ -758,14 +759,24 @@ export async function processImportedDeal(sourceId, input = {}) {
     hasImageUrl: Boolean(cleanText(input.imageUrl))
   });
 
-  const appSettings = db.prepare(`SELECT copybotEnabled FROM app_settings WHERE id = 1`).get();
-  if (appSettings?.copybotEnabled !== 1) {
+  const copybotState = getCopybotRuntimeState();
+  if (copybotState.enabled !== true) {
+    console.warn('[COPYBOT_SKIP_PIPELINE_DISABLED]', {
+      sourceId,
+      sourceName: cleanText(source.name),
+      reason: copybotState.reason,
+      envEnabled: copybotState.envEnabled,
+      settingEnabled: copybotState.settingEnabled
+    });
     logEvent({
       level: 'warning',
       eventType: 'copybot.disabled',
       sourceId,
       message: 'Deal verworfen, weil der globale Copybot deaktiviert ist.',
-      payload: input
+      payload: {
+        ...input,
+        copybotState
+      }
     });
 
     return {
@@ -1139,7 +1150,9 @@ export async function processImportedDeal(sourceId, input = {}) {
   };
 }
 
-export function listReviewQueue() {
+export function listReviewQueue(limit = 40) {
+  const normalizedLimit = Math.max(1, Math.min(200, Number(limit) || 40));
+
   return db
     .prepare(
       `
@@ -1152,9 +1165,10 @@ export function listReviewQueue() {
         JOIN sources s ON s.id = d.source_id
         WHERE d.status = 'review'
         ORDER BY d.created_at DESC
+        LIMIT ?
       `
     )
-    .all()
+    .all(normalizedLimit)
     .map((row) => ({
       ...row,
       keepa_result: row.keepa_result_json ? JSON.parse(row.keepa_result_json) : null,
@@ -1247,7 +1261,8 @@ export function updateReviewDecision(id, action) {
 }
 
 export function getCopybotOverview() {
-  const settings = db.prepare(`SELECT copybotEnabled FROM app_settings WHERE id = 1`).get();
+  const copybotState = getCopybotRuntimeState();
+  const statusAudit = getCopybotStatusAudit();
   const stats = db
     .prepare(
       `
@@ -1295,7 +1310,13 @@ export function getCopybotOverview() {
     .all();
 
   return {
-    copybotEnabled: settings?.copybotEnabled === 1,
+    copybotEnabled: copybotState.enabled === true,
+    copybotRuntime: copybotState,
+    statusAudit,
+    processingStatus: {
+      input: copybotState.enabled === true ? 'aktiv' : 'pausiert',
+      queue: copybotState.enabled === true ? 'aktiv' : 'pausiert'
+    },
     activeTelegramSources: Number(stats?.telegram_sources ?? 0),
     activeWhatsappSources: Number(stats?.whatsapp_sources ?? 0),
     pricingRulesCount: Number(stats?.pricing_rules_count ?? 0),
@@ -1307,7 +1328,9 @@ export function getCopybotOverview() {
   };
 }
 
-export function listCopybotLogs() {
+export function listCopybotLogs(limit = 120) {
+  const normalizedLimit = Math.max(1, Math.min(400, Number(limit) || 120));
+
   return db
     .prepare(
       `
@@ -1317,10 +1340,10 @@ export function listCopybotLogs() {
         FROM copybot_logs l
         LEFT JOIN sources s ON s.id = l.source_id
         ORDER BY l.created_at DESC
-        LIMIT 200
+        LIMIT ?
       `
     )
-    .all()
+    .all(normalizedLimit)
     .map((row) => ({
       ...row,
       payload: row.payload_json ? JSON.parse(row.payload_json) : null

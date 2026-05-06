@@ -25,6 +25,10 @@ export async function processTelegramPublishingTarget(target, queuePayload) {
 
   if (queuePayload.skipPostedDealHistory !== true) {
     result.targets.forEach((delivery) => {
+      if (delivery?.duplicateBlocked === true) {
+        return;
+      }
+
       savePostedDeal({
         asin: queuePayload.asin || '',
         originalUrl: queuePayload.link,

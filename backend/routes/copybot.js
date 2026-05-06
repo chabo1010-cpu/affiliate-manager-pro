@@ -16,6 +16,11 @@ import {
   testSource,
   updateReviewDecision
 } from '../services/copybotService.js';
+import {
+  getCopybotRuntimeState,
+  getCopybotStatusAudit,
+  logCopybotStatusChange
+} from '../services/copybotControlService.js';
 
 const router = Router();
 
@@ -113,7 +118,8 @@ router.put('/sampling-rules/:id', requireAdmin, (req, res) => {
 });
 
 router.get('/review-queue', (req, res) => {
-  res.json({ items: listReviewQueue() });
+  const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+  res.json({ items: listReviewQueue(limit) });
 });
 
 router.post('/review-queue/:id/approve', requireAdmin, (req, res) => {
@@ -133,7 +139,8 @@ router.post('/review-queue/:id/reject', requireAdmin, (req, res) => {
 });
 
 router.get('/logs', (req, res) => {
-  res.json({ items: listCopybotLogs() });
+  const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+  res.json({ items: listCopybotLogs(limit) });
 });
 
 router.post('/imports/process/:sourceId', requireAdmin, async (req, res) => {
@@ -146,18 +153,44 @@ router.post('/imports/process/:sourceId', requireAdmin, async (req, res) => {
 
 router.get('/settings', (req, res) => {
   const settings = getRepostSettings();
+  const runtime = getCopybotRuntimeState();
+  const statusAudit = getCopybotStatusAudit();
   res.json({
-    copybotEnabled: settings.copybotEnabled,
+    copybotEnabled: runtime.enabled,
+    copybotSettingEnabled: settings.copybotEnabled,
+    copybotRuntime: runtime,
+    statusAudit,
     telegramCopyButtonText: settings.telegramCopyButtonText
   });
 });
 
 router.put('/settings', requireAdmin, (req, res) => {
+  console.info('[COPYBOT_TOGGLE_REQUEST]', {
+    requesterRole: getRequesterRole(req),
+    requestedEnabled: req.body?.copybotEnabled === true
+  });
   const saved = saveRepostSettings({
     copybotEnabled: req.body?.copybotEnabled
   });
+  const runtime = getCopybotRuntimeState();
+  logCopybotStatusChange({
+    enabled: runtime.enabled === true,
+    actor: getRequesterRole(req) || 'unknown',
+    source: 'copybot_settings_ui',
+    runtime
+  });
+  const statusAudit = getCopybotStatusAudit();
+  console.info(saved.copybotEnabled ? '[COPYBOT_ENABLED]' : '[COPYBOT_DISABLED]', {
+    requesterRole: getRequesterRole(req),
+    copybotEnabled: runtime.enabled,
+    copybotSettingEnabled: saved.copybotEnabled,
+    reason: runtime.reason
+  });
   res.json({
-    copybotEnabled: saved.copybotEnabled,
+    copybotEnabled: runtime.enabled,
+    copybotSettingEnabled: saved.copybotEnabled,
+    copybotRuntime: runtime,
+    statusAudit,
     telegramCopyButtonText: saved.telegramCopyButtonText
   });
 });

@@ -76,6 +76,29 @@ test('Text "Verkaeufer Haendler XY Versand durch Haendler XY" ergibt FBM_THIRDPA
   assert.equal(sellerIdentity.sellerClass, 'FBM_THIRDPARTY');
 });
 
+test('Combined Buybox Text "Versender / Verkaeufer KUIYUE" ergibt FBM_THIRDPARTY', () => {
+  const signals = extractSellerSignalsFromText('Versender / Verkaeufer KUIYUE', {
+    detectionSource: 'buybox'
+  });
+  const sellerIdentity = resolveSellerIdentity({
+    soldByAmazon: signals.soldByAmazon,
+    shippedByAmazon: signals.shippedByAmazon,
+    sellerDetectionSource: signals.detectionSource,
+    detectionSources: [signals.rawDetectionSource],
+    matchedPatterns: signals.matchedPatterns,
+    sellerDetails: {
+      detectionSource: signals.detectionSource,
+      detectionSources: [signals.rawDetectionSource],
+      merchantText: signals.merchantText,
+      matchedPatterns: signals.matchedPatterns
+    }
+  });
+
+  assert.equal(signals.soldByAmazon, false);
+  assert.equal(signals.shippedByAmazon, false);
+  assert.equal(sellerIdentity.sellerClass, 'FBM_THIRDPARTY');
+});
+
 test('Explizites UNKNOWN ueberschreibt bestaetigte Amazon-Flags nicht mehr', () => {
   const sellerIdentity = resolveSellerIdentity({
     sellerClass: 'UNKNOWN',
@@ -124,6 +147,22 @@ test('Tabular Buybox erkennt FBA-Drittanbieter getrennt von Amazon Direct', () =
   assert.equal(sellerInfo.soldByAmazon, false);
   assert.equal(sellerInfo.shippedByAmazon, true);
   assert.equal(sellerInfo.sellerDetails?.detectionSource, 'tabular-buybox');
+});
+
+test('Amazon HTML mit "Versender / Verkaeufer KUIYUE" wird als FBM erkannt', () => {
+  const sellerInfo = extractSellerInfoFromAmazonHtml(`
+    <html>
+      <body>
+        <div id="tabular-buybox">
+          Versender / Verkaeufer KUIYUE
+        </div>
+      </body>
+    </html>
+  `);
+
+  assert.equal(sellerInfo.sellerClass, 'FBM_THIRDPARTY');
+  assert.equal(sellerInfo.soldByAmazon, false);
+  assert.equal(sellerInfo.shippedByAmazon, false);
 });
 
 test('FBM-Haendlerprofil mit 86 Prozent und 12 Monaten wird freigegeben', () => {

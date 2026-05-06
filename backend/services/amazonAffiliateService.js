@@ -505,6 +505,12 @@ function getSimilarVariantLimit(defaultLimit = 10) {
   return Math.max(1, Math.min(10, limit));
 }
 
+function buildAmazonVariationCacheKey(asin = '', source = 'paapi') {
+  const normalizedAsin = cleanText(asin).toUpperCase();
+  const normalizedSource = cleanText(source).toLowerCase() || 'paapi';
+  return normalizedAsin && normalizedSource ? `${normalizedSource}:${normalizedAsin}` : '';
+}
+
 function getSimilarEnrichLimit(defaultLimit = 10) {
   const envLimit = Number.parseInt(process.env.SIMILAR_ENRICH_LIMIT || '', 10);
   const fallback = isAmazonApiTestModeActive() ? 3 : Math.min(defaultLimit, 3);
@@ -550,15 +556,15 @@ function setCachedAmazonOfferData(item = {}) {
   });
 }
 
-function getCachedAmazonVariationData(asin = '') {
-  const normalizedAsin = cleanText(asin).toUpperCase();
-  const cached = amazonVariationDataCache.get(normalizedAsin);
+function getCachedAmazonVariationData(asin = '', options = {}) {
+  const cacheKey = buildAmazonVariationCacheKey(asin, options.source || 'paapi');
+  const cached = amazonVariationDataCache.get(cacheKey);
   if (!cached) {
     return null;
   }
 
   if (Date.now() - Number(cached.cachedAtMs || 0) > getSimilarVariantCacheTtlMs()) {
-    amazonVariationDataCache.delete(normalizedAsin);
+    amazonVariationDataCache.delete(cacheKey);
     return null;
   }
 
@@ -568,17 +574,24 @@ function getCachedAmazonVariationData(asin = '') {
   };
 }
 
-function setCachedAmazonVariationData(asin = '', payload = {}) {
-  const normalizedAsin = cleanText(asin).toUpperCase();
-  if (!normalizedAsin) {
+function setCachedAmazonVariationData(asin = '', payload = {}, options = {}) {
+  const cacheKey = buildAmazonVariationCacheKey(asin, options.source || 'paapi');
+  if (!cacheKey) {
     return;
   }
 
-  amazonVariationDataCache.set(normalizedAsin, {
+  amazonVariationDataCache.set(cacheKey, {
     cachedAtMs: Date.now(),
     cachedAt: nowIso(),
     ...payload
   });
+}
+
+function cacheAmazonVariationFamilyData(asins = [], payload = {}, options = {}) {
+  const familyAsins = normalizeAmazonAsinList(asins);
+  for (const asin of familyAsins) {
+    setCachedAmazonVariationData(asin, payload, options);
+  }
 }
 
 function parseAmazonAffiliatePriceValue(value = null) {
@@ -1050,6 +1063,102 @@ function mapAmazonCreatorItem(item = {}, fallbackAsin = '', config = {}) {
     rawCreatorItem: item,
     rawItem: normalizedItem
   };
+}
+
+function isLikelyCreatorVariantBranchKey(value = '') {
+  return /(variant|variation|child|children|relationship|twister|dimension|style|color|farbe|size|groesse|gr[oö]ße)/i.test(
+    cleanText(value)
+  );
+}
+
+function collectAmazonCreatorVariantAsins(value, asins = new Set(), depth = 0) {
+  if (depth > 6 || value === null || value === undefined) {
+    return asins;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = cleanText(value).toUpperCase();
+    if (/^[A-Z0-9]{10}$/.test(normalized)) {
+      asins.add(normalized);
+    }
+    return asins;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectAmazonCreatorVariantAsins(entry, asins, depth + 1);
+    }
+    return asins;
+  }
+
+  if (typeof value !== 'object') {
+    return asins;
+  }
+
+  const directAsin = firstCleanCreatorText(
+    value?.asin,
+    value?.ASIN,
+    value?.itemId,
+    value?.ItemId,
+    value?.childAsin,
+    value?.ChildAsin,
+    value?.sku,
+    value?.SKU
+  ).toUpperCase();
+  if (/^[A-Z0-9]{10}$/.test(directAsin)) {
+    asins.add(directAsin);
+  }
+
+  for (const [key, entry] of Object.entries(value)) {
+    if (isLikelyCreatorVariantBranchKey(key) || depth < 2) {
+      collectAmazonCreatorVariantAsins(entry, asins, depth + 1);
+    }
+  }
+
+  return asins;
+}
+
+function extractAmazonCreatorVariantAsins(rawItem = {}, fallbackAsin = '') {
+  const normalizedBaseAsin = cleanText(fallbackAsin || rawItem?.asin || rawItem?.ASIN).toUpperCase();
+  const branches = [
+    rawItem?.variations,
+    rawItem?.Variations,
+    rawItem?.variationItems,
+    rawItem?.VariationItems,
+    rawItem?.variationChildren,
+    rawItem?.VariationChildren,
+    rawItem?.children,
+    rawItem?.Children,
+    rawItem?.relationships,
+    rawItem?.Relationships,
+    rawItem?.variationSummary,
+    rawItem?.VariationSummary,
+    rawItem?.twister,
+    rawItem?.Twister,
+    rawItem?.itemInfo?.variations,
+    rawItem?.itemInfo?.variationSummary,
+    rawItem?.ItemInfo?.Variations,
+    rawItem?.ItemInfo?.VariationSummary
+  ].filter((entry) => entry !== undefined && entry !== null);
+
+  if (!branches.length && rawItem && typeof rawItem === 'object') {
+    for (const [key, value] of Object.entries(rawItem)) {
+      if (isLikelyCreatorVariantBranchKey(key)) {
+        branches.push(value);
+      }
+    }
+  }
+
+  const asins = new Set();
+  for (const branch of branches) {
+    collectAmazonCreatorVariantAsins(branch, asins, 0);
+  }
+
+  if (normalizedBaseAsin) {
+    asins.delete(normalizedBaseAsin);
+  }
+
+  return [...asins];
 }
 
 function extractAmazonCreatorItems(responseJson = {}) {
@@ -1873,6 +1982,218 @@ function extractAmazonVariationItems(responseJson = {}) {
   );
 }
 
+export async function loadAmazonCreatorFamilyVariations(input = {}) {
+  const asin = cleanText(input.asin).toUpperCase();
+  const requestedAt = nowIso();
+  const limit = getSimilarVariantLimit(input.limit || 10);
+  const creatorConfig = getAmazonCreatorApiConfig();
+  ensureAmazonConfigLog(getAmazonAffiliateConfig());
+
+  if ((process.env.SIMILAR_VARIANT_CHECK_ENABLED || '0') !== '1') {
+    return {
+      available: false,
+      status: 'disabled',
+      requestedAt,
+      asin,
+      items: [],
+      reason: 'SIMILAR_VARIANT_CHECK_ENABLED ist nicht aktiv.',
+      source: 'creator'
+    };
+  }
+
+  if (!asin) {
+    return {
+      available: false,
+      status: 'missing_asin',
+      requestedAt,
+      asin,
+      items: [],
+      reason: 'ASIN fehlt fuer Creator-Variantenpruefung.',
+      source: 'creator'
+    };
+  }
+
+  const cached = getCachedAmazonVariationData(asin, {
+    source: 'creator'
+  });
+  if (cached) {
+    console.info('[VARIANT_SCAN_DONE]', {
+      asin,
+      status: cached.status || 'cache_hit',
+      count: Array.isArray(cached.items) ? cached.items.length : 0,
+      cacheHit: true,
+      source: 'creator'
+    });
+    return {
+      available: true,
+      status: cached.status || 'cache_hit',
+      requestedAt,
+      asin,
+      items: Array.isArray(cached.items) ? cached.items.slice(0, limit) : [],
+      cacheHit: true,
+      reason: cleanText(cached.reason),
+      source: 'creator'
+    };
+  }
+
+  if (!creatorConfig.enabled || !hasAmazonCreatorApiCredentials(creatorConfig)) {
+    return {
+      available: false,
+      status: creatorConfig.enabled ? 'missing_config' : 'disabled',
+      requestedAt,
+      asin,
+      items: [],
+      reason: creatorConfig.enabled ? 'Creator API nicht vollstaendig konfiguriert.' : 'Creator API ist deaktiviert.',
+      source: 'creator'
+    };
+  }
+
+  console.info('[VARIANT_SCAN_START]', {
+    asin,
+    limit,
+    source: 'creator'
+  });
+
+  try {
+    const baseResponseJson = await requestAmazonCreatorApiGetItems(asin, creatorConfig);
+    const baseItems = extractAmazonCreatorItems(baseResponseJson);
+    const rawBaseItem =
+      baseItems.find((entry) => firstCleanCreatorText(entry?.asin, entry?.ASIN).toUpperCase() === asin) || baseItems[0] || null;
+
+    if (!rawBaseItem) {
+      const payload = {
+        status: 'no_hits',
+        items: [],
+        reason: 'Creator API lieferte kein Basisprodukt fuer den Variantencheck.'
+      };
+      setCachedAmazonVariationData(asin, payload, {
+        source: 'creator'
+      });
+      console.info('[VARIANT_SCAN_DONE]', {
+        asin,
+        status: payload.status,
+        count: 0,
+        cacheHit: false,
+        source: 'creator'
+      });
+      return {
+        available: true,
+        status: payload.status,
+        requestedAt,
+        asin,
+        items: [],
+        reason: payload.reason,
+        source: 'creator'
+      };
+    }
+
+    const familyAsins = normalizeAmazonAsinList([asin, ...extractAmazonCreatorVariantAsins(rawBaseItem, asin)]).slice(0, limit);
+    console.info('[VARIANT_SCAN_VISIBLE_OPTIONS]', {
+      asin,
+      source: 'creator',
+      familyAsins,
+      count: familyAsins.length
+    });
+
+    if (familyAsins.length <= 1) {
+      const payload = {
+        status: 'no_family_variants',
+        items: [],
+        reason: 'Creator API hat keine weiteren Varianten-ASINs geliefert.'
+      };
+      setCachedAmazonVariationData(asin, payload, {
+        source: 'creator'
+      });
+      console.info('[VARIANT_SCAN_DONE]', {
+        asin,
+        status: payload.status,
+        count: 0,
+        cacheHit: false,
+        source: 'creator'
+      });
+      return {
+        available: true,
+        status: payload.status,
+        requestedAt,
+        asin,
+        items: [],
+        reason: payload.reason,
+        source: 'creator'
+      };
+    }
+
+    const familyResponseJson = await requestAmazonCreatorApiGetItems(familyAsins, creatorConfig);
+    const familyItems = extractAmazonCreatorItems(familyResponseJson);
+    const mappedByAsin = new Map(
+      familyItems
+        .map((item) => mapAmazonCreatorItem(item, firstCleanCreatorText(item?.asin, item?.ASIN), creatorConfig))
+        .filter((item) => item.asin)
+        .map((item) => [item.asin, item])
+    );
+    const items = familyAsins.map((itemAsin) => mappedByAsin.get(itemAsin)).filter(Boolean).slice(0, limit);
+    const payload = {
+      status: items.length > 1 ? 'success' : 'no_family_variants',
+      items: items.length > 1 ? items : [],
+      reason: items.length > 1 ? '' : 'Creator API hat keine vollstaendige Variantenfamilie geliefert.'
+    };
+
+    cacheAmazonVariationFamilyData(familyAsins, payload, {
+      source: 'creator'
+    });
+    console.info('[VARIANT_SCAN_DONE]', {
+      asin,
+      status: payload.status,
+      count: Array.isArray(payload.items) ? payload.items.length : 0,
+      cacheHit: false,
+      source: 'creator'
+    });
+
+    return {
+      available: true,
+      status: payload.status,
+      requestedAt,
+      asin,
+      items: Array.isArray(payload.items) ? payload.items : [],
+      reason: payload.reason,
+      source: 'creator'
+    };
+  } catch (error) {
+    const throttled = isAmazonApiThrottlingError(error);
+    const status = throttled ? 'throttled' : deriveErrorStatus(error);
+    const reason = error instanceof Error ? error.message : 'Creator-Variantencheck fehlgeschlagen.';
+
+    if (!throttled) {
+      setCachedAmazonVariationData(
+        asin,
+        {
+          status,
+          items: [],
+          reason
+        },
+        {
+          source: 'creator'
+        }
+      );
+    }
+
+    console.warn('[VARIANT_SCAN_ABORT]', {
+      asin,
+      status,
+      source: 'creator',
+      reason
+    });
+    return {
+      available: false,
+      status,
+      requestedAt,
+      asin,
+      items: [],
+      reason,
+      source: 'creator'
+    };
+  }
+}
+
 export async function loadAmazonAffiliateVariations(input = {}) {
   const asin = cleanText(input.asin).toUpperCase();
   const requestedAt = nowIso();
@@ -1902,13 +2223,16 @@ export async function loadAmazonAffiliateVariations(input = {}) {
     };
   }
 
-  const cached = getCachedAmazonVariationData(asin);
+  const cached = getCachedAmazonVariationData(asin, {
+    source: 'paapi'
+  });
   if (cached) {
     console.info('[VARIANT_SCAN_DONE]', {
       asin,
       status: cached.status || 'cache_hit',
       count: Array.isArray(cached.items) ? cached.items.length : 0,
-      cacheHit: true
+      cacheHit: true,
+      source: 'paapi'
     });
     return {
       available: true,
@@ -1934,7 +2258,8 @@ export async function loadAmazonAffiliateVariations(input = {}) {
   console.info('[VARIANT_SCAN_START]', {
     asin,
     limit,
-    cacheTtlMs: getSimilarVariantCacheTtlMs()
+    cacheTtlMs: getSimilarVariantCacheTtlMs(),
+    source: 'paapi'
   });
 
   try {
@@ -1990,15 +2315,22 @@ export async function loadAmazonAffiliateVariations(input = {}) {
       .filter((item) => item.asin)
       .slice(0, limit);
 
-    setCachedAmazonVariationData(asin, {
-      status: items.length ? 'success' : 'no_hits',
-      items
-    });
+    cacheAmazonVariationFamilyData(
+      [asin, ...items.map((item) => item.asin)],
+      {
+        status: items.length ? 'success' : 'no_hits',
+        items
+      },
+      {
+        source: 'paapi'
+      }
+    );
     console.info('[VARIANT_SCAN_DONE]', {
       asin,
       status: items.length ? 'success' : 'no_hits',
       count: items.length,
-      cacheHit: false
+      cacheHit: false,
+      source: 'paapi'
     });
 
     return {
@@ -2011,19 +2343,41 @@ export async function loadAmazonAffiliateVariations(input = {}) {
     };
   } catch (error) {
     const throttled = isAmazonApiThrottlingError(error);
+    const status = throttled ? 'throttled' : deriveErrorStatus(error);
+    const reason = error instanceof Error ? error.message : 'GetVariations fehlgeschlagen.';
+    if (!throttled) {
+      setCachedAmazonVariationData(
+        asin,
+        {
+          status,
+          items: [],
+          reason
+        },
+        {
+          source: 'paapi'
+        }
+      );
+    }
+    console.warn('[VARIANT_SCAN_ABORT]', {
+      asin,
+      status,
+      source: 'paapi',
+      reason
+    });
     console.warn('[VARIANT_SCAN_DONE]', {
       asin,
-      status: throttled ? 'throttled' : deriveErrorStatus(error),
+      status,
       count: 0,
-      reason: error instanceof Error ? error.message : 'GetVariations fehlgeschlagen.'
+      reason,
+      source: 'paapi'
     });
     return {
       available: false,
-      status: throttled ? 'throttled' : deriveErrorStatus(error),
+      status,
       requestedAt,
       asin,
       items: [],
-      reason: error instanceof Error ? error.message : 'GetVariations fehlgeschlagen.'
+      reason
     };
   }
 }

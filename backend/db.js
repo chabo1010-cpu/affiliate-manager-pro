@@ -159,6 +159,22 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS product_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    keywords_json TEXT NOT NULL DEFAULT '[]',
+    brand_type TEXT NOT NULL DEFAULT 'ANY',
+    max_price REAL,
+    min_reviews INTEGER NOT NULL DEFAULT 0,
+    min_rating REAL NOT NULL DEFAULT 0,
+    market_compare_required INTEGER NOT NULL DEFAULT 0,
+    capacity_min INTEGER,
+    capacity_max INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -270,6 +286,26 @@ db.exec(`
     FOREIGN KEY (queue_id) REFERENCES publishing_queue(id),
     FOREIGN KEY (target_id) REFERENCES publishing_targets(id)
   );
+
+  CREATE TABLE IF NOT EXISTS telegram_post_duplicates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    duplicate_key TEXT NOT NULL UNIQUE,
+    channel_type TEXT NOT NULL,
+    target_ref TEXT,
+    asin TEXT,
+    normalized_title TEXT,
+    normalized_price TEXT NOT NULL,
+    normalized_url TEXT,
+    last_sent_at TEXT,
+    last_message_id TEXT,
+    last_post_context TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_post_duplicates_channel ON telegram_post_duplicates (channel_type);
+  CREATE INDEX IF NOT EXISTS idx_telegram_post_duplicates_sent_at ON telegram_post_duplicates (last_sent_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_telegram_post_duplicates_url ON telegram_post_duplicates (normalized_url);
 
   CREATE TABLE IF NOT EXISTS advertising_modules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1272,6 +1308,80 @@ db.exec(`
 `);
 
 const now = new Date().toISOString();
+const defaultProductRules = [
+  {
+    name: 'China Kopfhoerer',
+    keywordsJson: '["kopfhoerer","bluetooth kopfhoerer","in ear","earbuds","tws"]',
+    brandType: 'NONAME',
+    maxPrice: 12,
+    minReviews: 50,
+    minRating: 4,
+    marketCompareRequired: 0,
+    capacityMin: null,
+    capacityMax: null,
+    active: 1
+  },
+  {
+    name: 'China Beamer',
+    keywordsJson: '["beamer","mini beamer","projector"]',
+    brandType: 'NONAME',
+    maxPrice: 50,
+    minReviews: 50,
+    minRating: 4,
+    marketCompareRequired: 0,
+    capacityMin: null,
+    capacityMax: null,
+    active: 1
+  },
+  {
+    name: 'Marken Sneaker',
+    keywordsJson: '["sneaker","schuhe"]',
+    brandType: 'BRAND',
+    maxPrice: 33,
+    minReviews: 0,
+    minRating: 0,
+    marketCompareRequired: 1,
+    capacityMin: null,
+    capacityMax: null,
+    active: 1
+  },
+  {
+    name: 'Powerbank 10000mAh',
+    keywordsJson: '["powerbank"]',
+    brandType: 'ANY',
+    maxPrice: 11,
+    minReviews: 50,
+    minRating: 4,
+    marketCompareRequired: 0,
+    capacityMin: 9000,
+    capacityMax: 11000,
+    active: 1
+  },
+  {
+    name: 'Powerbank 19000-30000mAh',
+    keywordsJson: '["powerbank"]',
+    brandType: 'ANY',
+    maxPrice: 16,
+    minReviews: 50,
+    minRating: 4,
+    marketCompareRequired: 0,
+    capacityMin: 19000,
+    capacityMax: 30000,
+    active: 1
+  },
+  {
+    name: 'Grosse Powerbank',
+    keywordsJson: '["powerbank"]',
+    brandType: 'ANY',
+    maxPrice: 25,
+    minReviews: 50,
+    minRating: 4,
+    marketCompareRequired: 0,
+    capacityMin: 30001,
+    capacityMax: null,
+    active: 1
+  }
+];
 db.prepare(
   `
     INSERT OR IGNORE INTO pricing_rules (
@@ -1293,6 +1403,45 @@ db.prepare(
     )
   `
 ).run({ now });
+
+const insertDefaultProductRule = db.prepare(
+  `
+    INSERT OR IGNORE INTO product_rules (
+      name,
+      keywords_json,
+      brand_type,
+      max_price,
+      min_reviews,
+      min_rating,
+      market_compare_required,
+      capacity_min,
+      capacity_max,
+      active,
+      created_at,
+      updated_at
+    ) VALUES (
+      @name,
+      @keywordsJson,
+      @brandType,
+      @maxPrice,
+      @minReviews,
+      @minRating,
+      @marketCompareRequired,
+      @capacityMin,
+      @capacityMax,
+      @active,
+      @now,
+      @now
+    )
+  `
+);
+
+for (const rule of defaultProductRules) {
+  insertDefaultProductRule.run({
+    ...rule,
+    now
+  });
+}
 
 db.prepare(
   `

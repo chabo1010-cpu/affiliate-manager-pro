@@ -103,6 +103,8 @@ function buildKeepaPreview(context = {}) {
     keepaClient,
     sellerType: result.sellerType || null,
     categoryName: result.categoryName || '',
+    rating: parseNumber(result.rating, null),
+    reviewCount: parseInteger(result.reviewCount, null),
     comparisonSource: result.comparisonSource || null,
     comparisonStatus: result.comparisonStatus || null,
     comparisonPrice: result.comparisonPrice ?? null,

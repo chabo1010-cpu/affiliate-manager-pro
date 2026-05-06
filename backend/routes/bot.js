@@ -10,10 +10,10 @@ import { getDealEngineSettings } from '../services/dealEngine/configService.js';
 import { getAdvertisingSchedulerRuntimeStatus } from '../services/advertisingService.js';
 import { getKeepaSchedulerRuntimeStatus, getKeepaSettings } from '../services/keepaService.js';
 import {
+  getPublishingQueueCounts,
   getPublishingWorkerRuntimeStatus,
   getWorkerStatus,
-  listPublishingLogs,
-  listPublishingQueue
+  listPublishingLogs
 } from '../services/publisherService.js';
 import { getTelegramBotClientConfig } from '../services/telegramBotClientService.js';
 import { getWhatsappClientConfig } from '../services/whatsappClientService.js';
@@ -30,74 +30,87 @@ function buildOperationalModule(status, label, detail, extra = {}) {
   };
 }
 
+function logUiRouteDone(route, startedAt, extra = {}) {
+  const durationMs = Date.now() - startedAt;
+  console.info('[UI_ROUTE_DONE]', { route, durationMs, ...extra });
+  if (durationMs >= 800) {
+    console.warn('[UI_ROUTE_SLOW]', { route, durationMs, ...extra });
+  }
+}
+
 router.get('/', (req, res) => {
-  const publishingQueue = listPublishingQueue();
-  const publishingLogs = listPublishingLogs().slice(0, 6);
-  const workerStatus = getWorkerStatus();
-  const copybotOverview = getCopybotOverview();
-  const repostSettings = getRepostSettings();
-  const keepaSettings = getKeepaSettings();
-  const dealEngineSettings = getDealEngineSettings();
-  const keepaSchedulerRuntime = getKeepaSchedulerRuntimeStatus();
-  const publishingWorkerRuntime = getPublishingWorkerRuntimeStatus();
-  const advertisingSchedulerRuntime = getAdvertisingSchedulerRuntimeStatus();
-  const storageConfig = getStorageConfig();
-  const telegramBotClient = getTelegramBotClientConfig();
-  const telegramUserReaderConfig = getTelegramUserReaderConfig();
-  const whatsappConfig = getWhatsappClientConfig();
-  const telegramTargetStatus = workerStatus.channels.find((item) => item.channel_type === 'telegram') || null;
-  const whatsappTargetStatus = workerStatus.channels.find((item) => item.channel_type === 'whatsapp') || null;
-  const sessionStats =
-    db.prepare(
-      `
-        SELECT
-          COUNT(*) AS total_sessions,
-          SUM(CASE WHEN status IN ('connected', 'active', 'watching') THEN 1 ELSE 0 END) AS active_sessions,
-          MAX(last_message_at) AS last_message_at
-        FROM telegram_reader_sessions
-      `
-    ).get() || {};
-  const channelStats =
-    db.prepare(
-      `
-        SELECT
-          COUNT(*) AS total_channels,
-          SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS active_channels
-        FROM telegram_reader_channels
-      `
-    ).get() || {};
-  const openQueueCount = publishingQueue.filter((item) => ['pending', 'sending', 'retry'].includes(item.status)).length;
-  const configuredTelegramBot = Boolean(telegramBotClient.tokenConfigured && telegramBotClient.effectiveTargets.length);
-  const configuredTelegramReader = Boolean(telegramUserReaderConfig.apiId && telegramUserReaderConfig.apiHash);
-  const readerActiveSessions = Number(sessionStats.active_sessions || 0);
-  const readerSavedSessions = Number(sessionStats.total_sessions || 0);
-  const readerWatchedChannels = Number(channelStats.active_channels || 0);
-  const whatsappPrepared =
-    whatsappConfig.enabled ||
-    whatsappConfig.endpointConfigured ||
-    whatsappConfig.senderConfigured ||
-    Number(copybotOverview.activeWhatsappSources || 0) > 0;
-  const whatsappLive = Boolean(whatsappConfig.enabled && whatsappConfig.endpointConfigured && whatsappConfig.senderConfigured);
-  const telegramReaderStatus =
-    readerActiveSessions > 0 ? 'active' : configuredTelegramReader && telegramUserReaderConfig.enabled ? 'session_missing' : 'prepared';
-  const telegramReaderLabel =
-    telegramReaderStatus === 'active'
-      ? 'aktiv'
-      : telegramReaderStatus === 'session_missing'
-        ? 'Session fehlt'
-        : 'vorbereitet';
-  const telegramBotStatus = configuredTelegramBot && telegramBotClient.enabled ? 'active' : 'prepared';
-  const telegramBotLabel = telegramBotStatus === 'active' ? 'aktiv' : 'vorbereitet';
-  const whatsappStatus = whatsappLive ? 'active' : whatsappPrepared ? 'prepared' : 'not_configured';
-  const whatsappLabel = whatsappStatus === 'active' ? 'aktiv' : whatsappStatus === 'prepared' ? 'vorbereitet' : 'nicht konfiguriert';
-  const aiResolverStatus = dealEngineSettings.ai.resolverEnabled ? 'active' : 'disabled';
-  const aiResolverLabel = aiResolverStatus === 'active' ? 'aktiv' : 'deaktiviert';
-  const schedulerFullyActive =
-    keepaSettings.schedulerEnabled &&
-    keepaSchedulerRuntime.started &&
-    publishingWorkerRuntime.started &&
-    advertisingSchedulerRuntime.started;
-  const schedulerLabel = schedulerFullyActive ? 'aktiv' : 'deaktiviert';
+  const route = '/api/bot';
+  const startedAt = Date.now();
+  console.info('[UI_ROUTE_START]', { route });
+
+  try {
+    const publishingLogs = listPublishingLogs({ limit: 6 });
+    const publishingQueueCounts = getPublishingQueueCounts();
+    const workerStatus = getWorkerStatus();
+    const copybotOverview = getCopybotOverview();
+    const repostSettings = getRepostSettings();
+    const keepaSettings = getKeepaSettings();
+    const dealEngineSettings = getDealEngineSettings();
+    const keepaSchedulerRuntime = getKeepaSchedulerRuntimeStatus();
+    const publishingWorkerRuntime = getPublishingWorkerRuntimeStatus();
+    const advertisingSchedulerRuntime = getAdvertisingSchedulerRuntimeStatus();
+    const storageConfig = getStorageConfig();
+    const telegramBotClient = getTelegramBotClientConfig();
+    const telegramUserReaderConfig = getTelegramUserReaderConfig();
+    const whatsappConfig = getWhatsappClientConfig();
+    const telegramTargetStatus = workerStatus.channels.find((item) => item.channel_type === 'telegram') || null;
+    const whatsappTargetStatus = workerStatus.channels.find((item) => item.channel_type === 'whatsapp') || null;
+    const sessionStats =
+      db.prepare(
+        `
+          SELECT
+            COUNT(*) AS total_sessions,
+            SUM(CASE WHEN status IN ('connected', 'active', 'watching') THEN 1 ELSE 0 END) AS active_sessions,
+            MAX(last_message_at) AS last_message_at
+          FROM telegram_reader_sessions
+        `
+      ).get() || {};
+    const channelStats =
+      db.prepare(
+        `
+          SELECT
+            COUNT(*) AS total_channels,
+            SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS active_channels
+          FROM telegram_reader_channels
+        `
+      ).get() || {};
+    const openQueueCount = publishingQueueCounts.openCount;
+    const configuredTelegramBot = Boolean(telegramBotClient.tokenConfigured && telegramBotClient.effectiveTargets.length);
+    const configuredTelegramReader = Boolean(telegramUserReaderConfig.apiId && telegramUserReaderConfig.apiHash);
+    const readerActiveSessions = Number(sessionStats.active_sessions || 0);
+    const readerSavedSessions = Number(sessionStats.total_sessions || 0);
+    const readerWatchedChannels = Number(channelStats.active_channels || 0);
+    const whatsappPrepared =
+      whatsappConfig.enabled ||
+      whatsappConfig.endpointConfigured ||
+      whatsappConfig.senderConfigured ||
+      Number(copybotOverview.activeWhatsappSources || 0) > 0;
+    const whatsappLive = Boolean(whatsappConfig.enabled && whatsappConfig.endpointConfigured && whatsappConfig.senderConfigured);
+    const telegramReaderStatus =
+      readerActiveSessions > 0 ? 'active' : configuredTelegramReader && telegramUserReaderConfig.enabled ? 'session_missing' : 'prepared';
+    const telegramReaderLabel =
+      telegramReaderStatus === 'active'
+        ? 'aktiv'
+        : telegramReaderStatus === 'session_missing'
+          ? 'Session fehlt'
+          : 'vorbereitet';
+    const telegramBotStatus = configuredTelegramBot && telegramBotClient.enabled ? 'active' : 'prepared';
+    const telegramBotLabel = telegramBotStatus === 'active' ? 'aktiv' : 'vorbereitet';
+    const whatsappStatus = whatsappLive ? 'active' : whatsappPrepared ? 'prepared' : 'not_configured';
+    const whatsappLabel = whatsappStatus === 'active' ? 'aktiv' : whatsappStatus === 'prepared' ? 'vorbereitet' : 'nicht konfiguriert';
+    const aiResolverStatus = dealEngineSettings.ai.resolverEnabled ? 'active' : 'disabled';
+    const aiResolverLabel = aiResolverStatus === 'active' ? 'aktiv' : 'deaktiviert';
+    const schedulerFullyActive =
+      keepaSettings.schedulerEnabled &&
+      keepaSchedulerRuntime.started &&
+      publishingWorkerRuntime.started &&
+      advertisingSchedulerRuntime.started;
+    const schedulerLabel = schedulerFullyActive ? 'aktiv' : 'deaktiviert';
 
   const operationalStatus = {
     telegramReader: buildOperationalModule(
@@ -247,17 +260,17 @@ router.get('/', (req, res) => {
     }
   ];
 
-  res.json({
-    status: openQueueCount > 0 ? 'aktiv' : configuredTelegramBot || configuredTelegramReader ? 'bereit' : 'konfiguration_noetig',
-    queue: openQueueCount,
-    lastCheck: new Date().toISOString(),
-    activities: publishingLogs.map((entry) => ({
-      id: entry.id,
-      action: entry.message || entry.event_type || 'Publishing Event',
-      user: entry.worker_type || 'system',
-      time: entry.created_at
-    })),
-    modules: {
+    res.json({
+      status: openQueueCount > 0 ? 'aktiv' : configuredTelegramBot || configuredTelegramReader ? 'bereit' : 'konfiguration_noetig',
+      queue: openQueueCount,
+      lastCheck: new Date().toISOString(),
+      activities: publishingLogs.map((entry) => ({
+        id: entry.id,
+        action: entry.message || entry.event_type || 'Publishing Event',
+        user: entry.worker_type || 'system',
+        time: entry.created_at
+      })),
+      modules: {
       telegramUserApi: {
         enabled: telegramUserReaderConfig.enabled,
         apiConfigured: configuredTelegramReader,
@@ -302,17 +315,33 @@ router.get('/', (req, res) => {
         queueSent: Number(whatsappTargetStatus?.sent || 0),
         runtimeStatus: operationalStatus.whatsapp
       },
-      persistence: {
-        dbPath: storageConfig.dbPath,
-        queueEntries: publishingQueue.length,
-        repostCooldownEnabled: Boolean(repostSettings.repostCooldownEnabled),
-        repostCooldownHours: Number(repostSettings.repostCooldownHours || 0)
-      }
-    },
-    operationalStatus,
-    productionReality,
-    finalFlow
-  });
+        persistence: {
+          dbPath: storageConfig.dbPath,
+          queueEntries: publishingQueueCounts.totalCount,
+          repostCooldownEnabled: Boolean(repostSettings.repostCooldownEnabled),
+          repostCooldownHours: Number(repostSettings.repostCooldownHours || 0)
+        }
+      },
+      operationalStatus,
+      productionReality,
+      finalFlow
+    });
+
+    logUiRouteDone(route, startedAt, {
+      queueOpenCount: openQueueCount,
+      queueEntries: publishingQueueCounts.totalCount
+    });
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    console.error('[UI_ROUTE_ERROR]', {
+      route,
+      durationMs,
+      errorMessage: error instanceof Error ? error.message : 'Bot-Status konnte nicht geladen werden.'
+    });
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Bot-Status konnte nicht geladen werden.'
+    });
+  }
 });
 
 export default router;

@@ -1,5 +1,5 @@
 import { getCopybotOverview, listSources } from '../copybotService.js';
-import { listPublishingLogs, listPublishingQueue } from '../publisherService.js';
+import { getPublishingQueueCounts, listPublishingQueue } from '../publisherService.js';
 import { getWorkerStatus } from '../publisherService.js';
 import { getDealEngineSettings } from './configService.js';
 import { getDealEngineMetrics, listDealEngineRuns } from './repositoryService.js';
@@ -30,17 +30,12 @@ export function getDealEngineDashboard() {
   const copybotOverview = getCopybotOverview();
   const workerStatus = getWorkerStatus();
   const outputSnapshot = getDealEngineOutputSnapshot(settings);
-  const queues = listPublishingQueue().filter((item) => item.source_type === 'deal_engine').slice(0, 10);
-  const logs = listPublishingLogs()
-    .filter((item) => {
-      const payload = item.payload || {};
-      return payload?.sourceType === 'deal_engine' || payload?.databaseSourceType === 'deal_engine' || item.worker_type === 'publisher';
-    })
-    .slice(0, 10);
+  const queues = listPublishingQueue({ sourceType: 'deal_engine', limit: 10 });
+  const queueCounts = getPublishingQueueCounts({ sourceType: 'deal_engine' });
   const activeSources = sourceItems.filter((item) => Number(item.is_active) === 1);
   const activeTelegramSources = activeSources.filter((item) => String(item.platform || '').toLowerCase() === 'telegram');
   const activeWhatsappSources = activeSources.filter((item) => String(item.platform || '').toLowerCase() === 'whatsapp');
-  const openDealEngineQueues = queues.filter((item) => ['pending', 'retry', 'sending'].includes(String(item.status || '').toLowerCase()));
+  const openDealEngineQueues = queueCounts.openCount;
   const errors = runs
     .filter((item) => item.decision === 'REJECT' || String(item.outputStatus || '').includes('without_active_output'))
     .slice(0, 8)
@@ -54,7 +49,7 @@ export function getDealEngineDashboard() {
   const systemStatus =
     errors.length > 0
       ? 'attention_required'
-      : openDealEngineQueues.length > 0
+      : openDealEngineQueues > 0
         ? 'active'
         : metrics.totalRuns > 0
           ? 'ready'
@@ -83,7 +78,7 @@ export function getDealEngineDashboard() {
     outputs: {
       snapshot: outputSnapshot,
       workers: workerStatus,
-      openQueueCount: openDealEngineQueues.length,
+      openQueueCount: openDealEngineQueues,
       latestQueues: queues
     },
     operatingPrinciples: [
@@ -188,7 +183,6 @@ export function getDealEngineDashboard() {
       createdAt: item.createdAt
     })),
     errors,
-    runs,
-    logs
+    runs
   };
 }

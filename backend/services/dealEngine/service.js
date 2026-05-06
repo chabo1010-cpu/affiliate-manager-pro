@@ -1,5 +1,6 @@
 import { extractKeepaFallbackMetrics } from '../keepaFakeDropService.js';
 import { logGeneratorDebug } from '../generatorFlowService.js';
+import { evaluateProductRules as evaluateConfiguredProductRules } from '../productRulesService.js';
 import { evaluateSellerDecisionPolicy, resolveSellerIdentity } from '../sellerClassificationService.js';
 import { getDealEngineSettings, getRequiredMarketAdvantagePct, resolveDealEngineDayPart } from './configService.js';
 import { resolveAiAssistance } from './aiResolverService.js';
@@ -9,12 +10,14 @@ import { evaluateMarketComparison } from './marketService.js';
 import { enqueueApprovedDeal } from './publisherService.js';
 import { createDealEngineRun } from './repositoryService.js';
 import {
+  buildArrayFromTextList,
   cleanText,
   extractAsinFromAmazonUrl,
   isAmazonLink,
   normalizeDayPart,
   normalizeSellerArea,
   parseBool,
+  parseInteger,
   parseNumber,
   round,
   summarizeReasons
@@ -94,18 +97,6 @@ function logDecisionFlow(tag, payload = {}) {
   logGeneratorDebug(tag, payload);
 }
 
-function formatCurrency(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return '-';
-  }
-
-  return new Intl.NumberFormat('de-DE', {
-    style: 'currency',
-    currency: 'EUR'
-  }).format(parsed);
-}
-
 function buildSellerAnalysis(policy = {}) {
   const seller = policy.seller || {};
 
@@ -143,149 +134,37 @@ function attachAnalysisAliases(analysis = {}, marketResult = {}, aiResolution = 
   };
 }
 
-const PRODUCT_RULE_POWERBANK_LIMITS = new Map([
-  [10000, 10],
-  [20000, 16]
-]);
-
-const PRODUCT_RULE_TRUSTED_AUDIO_BRANDS = new Set(['sony', 'bose', 'apple', 'samsung', 'jbl', 'anker', 'soundcore']);
-
-function normalizeRuleText(value = '') {
-  return cleanText(value).toLowerCase();
-}
-
-function normalizeRuleDigits(value = '') {
-  return String(value || '').replace(/[^\d]/g, '');
-}
-
-function extractMahCapacity(...values) {
-  for (const value of values) {
-    const match = String(value || '').match(/(\d{2}\.?\d{3}|\d{5})\s*m\s*a\s*h/i);
-    if (!match) {
-      continue;
-    }
-
-    const normalizedCapacity = Number.parseInt(normalizeRuleDigits(match[1]), 10);
-    if (Number.isFinite(normalizedCapacity)) {
-      return normalizedCapacity;
-    }
-  }
-
-  return null;
-}
-
-function looksLikePowerbank(deal = {}) {
-  return [deal.title, deal.category].some((value) => normalizeRuleText(value).includes('powerbank'));
-}
-
-function looksLikeHeadphones(deal = {}) {
-  return [deal.title, deal.category].some((value) => {
-    const normalized = normalizeRuleText(value);
-    return (
-      normalized.includes('kopfho') ||
-      normalized.includes('headphone') ||
-      normalized.includes('headset') ||
-      normalized.includes('earbud') ||
-      normalized.includes('earphone') ||
-      normalized.includes('in-ear')
-    );
-  });
-}
-
 function buildProductRuleFlow(flow = [], finalDecision = '') {
   const baseFlow = (Array.isArray(flow) ? flow : []).filter((step) => step && !String(step).startsWith('Final:'));
   return [...baseFlow, 'Produktregeln pruefen', `Final: ${finalDecision}`];
 }
 
-function evaluateProductRules(normalized = {}) {
-  const deal = normalized.deal || {};
-  const currentPrice = parseNumber(deal.amazonPrice, null);
-  const items = [];
-  const reasonDetails = [];
-  let action = 'none';
-
-  if (looksLikePowerbank(deal) && currentPrice !== null) {
-    const capacityMah = extractMahCapacity(deal.title, deal.variantKey, deal.quantityKey);
-    const maxPrice = PRODUCT_RULE_POWERBANK_LIMITS.get(capacityMah);
-
-    if (maxPrice !== undefined && currentPrice > maxPrice) {
-      action = 'reject';
-      items.push({
-        id: 'powerbank_price_cap',
-        label: 'Powerbank Preislimit',
-        action,
-        detail: `${capacityMah} mAh ueberschreitet das Preislimit von ${formatCurrency(maxPrice)}.`,
-        meta: {
-          capacityMah,
-          maxPrice,
-          currentPrice
-        }
-      });
-      reasonDetails.push(
-        createReasonDetail(
-          `product_rule_powerbank_${capacityMah}`,
-          `${capacityMah} mAh Powerbank liegt mit ${formatCurrency(currentPrice)} ueber dem Produktlimit von ${formatCurrency(maxPrice)}.`,
-          'critical',
-          {
-            capacityMah,
-            currentPrice,
-            maxPrice
-          }
-        )
-      );
-    }
-  }
-
-  if (looksLikeHeadphones(deal) && currentPrice !== null && currentPrice > 25) {
-    const normalizedBrand = normalizeRuleText(deal.brand);
-    const trustedBrand = normalizedBrand && PRODUCT_RULE_TRUSTED_AUDIO_BRANDS.has(normalizedBrand);
-
-    if (!trustedBrand) {
-      action = 'reject';
-      items.push({
-        id: 'china_headphones_price_cap',
-        label: 'China Kopfhoerer Filter',
-        action,
-        detail: `Nicht gelistete Marke liegt ueber ${formatCurrency(25)}.`,
-        meta: {
-          brand: cleanText(deal.brand) || 'unbekannt',
-          currentPrice
-        }
-      });
-      reasonDetails.push(
-        createReasonDetail(
-          'product_rule_china_headphones',
-          `Kopfhoerer ohne freigegebene Markenliste liegen mit ${formatCurrency(currentPrice)} ueber dem China-Preislimit von ${formatCurrency(25)}.`,
-          'critical',
-          {
-            brand: cleanText(deal.brand) || 'unbekannt',
-            currentPrice,
-            trustedBrands: [...PRODUCT_RULE_TRUSTED_AUDIO_BRANDS]
-          }
-        )
-      );
-    }
-  }
-
-  return {
-    status: items.length ? 'matched' : 'clear',
-    action,
-    items,
-    reasonDetails,
-    summary: items.length
-      ? `${items.length} Produktregel${items.length === 1 ? '' : 'n'} aktiv: ${items.map((item) => item.label).join(' | ')}`
-      : 'Keine Produktregel ausgelost.'
-  };
-}
-
 function applyProductRuleDecision({ analysis, normalized, settings, marketResult, aiResolution }) {
-  const productRules = evaluateProductRules(normalized);
+  const productRules = evaluateConfiguredProductRules({
+    title: normalized?.deal?.title,
+    brand: normalized?.deal?.brand,
+    finalPrice: normalized?.deal?.amazonPrice,
+    rating: normalized?.deal?.rating,
+    reviewCount: normalized?.deal?.reviewCount,
+    category: normalized?.deal?.category,
+    features: normalized?.deal?.features || [],
+    sellerClass: normalized?.deal?.sellerClass,
+    isBrandProduct: normalized?.deal?.isBrandProduct,
+    isNoName: normalized?.deal?.isNoName,
+    isChinaProduct: normalized?.deal?.isChinaProduct,
+    marketComparisonAvailable: marketResult?.available === true,
+    marketComparisonStatus:
+      marketResult?.available === true
+        ? 'success'
+        : cleanText(marketResult?.status || (marketResult?.blocked === true ? 'blocked' : 'missing')),
+    scope: 'deal_engine'
+  });
 
   if (!analysis || typeof analysis !== 'object') {
     return analysis;
   }
 
-  if (!productRules.items.length) {
+  if (!productRules.matchedRule) {
     return attachAnalysisAliases(
       {
         ...analysis,
@@ -296,12 +175,19 @@ function applyProductRuleDecision({ analysis, normalized, settings, marketResult
     );
   }
 
-  const nextDecision = productRules.action === 'reject' ? 'REJECT' : analysis.decision;
+  const nextDecision =
+    productRules.allowed === true
+      ? analysis.decision
+      : productRules.decision === 'review'
+        ? settings?.global?.queueEnabled === true
+          ? 'QUEUE'
+          : 'REJECT'
+        : 'REJECT';
   const nextReasonDetails = mergeReasonDetails(analysis.reasonDetails, productRules.reasonDetails);
   const nextAnalysis = {
     ...analysis,
     decision: nextDecision,
-    decisionOverrideSource: productRules.action === 'reject' ? 'product_rule_engine' : analysis.decisionOverrideSource,
+    decisionOverrideSource: productRules.allowed !== true ? 'product_rule_engine' : analysis.decisionOverrideSource,
     reasonDetails: nextReasonDetails,
     flow: buildProductRuleFlow(analysis.flow, nextDecision),
     productRules: {
@@ -359,6 +245,9 @@ function normalizeDealEngineInput(input = {}) {
       shippedByAmazon: sellerIdentity.shippedByAmazon,
       brand: cleanText(deal.brand),
       category: cleanText(deal.category),
+      rating: parseNumber(deal.rating, null),
+      reviewCount: parseInteger(deal.reviewCount ?? deal.totalReviews, null),
+      features: Array.isArray(deal.features) ? deal.features.map((item) => cleanText(item)).filter(Boolean) : buildArrayFromTextList(deal.features),
       variantKey: cleanText(deal.variantKey || deal.variant),
       quantityKey: cleanText(deal.quantityKey || deal.quantity),
       isBrandProduct: parseBool(deal.isBrandProduct, false),
@@ -744,6 +633,8 @@ export function getDealEngineSamplePayload() {
       shippedByAmazon: true,
       brand: 'Bosch Professional',
       category: 'Werkzeug',
+      rating: 4.7,
+      reviewCount: 184,
       variantKey: '18v solo',
       quantityKey: '1 stueck',
       isBrandProduct: true,

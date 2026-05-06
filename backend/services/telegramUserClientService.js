@@ -10,6 +10,7 @@ import { getReaderRuntimeConfig, getTelegramTestGroupConfig, getTelegramUserRead
 import { scrapeAmazonProduct } from '../routes/amazon.js';
 import {
   enrichAmazonAffiliateProductsWithOfferData,
+  loadAmazonCreatorFamilyVariations,
   loadAmazonAffiliateVariations,
   loadAmazonAffiliateContext,
   searchAmazonAffiliateProducts
@@ -19,10 +20,12 @@ import { upsertAppSession } from './databaseService.js';
 import { publishGeneratorPostDirect } from './directPublisher.js';
 import { buildGeneratorDealContext } from './generatorDealScoringService.js';
 import { loadKeepaClientByAsin } from './keepaClientService.js';
+import { evaluateProductRules } from './productRulesService.js';
 import { createPublishingEntry, processPublishingQueueEntry } from './publisherService.js';
 import { extractSellerSignalsFromText, formatSellerBoolean, resolveSellerIdentity } from './sellerClassificationService.js';
-import { sendTelegramPost } from './telegramSenderService.js';
-import { COUPON_OPTION_LABEL, formatPrice, generatePostText, resolveDealImageUrlFromScrape } from '../../frontend/src/lib/postGenerator.js';
+import { sendTelegramCouponFollowUp, sendTelegramPost } from './telegramSenderService.js';
+import { getCopybotRuntimeState } from './copybotControlService.js';
+import { formatPrice, generatePostText, resolveDealImageUrlFromScrape } from '../../frontend/src/lib/postGenerator.js';
 
 const db = getDb();
 const activeClients = new Map();
@@ -47,7 +50,6 @@ const DEBUG_QUEUE_ID_PLACEHOLDER = '__QUEUE_ID__';
 const OPTIMIZED_CHANNEL_ENABLED = process.env.TELEGRAM_OPTIMIZED_CHANNEL_ENABLED === '1';
 const OPTIMIZED_CHANNEL_ID = cleanText(process.env.TELEGRAM_OPTIMIZED_CHANNEL_ID);
 const OPTIMIZED_CHANNEL_USERNAME = normalizeConfiguredChannelRef(process.env.TELEGRAM_OPTIMIZED_CHANNEL_USERNAME);
-const SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT = process.env.SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT === '1';
 const optimizedChannelCache = {
   chatId: OPTIMIZED_CHANNEL_ID,
   resolvedFromUsername: false,
@@ -207,6 +209,9 @@ const PROTECTED_SOURCE_HOST_PATTERNS = [
 const ALLOWED_MAIN_POST_TITLE_SOURCES = new Set(['paapi', 'amazon', 'keepa_verified']);
 const ALLOWED_MAIN_POST_IMAGE_SOURCES = new Set(['paapi', 'amazon', 'keepa_verified', 'manual_upload']);
 const ALLOWED_MAIN_POST_LINK_SOURCES = new Set(['own_affiliate']);
+const TELEGRAM_COUPON_ACTIVE_OPTION = '\u2714\uFE0F Coupon aktivieren';
+const TELEGRAM_RABATTGUTSCHEIN_PREFIX = '\u2139\uFE0F Rabattgutschein:';
+const TELEGRAM_BEST_VARIANT_HEADLINE = '\u{1F3A8} Beste Variante:';
 const BLOCKED_MAIN_POST_SOURCE_VALUES = new Set([
   'telegram',
   'source',
@@ -3370,7 +3375,7 @@ function maybeStoreProductIntelligenceMaster({
   const normalizedSellerClass = normalizeSimilarSellerClass(sellerClass);
   const price = Number(candidate.price ?? profile.price);
 
-  if (similarityScore < 70 || !['FBA', 'AMAZON_DIRECT'].includes(normalizedSellerClass) || !Number.isFinite(price)) {
+  if (similarityScore < 70 || !['FBA_PREMIUM', 'FBA_UNKNOWN', 'AMAZON_DIRECT'].includes(normalizedSellerClass) || !Number.isFinite(price)) {
     return {
       stored: false,
       priceErrorProtected: false,
@@ -3454,15 +3459,28 @@ function maybeStoreProductIntelligenceMaster({
 function normalizeSimilarSellerClass(value = '') {
   const sellerClass = cleanText(value).toUpperCase();
 
-  if (sellerClass === 'FBA_THIRDPARTY') {
-    return 'FBA';
+  if (sellerClass === 'FBA_THIRDPARTY' || sellerClass === 'FBA' || sellerClass === 'FBA_PREMIUM') {
+    return 'FBA_PREMIUM';
   }
 
-  if (sellerClass === 'FBM_THIRDPARTY') {
+  if (sellerClass === 'FBA_OR_AMAZON_UNKNOWN' || sellerClass === 'FBA_UNKNOWN') {
+    return 'FBA_UNKNOWN';
+  }
+
+  if (sellerClass === 'FBM_THIRDPARTY' || sellerClass === 'FBM') {
+    return 'FBM';
+  }
+
+  if (sellerClass.includes('FBM')) {
     return 'FBM';
   }
 
   return sellerClass || 'UNKNOWN';
+}
+
+function isAllowedSimilarOptimizedSellerClass(sellerClass = '') {
+  const normalizedSellerClass = normalizeSimilarSellerClass(sellerClass);
+  return ['AMAZON_DIRECT', 'FBA_PREMIUM', 'FBA_UNKNOWN'].includes(normalizedSellerClass);
 }
 
 function isSimilarProductTestModeActive() {
@@ -3479,19 +3497,29 @@ function resolveSimilarProductEligibility(generatorInput = {}, generatorContext 
   );
   const optimizedTestModeRelaxed = isSimilarProductTestModeActive();
 
-  if (sellerClass === 'FBA') {
+  if (sellerClass === 'FBA_PREMIUM') {
     if (optimizedTestModeRelaxed) {
       console.info('[OPTIMIZED_TEST_MODE_RELAXED]', {
         sellerClass,
         allowed: true,
-        reason: 'READER_TEST_MODE erlaubt Optimierte Deals fuer alle Nicht-FBM Seller.'
+        reason: 'READER_TEST_MODE bestaetigt erlaubten Optimized-Seller.'
       });
     }
     return {
       allowed: true,
       checked: true,
       sellerClass,
-      reason: 'FBA Deal: Similar Product Check aktiv.',
+      reason: 'FBA_PREMIUM Deal: Similar Product Check aktiv.',
+      fbmExcluded: false
+    };
+  }
+
+  if (sellerClass === 'FBA_UNKNOWN') {
+    return {
+      allowed: true,
+      checked: true,
+      sellerClass,
+      reason: 'FBA_UNKNOWN Deal: Similar Product Check aktiv.',
       fbmExcluded: false
     };
   }
@@ -3512,50 +3540,35 @@ function resolveSimilarProductEligibility(generatorInput = {}, generatorContext 
   }
 
   if (optimizedTestModeRelaxed) {
-    const normalizedSellerClass = sellerClass || 'UNKNOWN';
     console.info('[OPTIMIZED_TEST_MODE_RELAXED]', {
-      sellerClass: normalizedSellerClass,
-      allowed: true,
-      reason: 'READER_TEST_MODE erlaubt Optimierte Deals fuer alle Nicht-FBM Seller.'
+      sellerClass: sellerClass || 'UNKNOWN',
+      allowed: false,
+      reason: 'READER_TEST_MODE lockert Seller-Regeln fuer Optimierte Deals nicht mehr ueber erlaubte Klassen hinaus.'
     });
-    if (normalizedSellerClass === 'UNKNOWN') {
-      console.info('[OPTIMIZED_ALLOW_UNKNOWN]', {
-        sellerClass: normalizedSellerClass,
-        allowed: true
-      });
-    }
-    if (normalizedSellerClass === 'FBA_OR_AMAZON_UNKNOWN') {
-      console.info('[OPTIMIZED_ALLOW_FBA_UNKNOWN]', {
-        sellerClass: normalizedSellerClass,
-        allowed: true
+  }
+
+  if (sellerClass === 'AMAZON_DIRECT') {
+    if (optimizedTestModeRelaxed) {
+      console.info('[OPTIMIZED_TEST_MODE_RELAXED]', {
+        sellerClass,
+        allowed: true,
+        reason: 'READER_TEST_MODE bestaetigt erlaubten Optimized-Seller.'
       });
     }
     return {
       allowed: true,
       checked: true,
-      sellerClass: normalizedSellerClass,
-      reason: 'READER_TEST_MODE: Nicht-FBM Seller fuer Optimierte Deals erlaubt.',
-      fbmExcluded: false
-    };
-  }
-
-  if (sellerClass === 'AMAZON_DIRECT') {
-    return {
-      allowed: SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT === true,
-      checked: SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT === true,
       sellerClass,
-      reason: SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT
-        ? 'Amazon Direct per SIMILAR_PRODUCT_ALLOW_AMAZON_DIRECT aktiviert.'
-        : 'Amazon Direct fuer Optimierte Deals vorbereitet, aktuell deaktiviert.',
+      reason: 'Amazon Direct fuer Optimierte Deals erlaubt.',
       fbmExcluded: false
     };
   }
 
   return {
     allowed: false,
-    checked: false,
+    checked: optimizedTestModeRelaxed,
     sellerClass: sellerClass || 'UNKNOWN',
-    reason: 'SellerClass ist nicht FBA.',
+    reason: 'SellerClass ist nicht fuer Optimierte Deals erlaubt.',
     fbmExcluded: false
   };
 }
@@ -4081,7 +4094,7 @@ function extractProductRole(title = '', features = []) {
     role = 'UNKNOWN';
   }
 
-  const result = {
+  let result = {
     role,
     reason: match?.reason || (role === 'MAIN_PRODUCT' ? 'Normales Hauptprodukt.' : 'Produktrolle nicht erkannt.'),
     matchedTerm: match?.term || '',
@@ -4174,12 +4187,7 @@ function compareSimilarProductRoles({
 }
 
 function isOptimizedVariationSellerAllowed(sellerClass = '', testMode = false) {
-  const normalizedSellerClass = normalizeSimilarSellerClass(sellerClass);
-  return (
-    normalizedSellerClass === 'AMAZON_DIRECT' ||
-    normalizedSellerClass === 'FBA' ||
-    (testMode === true && normalizedSellerClass === 'FBA_OR_AMAZON_UNKNOWN')
-  );
+  return isAllowedSimilarOptimizedSellerClass(sellerClass);
 }
 
 function resolveSimilarVariantLabel(variant = {}) {
@@ -4213,6 +4221,527 @@ function extractSimilarVariantDebugDetails(variant = {}) {
     color: resolveAttributeValue([/color/, /farbe/, /colour/]) || '',
     size: resolveAttributeValue([/size/, /groesse/, /größe/, /dimension/]) || '',
     model: resolveAttributeValue([/model/, /modell/, /style/, /ausfuehrung/, /ausführung/]) || ''
+  };
+}
+
+function getConfiguredSimilarVariantLimit(defaultLimit = 10) {
+  const parsed = Number.parseInt(process.env.SIMILAR_VARIANT_LIMIT || String(defaultLimit), 10);
+  const normalized = Number.isFinite(parsed) && parsed > 0 ? parsed : defaultLimit;
+  return Math.max(1, Math.min(10, normalized));
+}
+
+function getConfiguredBrowserVariantVisibleLimit(defaultLimit = 12) {
+  const parsed = Number.parseInt(process.env.AMAZON_BROWSER_VARIANT_VISIBLE_LIMIT || String(defaultLimit), 10);
+  const normalized = Number.isFinite(parsed) && parsed > 0 ? parsed : defaultLimit;
+  return Math.max(1, Math.min(12, normalized));
+}
+
+function getConfiguredBrowserVariantEnrichLimit(defaultLimit = 3) {
+  const parsed = Number.parseInt(process.env.SIMILAR_ENRICH_LIMIT || String(defaultLimit), 10);
+  const normalized = Number.isFinite(parsed) && parsed > 0 ? parsed : defaultLimit;
+  return Math.max(1, Math.min(3, normalized));
+}
+
+function isBrowserVariantScanEnabled() {
+  return process.env.AMAZON_BROWSER_VARIANT_SCAN_ENABLED === '1';
+}
+
+function decodeVariantHtml(value = '') {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function stripVariantHtml(value = '') {
+  return decodeVariantHtml(String(value || ''))
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function resolveVariantBrowserUrl(value = '', baseUrl = '') {
+  const trimmed = decodeVariantHtml(cleanText(value));
+  if (!trimmed) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith('//')) {
+    return `https:${trimmed}`;
+  }
+
+  try {
+    return new URL(trimmed, baseUrl || 'https://www.amazon.de/').toString();
+  } catch {
+    return '';
+  }
+}
+
+function buildVariantAttributesFromBrowserLabel(label = '') {
+  const normalizedLabel = cleanText(label);
+  if (!normalizedLabel) {
+    return [];
+  }
+
+  const sizeMatch = normalizedLabel.match(
+    /\b((?:\d{2,3}(?:[.,]\d+)?\s?(?:EU|cm|mm|ml|l)|(?:XXS|XS|S|M|L|XL|XXL|XXXL)|W\d+\s*\/\s*L\d+|Gr\.\s*[A-Z0-9]+))\b/i
+  );
+  const colorCandidate = normalizedLabel
+    .replace(sizeMatch?.[0] || '', ' ')
+    .replace(/[()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const attributes = [];
+
+  if (colorCandidate) {
+    attributes.push({ name: 'Color', value: colorCandidate });
+  }
+  if (sizeMatch?.[1]) {
+    attributes.push({ name: 'Size', value: cleanText(sizeMatch[1]) });
+  }
+  if (!attributes.length) {
+    attributes.push({ name: 'Variant', value: normalizedLabel });
+  }
+
+  return attributes;
+}
+
+function extractBrowserVariantPriceValue(snippet = '') {
+  const wholeMatch = snippet.match(/a-price-whole[^>]*>\s*([^<]+)\s*</i)?.[1];
+  const fractionMatch = snippet.match(/a-price-fraction[^>]*>\s*([^<]+)\s*</i)?.[1];
+  if (wholeMatch && fractionMatch) {
+    return parseTelegramLocalizedNumber(`${stripVariantHtml(wholeMatch)},${stripVariantHtml(fractionMatch)}`);
+  }
+
+  const rawPriceText =
+    snippet.match(/a-offscreen[^>]*>\s*([^<]*?(?:€|EUR)[^<]*)\s*</i)?.[1] ||
+    snippet.match(/\"displayAmount\"\s*:\s*\"([^\"]+)\"/i)?.[1] ||
+    snippet.match(/\"priceToPay\"\s*:\s*\{\"displayAmount\"\s*:\s*\"([^\"]+)\"/i)?.[1] ||
+    '';
+
+  return parseTelegramLocalizedNumber(stripVariantHtml(rawPriceText));
+}
+
+function extractBrowserVariantLabel(snippet = '') {
+  const rawLabel =
+    snippet.match(/\baria-label=["']([^"']+)["']/i)?.[1] ||
+    snippet.match(/\btitle=["']([^"']+)["']/i)?.[1] ||
+    snippet.match(/\balt=["']([^"']+)["']/i)?.[1] ||
+    snippet.match(/data-a-button-text=["']([^"']+)["']/i)?.[1] ||
+    snippet.match(/<span[^>]*class=["'][^"']*a-button-text[^"']*["'][^>]*>\s*([\s\S]*?)<\/span>/i)?.[1] ||
+    snippet.match(/<span[^>]*class=["'][^"']*(?:twisterTextDiv|inline-twister-dim-title)[^"']*["'][^>]*>\s*([\s\S]*?)<\/span>/i)?.[1] ||
+    '';
+
+  return stripVariantHtml(rawLabel)
+    .replace(/\b(?:farbe|color|groesse|größe|size|style|modell|model)\s*[:|-]?\s*/gi, '')
+    .replace(/\b(?:zum produkt|auswaehlen|auswählen|click to select|tap to select)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractVisibleAmazonVariantOffersFromHtml(html = '', options = {}) {
+  const sourceHtml = typeof html === 'string' ? html : '';
+  const baseUrl = cleanText(options.baseUrl);
+  const limit = getConfiguredBrowserVariantVisibleLimit(options.limit || 12);
+  const variants = [];
+  const seenAsins = new Set();
+  const matchPattern =
+    /(?:data-defaultasin|data-asin|data-dp-url|href)=["'][^"']*(?:\/dp\/|\/gp\/product\/)?([A-Z0-9]{10})[^"']*["']/gi;
+
+  for (const match of sourceHtml.matchAll(matchPattern)) {
+    if (variants.length >= limit) {
+      break;
+    }
+
+    const asin = cleanText(match?.[1]).toUpperCase();
+    if (!asin || seenAsins.has(asin)) {
+      continue;
+    }
+
+    const index = typeof match.index === 'number' ? match.index : -1;
+    if (index < 0) {
+      continue;
+    }
+
+    const snippet = sourceHtml.slice(Math.max(0, index - 260), Math.min(sourceHtml.length, index + 900));
+    if (!/(twister|swatch|variation|dimension|inline-twister|size_name|color_name|style_name|a-button-text)/i.test(snippet)) {
+      continue;
+    }
+
+    const hrefCandidate =
+      snippet.match(/\bdata-dp-url=["']([^"']+)["']/i)?.[1] ||
+      snippet.match(/\bhref=["']([^"']*(?:\/dp\/|\/gp\/product\/)[^"']+)["']/i)?.[1] ||
+      '';
+    const resolvedUrl = resolveVariantBrowserUrl(hrefCandidate || `/dp/${asin}`, baseUrl);
+    const priceValue = extractBrowserVariantPriceValue(snippet);
+    const label = extractBrowserVariantLabel(snippet);
+
+    if (!Number.isFinite(priceValue) || priceValue <= 0) {
+      continue;
+    }
+
+    variants.push({
+      asin,
+      title: label,
+      variationLabel: label,
+      variationAttributes: buildVariantAttributesFromBrowserLabel(label),
+      priceValue,
+      priceDisplay: formatPrice(priceValue),
+      normalizedUrl: resolvedUrl,
+      detailPageUrl: resolvedUrl,
+      affiliateUrl: resolvedUrl,
+      imageUrl: '',
+      dataSource: 'amazon_browser_visible_variants'
+    });
+    seenAsins.add(asin);
+  }
+
+  return variants;
+}
+
+function buildOptimizedCandidateFromSimilarCheck(similarCheck = {}) {
+  const baseCandidate =
+    similarCheck?.candidate && typeof similarCheck.candidate === 'object'
+      ? {
+          ...similarCheck.candidate
+        }
+      : {};
+  const inferredSellerClass = normalizeSimilarSellerClass(
+    similarCheck.optimizedSellerClass || similarCheck.similarCheaperSellerClass || baseCandidate.sellerClass || baseCandidate.sellerType
+  );
+  const inferredMerchantName =
+    cleanText(similarCheck.optimizedMerchantName || similarCheck.similarCheaperMerchantName || baseCandidate.merchantName) ||
+    (inferredSellerClass === 'AMAZON_DIRECT' ? 'Amazon' : '');
+  const inferredAmazonFulfilled =
+    similarCheck.optimizedIsAmazonFulfilled ??
+    similarCheck.similarCheaperIsAmazonFulfilled ??
+    baseCandidate.isAmazonFulfilled ??
+    (inferredSellerClass === 'FBA_PREMIUM' ? true : false);
+  const inferredPrimeEligible =
+    similarCheck.optimizedIsPrimeEligible ??
+    similarCheck.similarCheaperIsPrimeEligible ??
+    baseCandidate.isPrimeEligible ??
+    (inferredSellerClass === 'FBA_UNKNOWN' ? true : false);
+
+  return {
+    ...baseCandidate,
+    asin: cleanText(similarCheck.optimizedAsin || similarCheck.similarCheaperAsin || baseCandidate.asin).toUpperCase(),
+    title: cleanText(similarCheck.optimizedTitle || similarCheck.similarCheaperTitle || baseCandidate.title),
+    priceValue: resolveFirstSimilarPositivePrice(
+      similarCheck.optimizedPriceValue,
+      similarCheck.similarCheaperPriceValue,
+      baseCandidate.priceValue,
+      baseCandidate.priceDisplay,
+      similarCheck.optimizedPrice,
+      similarCheck.similarCheaperPrice
+    ),
+    priceDisplay:
+      cleanText(similarCheck.optimizedPrice || similarCheck.similarCheaperPrice || baseCandidate.priceDisplay) ||
+      formatPrice(
+        resolveFirstSimilarPositivePrice(
+          similarCheck.optimizedPriceValue,
+          similarCheck.similarCheaperPriceValue,
+          baseCandidate.priceValue,
+          baseCandidate.priceDisplay
+        ) || 0
+      ),
+    normalizedUrl: cleanText(similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl || baseCandidate.normalizedUrl || baseCandidate.detailPageUrl),
+    detailPageUrl: cleanText(baseCandidate.detailPageUrl || similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl),
+    affiliateUrl: cleanText(similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl || baseCandidate.affiliateUrl),
+    imageUrl: cleanText(similarCheck.optimizedImageUrl || resolveOptimizedCandidateImageUrl(baseCandidate)),
+    sellerClass: inferredSellerClass,
+    sellerType: inferredSellerClass,
+    merchantName: inferredMerchantName,
+    sellerSource: cleanText(similarCheck.optimizedSellerSource || similarCheck.similarCheaperSellerSource || baseCandidate.sellerSource),
+    isAmazonFulfilled: inferredAmazonFulfilled === true,
+    isPrimeEligible: inferredPrimeEligible === true,
+    rawSellerKeysFound:
+      similarCheck.optimizedRawSellerKeysFound ||
+      similarCheck.similarCheaperRawSellerKeysFound ||
+      baseCandidate.rawSellerKeysFound ||
+      [],
+    availability: cleanText(baseCandidate.availability || similarCheck.similarCheaperShipping),
+    variationLabel: cleanText(similarCheck.variantLabel || baseCandidate.variationLabel)
+  };
+}
+
+function buildOriginalProfileForFinalOffer(originalDeal = {}, similarCheck = {}) {
+  if (originalDeal?.originalProfile && typeof originalDeal.originalProfile === 'object') {
+    return originalDeal.originalProfile;
+  }
+
+  if (originalDeal?.generatorInput || originalDeal?.scrapedDeal) {
+    return buildSimilarProductProfile(originalDeal.generatorInput || {}, originalDeal.scrapedDeal || {});
+  }
+
+  const originalTitle = cleanText(similarCheck.originalTitle || originalDeal.title);
+  const originalPrice = resolveFirstSimilarPositivePrice(
+    similarCheck.originalPriceValue,
+    similarCheck.originalPrice,
+    originalDeal.price,
+    originalDeal.currentPrice
+  );
+  const originalFeatures = Array.isArray(originalDeal.features) ? originalDeal.features : [];
+  const originalItemInfo = originalDeal.itemInfo && typeof originalDeal.itemInfo === 'object' ? originalDeal.itemInfo : {};
+
+  return {
+    asin: cleanText(similarCheck.originalAsin || originalDeal.asin).toUpperCase(),
+    title: originalTitle,
+    brand: cleanText(originalDeal.brand || resolveSourceBrandCandidate(originalTitle)),
+    price: originalPrice,
+    quantityInfo:
+      similarCheck.originalQuantityInfo || extractQuantityInfo(originalTitle, originalFeatures, originalItemInfo),
+    productRoleInfo:
+      similarCheck.originalProductRoleInfo || extractProductRole(originalTitle, originalFeatures),
+    productTypeTokens: resolveSimilarProductTypeTokens(originalTitle),
+    coreFeatureTokens: resolveSimilarCoreFeatureTokens(originalTitle, originalFeatures)
+  };
+}
+
+function buildOriginalProductFamilyCandidate({
+  originalProfile = {},
+  generatorInput = {},
+  scrapedDeal = {},
+  originalSellerDebug = {},
+  eligibility = {},
+  originalDataSources = {}
+} = {}) {
+  const asin = cleanText(originalProfile.asin).toUpperCase();
+  const fallbackUrl =
+    cleanText(
+      generatorInput?.normalizedUrl ||
+        generatorInput?.productUrl ||
+        generatorInput?.link ||
+        originalDataSources?.originalUrl
+    ) || buildAmazonAffiliateLinkRecord(asin, { asin }).normalizedUrl;
+  const linkRecord = buildAmazonAffiliateLinkRecord(fallbackUrl || asin, {
+    asin
+  });
+  const sellerClass = normalizeSimilarSellerClass(eligibility?.sellerClass || generatorInput?.sellerClass || generatorInput?.sellerType);
+  const merchantNameRaw =
+    cleanText(originalSellerDebug?.merchantName) ||
+    cleanText(generatorInput?.amazonMerchantName || generatorInput?.merchantName || scrapedDeal?.merchantName);
+  const merchantName = merchantNameRaw && merchantNameRaw !== 'fehlt' ? merchantNameRaw : sellerClass === 'AMAZON_DIRECT' ? 'Amazon' : '';
+  const rawSellerKeysFound = Array.isArray(originalSellerDebug?.rawSellerKeysFound) ? originalSellerDebug.rawSellerKeysFound : [];
+  const featureCandidates = Array.isArray(generatorInput?.features)
+    ? generatorInput.features
+    : Array.isArray(generatorInput?.bulletPoints)
+      ? generatorInput.bulletPoints
+      : Array.isArray(scrapedDeal?.bulletPoints)
+        ? scrapedDeal.bulletPoints
+        : Array.isArray(scrapedDeal?.features)
+          ? scrapedDeal.features
+          : [];
+
+  return {
+    asin,
+    title: cleanText(originalProfile.title),
+    brand: cleanText(originalProfile.brand),
+    priceValue: normalizeSimilarPositivePrice(originalProfile.price),
+    priceDisplay: originalProfile.price === null ? '' : formatPrice(originalProfile.price),
+    normalizedUrl: linkRecord.valid ? linkRecord.normalizedUrl : fallbackUrl,
+    detailPageUrl: fallbackUrl,
+    affiliateUrl: linkRecord.valid ? linkRecord.affiliateUrl : fallbackUrl,
+    imageUrl: cleanText(
+      generatorInput?.imageUrl ||
+        generatorInput?.productImage ||
+        generatorInput?.image ||
+        scrapedDeal?.imageUrl ||
+        scrapedDeal?.image ||
+        ''
+    ),
+    merchantName,
+    isAmazonFulfilled:
+      generatorInput?.shippedByAmazon === true ||
+      sellerClass === 'FBA' ||
+      sellerClass === 'FBA_PREMIUM',
+    isPrimeEligible:
+      generatorInput?.isPrimeEligible === true ||
+      generatorInput?.prime === true ||
+      sellerClass === 'FBA_UNKNOWN',
+    sellerClass,
+    sellerType: sellerClass,
+    sellerSource: cleanText(originalSellerDebug?.sellerSource),
+    rawSellerKeysFound,
+    features: featureCandidates
+  };
+}
+
+function buildSameFamilySimilarCheckSeed({
+  originalProfile = {},
+  originalCandidate = {},
+  originalDataSources = {},
+  originalSellerDebug = {},
+  eligibility = {},
+  productIntelligenceProfile = null,
+  baselineResult = null,
+  strictScoreThreshold = SIMILAR_PRODUCT_MIN_SCORE,
+  minimumPostScoreThreshold = SIMILAR_PRODUCT_MIN_SCORE,
+  shortQuery = ''
+} = {}) {
+  const originalPriceText = originalProfile.price === null ? 'n/a' : formatPrice(originalProfile.price);
+  const sellerClass = normalizeSimilarSellerClass(eligibility?.sellerClass || originalCandidate?.sellerClass || 'UNKNOWN');
+  const sellerSource = cleanText(originalSellerDebug?.sellerSource || originalCandidate?.sellerSource);
+  const merchantName = cleanText(originalCandidate?.merchantName || originalSellerDebug?.merchantName);
+
+  return {
+    checked: true,
+    allowed: true,
+    similarCheaperFound: false,
+    fbmExcluded: false,
+    sellerClass,
+    sourceTelegramText: cleanText(originalDataSources.sourceTelegramText),
+    sourceGroup: cleanText(originalDataSources.sourceGroup),
+    originalTitle: cleanText(originalProfile.title),
+    originalPrice: originalPriceText,
+    originalPriceValue: normalizeSimilarPositivePrice(originalProfile.price),
+    originalUrl: cleanText(originalDataSources.originalUrl),
+    originalAsin: cleanText(originalDataSources.originalAsin || originalProfile.asin).toUpperCase(),
+    originalSourceGroup: cleanText(originalDataSources.sourceGroup),
+    sellerSource,
+    merchantName: merchantName || '',
+    amazonFulfilledLabel: cleanText(originalSellerDebug?.amazonFulfilledLabel),
+    primeLabel: cleanText(originalSellerDebug?.primeLabel),
+    rawSellerKeysFound: Array.isArray(originalSellerDebug?.rawSellerKeysFound) ? originalSellerDebug.rawSellerKeysFound : [],
+    optimizedTitle: cleanText(originalCandidate.title),
+    optimizedPrice: originalPriceText,
+    optimizedPriceValue: normalizeSimilarPositivePrice(originalProfile.price),
+    optimizedAsin: cleanText(originalCandidate.asin).toUpperCase(),
+    optimizedAffiliateUrl: cleanText(originalCandidate.affiliateUrl),
+    optimizedImageUrl: cleanText(originalCandidate.imageUrl),
+    optimizedSellerClass: sellerClass,
+    optimizedSellerSource: sellerSource,
+    optimizedMerchantName: merchantName || '',
+    optimizedIsAmazonFulfilled: originalCandidate.isAmazonFulfilled === true,
+    optimizedIsPrimeEligible: originalCandidate.isPrimeEligible === true,
+    optimizedRawSellerKeysFound: originalCandidate.rawSellerKeysFound || [],
+    similarCheaperPrice: originalPriceText,
+    similarCheaperPriceValue: normalizeSimilarPositivePrice(originalProfile.price),
+    similarCheaperAsin: cleanText(originalCandidate.asin).toUpperCase(),
+    similarCheaperTitle: cleanText(originalCandidate.title),
+    similarCheaperSellerClass: sellerClass,
+    similarCheaperSellerSource: sellerSource,
+    similarCheaperMerchantName: merchantName || '',
+    similarCheaperIsAmazonFulfilled: originalCandidate.isAmazonFulfilled === true,
+    similarCheaperIsPrimeEligible: originalCandidate.isPrimeEligible === true,
+    similarCheaperRawSellerKeysFound: originalCandidate.rawSellerKeysFound || [],
+    affiliateUrl: cleanText(originalCandidate.affiliateUrl),
+    amazonApiTitle: cleanText(originalCandidate.title),
+    amazonAsin: cleanText(originalCandidate.asin).toUpperCase(),
+    amazonMerchantName: merchantName || '',
+    amazonIsAmazonFulfilled: originalCandidate.isAmazonFulfilled === true,
+    amazonIsPrimeEligible: originalCandidate.isPrimeEligible === true,
+    amazonSellerClass: sellerClass,
+    amazonSellerSource: sellerSource,
+    candidateCount: 0,
+    bestScore: 100,
+    differenceAmount: formatPrice(0),
+    differencePercent: 0,
+    priceValid: normalizeSimilarPositivePrice(originalProfile.price) !== null,
+    rawPriceObject: resolveSimilarCandidateRawPriceObject(originalCandidate),
+    extractedPrice: normalizeSimilarPositivePrice(originalProfile.price),
+    softOptimizedDeal: false,
+    strictScoreThreshold,
+    minimumPostScoreThreshold,
+    similarSearchQuery: 'same_product_family',
+    similarSearchQueryType: 'product_family',
+    productIntelligence: productIntelligenceProfile,
+    baselineMaster: baselineResult?.master || null,
+    baselineResult,
+    query: 'same_product_family',
+    shortQuery,
+    candidate: {
+      ...originalCandidate
+    }
+  };
+}
+
+function evaluateFinalOfferCandidate({
+  offerCandidate = {},
+  originalProfile = {},
+  comparisonPrice = null,
+  testMode = false,
+  minimumDifferencePercent = 3
+} = {}) {
+  const candidatePrice = resolveSimilarCandidatePrice(offerCandidate);
+  const comparisonPriceValue = resolveFirstSimilarPositivePrice(comparisonPrice, originalProfile.price);
+  const sellerDetection = detectSimilarSellerClass(offerCandidate, { testMode });
+  const candidateRoleInfo = extractProductRole(offerCandidate.title, offerCandidate.features || []);
+  const productRoleComparison = compareSimilarProductRoles({
+    originalRoleInfo: originalProfile.productRoleInfo,
+    candidateRoleInfo,
+    originalTitle: originalProfile.title,
+    candidateTitle: offerCandidate.title,
+    candidateAsin: offerCandidate.asin
+  });
+  const candidateQuantityInfo = extractQuantityInfo(
+    offerCandidate.title,
+    offerCandidate.features || [],
+    offerCandidate.rawItem?.ItemInfo || offerCandidate.rawItem?.itemInfo || offerCandidate.rawItem || offerCandidate
+  );
+  const quantityComparison = compareSimilarQuantityInfo({
+    originalQuantityInfo: originalProfile.quantityInfo,
+    candidateQuantityInfo,
+    originalPrice: originalProfile.price,
+    candidatePrice,
+    originalTitle: originalProfile.title,
+    candidateTitle: offerCandidate.title,
+    candidateAsin: offerCandidate.asin
+  });
+  const scoring = scoreSimilarProductCandidate(originalProfile, offerCandidate, {
+    testMode,
+    sellerDetection
+  });
+  const differenceAmount =
+    Number.isFinite(comparisonPriceValue) && Number.isFinite(candidatePrice)
+      ? Math.max(0, comparisonPriceValue - candidatePrice)
+      : 0;
+  const differencePercent =
+    Number.isFinite(comparisonPriceValue) && comparisonPriceValue > 0 && Number.isFinite(candidatePrice)
+      ? Math.round((differenceAmount / comparisonPriceValue) * 1000) / 10
+      : 0;
+  let rejectReason = '';
+
+  if (candidatePrice === null || comparisonPriceValue === null) {
+    rejectReason = 'PRICE_MISSING';
+  } else if (!isOptimizedVariationSellerAllowed(sellerDetection.sellerClass, testMode)) {
+    rejectReason =
+      sellerDetection.sellerClass === 'FBM'
+        ? 'candidate_is_fbm'
+        : sellerDetection.sellerClass === 'UNKNOWN'
+          ? 'SELLER_UNKNOWN_NOT_ALLOWED'
+          : 'SELLER_NOT_ALLOWED';
+  } else if (!productRoleComparison.allowed) {
+    rejectReason = 'PRODUCT_ROLE_MISMATCH';
+  } else if (!quantityComparison.allowed) {
+    rejectReason = 'PACK_SIZE_MISMATCH';
+  } else if (scoring.score < SIMILAR_PRODUCT_MIN_SCORE) {
+    rejectReason = 'SIMILARITY_TOO_LOW';
+  } else if (candidatePrice >= comparisonPriceValue) {
+    rejectReason = 'PRICE_NOT_CHEAPER';
+  } else if (differencePercent < minimumDifferencePercent) {
+    rejectReason = 'SAVING_TOO_LOW';
+  }
+
+  return {
+    allowed: !rejectReason,
+    rejectReason,
+    candidatePrice,
+    comparisonPrice: comparisonPriceValue,
+    differenceAmount,
+    differencePercent,
+    sellerDetection,
+    candidateRoleInfo,
+    candidateQuantityInfo,
+    productRoleComparison,
+    quantityComparison,
+    scoring
   };
 }
 
@@ -4315,10 +4844,25 @@ async function findCheapestAllowedVariation({
   sessionName = '',
   sourceId = null,
   messageId = '',
-  variationLoader = loadAmazonAffiliateVariations
+  variationLoader = loadAmazonAffiliateVariations,
+  variationSource = 'api',
+  includeMeta = false
 } = {}) {
   if ((process.env.SIMILAR_VARIANT_CHECK_ENABLED || '0') !== '1') {
-    return null;
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      source: cleanText(variationSource).toLowerCase() || 'api',
+      reason: 'SIMILAR_VARIANT_CHECK_DISABLED'
+    });
+    return includeMeta
+      ? {
+          variantPayload: null,
+          variantScanUsed: false,
+          variantScanSource: 'skipped',
+          checkedVariantCount: 0,
+          rejectReason: '',
+          skipReason: 'SIMILAR_VARIANT_CHECK_DISABLED'
+        }
+      : null;
   }
 
   const candidateAsin = cleanText(finalCandidate.asin || currentResult.optimizedAsin || currentResult.similarCheaperAsin).toUpperCase();
@@ -4329,9 +4873,26 @@ async function findCheapestAllowedVariation({
       currentResult.similarCheaperPriceValue ||
       currentResult.similarCheaperPrice
   );
-  const variantLimit = Math.max(1, Math.min(10, Number.parseInt(process.env.SIMILAR_VARIANT_LIMIT || '10', 10) || 10));
+  const variantLimit = getConfiguredSimilarVariantLimit();
   if (!candidateAsin || currentPrice === null) {
-    return null;
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin || '',
+      source: cleanText(variationSource).toLowerCase() || 'api',
+      reason: !candidateAsin ? 'MISSING_CANDIDATE_ASIN' : 'PRICE_MISSING'
+    });
+    return includeMeta
+      ? {
+          variantPayload: null,
+          variantScanUsed: false,
+          variantScanSource: 'skipped',
+          checkedVariantCount: 0,
+          rejectReason: '',
+          skipReason: !candidateAsin ? 'MISSING_CANDIDATE_ASIN' : 'PRICE_MISSING'
+        }
+      : null;
   }
 
   console.info('[VARIANT_CHECK_START]', {
@@ -4342,13 +4903,70 @@ async function findCheapestAllowedVariation({
     currentPrice: formatPrice(currentPrice),
     limit: variantLimit
   });
+  console.info('[VARIANT_SCAN_START]', {
+    sessionName,
+    sourceId,
+    messageId,
+    asin: candidateAsin,
+    currentPrice: formatPrice(currentPrice),
+    limit: variantLimit,
+    source: cleanText(variationSource).toLowerCase() || 'api'
+  });
 
   const variationResult = await variationLoader({
     asin: candidateAsin,
     limit: variantLimit
   });
+  const requestedVariationSource = cleanText(variationSource).toLowerCase();
+  const resolvedVariationSource =
+    requestedVariationSource === 'browser'
+      ? 'browser'
+      : requestedVariationSource === 'creator'
+        ? 'creator'
+        : requestedVariationSource === 'paapi'
+          ? 'paapi'
+          : variationResult.cacheHit
+            ? 'cache'
+            : 'api';
+
+  if (resolvedVariationSource === 'browser') {
+    console.info('[VARIANT_SCAN_BROWSER_USED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin,
+      status: variationResult.status || 'success',
+      count: Array.isArray(variationResult.items) ? variationResult.items.length : 0
+    });
+  } else if (variationResult.cacheHit) {
+    console.info('[VARIANT_SCAN_CACHE_HIT]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin,
+      status: variationResult.status || 'cache_hit',
+      count: Array.isArray(variationResult.items) ? variationResult.items.length : 0
+    });
+  } else {
+    console.info('[VARIANT_SCAN_API_USED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin,
+      status: variationResult.status || 'success',
+      count: Array.isArray(variationResult.items) ? variationResult.items.length : 0
+    });
+  }
 
   if (variationResult.status === 'throttled') {
+    console.warn('[VARIANT_SCAN_ABORT]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: candidateAsin,
+      status: 'throttled',
+      source: resolvedVariationSource
+    });
     console.info('[VARIANT_SCAN_DONE]', {
       sessionName,
       sourceId,
@@ -4357,7 +4975,16 @@ async function findCheapestAllowedVariation({
       status: 'throttled',
       action: 'keep_original_candidate'
     });
-    return null;
+    return includeMeta
+      ? {
+          variantPayload: null,
+          variantScanUsed: true,
+          variantScanSource: resolvedVariationSource,
+          checkedVariantCount: 0,
+          rejectReason: 'API_THROTTLED',
+          skipReason: 'API_THROTTLED'
+        }
+      : null;
   }
 
   const variants = Array.isArray(variationResult.items) ? variationResult.items : [];
@@ -4365,54 +4992,17 @@ async function findCheapestAllowedVariation({
 
   for (const variant of variants) {
     const variantAsin = cleanText(variant.asin).toUpperCase();
-    const variantPrice = resolveSimilarCandidatePrice(variant);
+    const evaluation = evaluateFinalOfferCandidate({
+      offerCandidate: variant,
+      originalProfile,
+      comparisonPrice: currentPrice,
+      testMode,
+      minimumDifferencePercent: 0
+    });
+    const variantPrice = evaluation.candidatePrice;
     const variantPriceValid = Number.isFinite(variantPrice) && variantPrice > 0;
     const variantDebug = extractSimilarVariantDebugDetails(variant);
-    const sellerDetection = detectSimilarSellerClass(variant, { testMode });
-    const sellerAllowed = isOptimizedVariationSellerAllowed(sellerDetection.sellerClass, testMode);
-    const candidateRoleInfo = extractProductRole(variant.title, variant.features || []);
-    const productRoleComparison = compareSimilarProductRoles({
-      originalRoleInfo: originalProfile.productRoleInfo,
-      candidateRoleInfo,
-      originalTitle: originalProfile.title,
-      candidateTitle: variant.title,
-      candidateAsin: variantAsin
-    });
-    const candidateQuantityInfo = extractQuantityInfo(
-      variant.title,
-      variant.features || [],
-      variant.rawItem?.ItemInfo || variant.rawItem?.itemInfo || variant.rawItem || variant
-    );
-    const quantityComparison = compareSimilarQuantityInfo({
-      originalQuantityInfo: originalProfile.quantityInfo,
-      candidateQuantityInfo,
-      originalPrice: originalProfile.price,
-      candidatePrice: variantPrice,
-      originalTitle: originalProfile.title,
-      candidateTitle: variant.title,
-      candidateAsin: variantAsin
-    });
-    const scoring = scoreSimilarProductCandidate(originalProfile, variant, {
-      testMode,
-      sellerDetection
-    });
-    let rejectReason = '';
-
-    if (!variantPriceValid) {
-      rejectReason = 'PRICE_MISSING';
-    } else if (variantPrice >= currentPrice) {
-      rejectReason = 'PRICE_NOT_CHEAPER';
-    } else if (!sellerAllowed) {
-      rejectReason = sellerDetection.sellerClass === 'FBM' ? 'candidate_is_fbm' : 'SELLER_NOT_ALLOWED';
-    } else if (!productRoleComparison.allowed) {
-      rejectReason = 'PRODUCT_ROLE_MISMATCH';
-    } else if (!quantityComparison.allowed) {
-      rejectReason = 'PACK_SIZE_MISMATCH';
-    } else if (scoring.score < SIMILAR_PRODUCT_MIN_SCORE) {
-      rejectReason = 'SIMILARITY_TOO_LOW';
-    }
-
-    const allowed = !rejectReason;
+    const allowed = evaluation.allowed === true;
     const label = resolveSimilarVariantLabel(variant);
     console.info('[VARIANT_FOUND]', {
       asin: variantAsin,
@@ -4421,9 +5011,20 @@ async function findCheapestAllowedVariation({
       color: variantDebug.color || '',
       size: variantDebug.size || '',
       model: variantDebug.model || '',
-      sellerClass: sellerDetection.sellerClass,
+      sellerClass: evaluation.sellerDetection.sellerClass,
       allowed,
-      rejectReason
+      rejectReason: evaluation.rejectReason
+    });
+    console.info('[VARIANT_CANDIDATE_SEEN]', {
+      asin: variantAsin,
+      label,
+      price: variantPriceValid ? formatPrice(variantPrice) : null,
+      color: variantDebug.color || '',
+      size: variantDebug.size || '',
+      model: variantDebug.model || '',
+      sellerClass: evaluation.sellerDetection.sellerClass,
+      allowed,
+      rejectReason: evaluation.rejectReason
     });
     console.info('[VARIANT_CANDIDATE]', {
       asin: variantAsin,
@@ -4432,13 +5033,31 @@ async function findCheapestAllowedVariation({
       color: variantDebug.color || '',
       size: variantDebug.size || '',
       model: variantDebug.model || '',
-      sellerClass: sellerDetection.sellerClass,
+      sellerClass: evaluation.sellerDetection.sellerClass,
       allowed,
-      rejectReason,
-      similarityScore: scoring.score,
-      productRole: productRoleComparison.candidateRoleLabel || '',
-      quantity: quantityComparison.candidateQuantityLabel || ''
+      rejectReason: evaluation.rejectReason,
+      similarityScore: evaluation.scoring.score,
+      productRole: evaluation.productRoleComparison.candidateRoleLabel || '',
+      quantity: evaluation.quantityComparison.candidateQuantityLabel || ''
     });
+    if (evaluation.rejectReason === 'PACK_SIZE_MISMATCH') {
+      console.info('[PACK_SIZE_MISMATCH]', {
+        asin: variantAsin,
+        label,
+        price: variantPriceValid ? formatPrice(variantPrice) : null,
+        source: resolvedVariationSource,
+        detail: evaluation.quantityComparison.reason || ''
+      });
+    }
+    if (evaluation.rejectReason === 'PRODUCT_ROLE_MISMATCH') {
+      console.info('[PRODUCT_ROLE_MISMATCH]', {
+        asin: variantAsin,
+        label,
+        price: variantPriceValid ? formatPrice(variantPrice) : null,
+        source: resolvedVariationSource,
+        detail: evaluation.productRoleComparison.reason || ''
+      });
+    }
 
     if (!allowed) {
       continue;
@@ -4449,10 +5068,10 @@ async function findCheapestAllowedVariation({
         variant,
         variantPrice,
         label,
-        sellerDetection,
-        scoring,
-        productRoleComparison,
-        quantityComparison,
+        sellerDetection: evaluation.sellerDetection,
+        scoring: evaluation.scoring,
+        productRoleComparison: evaluation.productRoleComparison,
+        quantityComparison: evaluation.quantityComparison,
         reason: `Guenstigste erlaubte Variante gewaehlt: ${label}`
       };
     }
@@ -4460,6 +5079,18 @@ async function findCheapestAllowedVariation({
 
   if (bestVariantPayload && bestVariantPayload.variantPrice < currentPrice) {
     const bestVariantDebug = extractSimilarVariantDebugDetails(bestVariantPayload.variant);
+    console.info('[VARIANT_SCAN_SELECTED]', {
+      asin: cleanText(bestVariantPayload.variant.asin).toUpperCase(),
+      label: bestVariantPayload.label,
+      price: formatPrice(bestVariantPayload.variantPrice),
+      source: resolvedVariationSource
+    });
+    console.info('[CHEAPEST_VARIANT_SELECTED]', {
+      asin: cleanText(bestVariantPayload.variant.asin).toUpperCase(),
+      label: bestVariantPayload.label,
+      price: formatPrice(bestVariantPayload.variantPrice),
+      source: resolvedVariationSource
+    });
     console.info('[VARIANT_BEST_SELECTED]', {
       asin: cleanText(bestVariantPayload.variant.asin).toUpperCase(),
       label: bestVariantPayload.label,
@@ -4483,9 +5114,26 @@ async function findCheapestAllowedVariation({
       selectedAsin: cleanText(bestVariantPayload.variant.asin).toUpperCase(),
       label: bestVariantPayload.label
     });
-    return bestVariantPayload;
+    return includeMeta
+      ? {
+          variantPayload: bestVariantPayload,
+          variantScanUsed: true,
+          variantScanSource: resolvedVariationSource,
+          checkedVariantCount: variants.length,
+          rejectReason: ''
+        }
+      : bestVariantPayload;
   }
 
+  console.info('[VARIANT_SCAN_SKIPPED]', {
+    sessionName,
+    sourceId,
+    messageId,
+    asin: candidateAsin,
+    source: resolvedVariationSource,
+    reason: 'NO_CHEAPER_ALLOWED_VARIANT',
+    checkedVariantCount: variants.length
+  });
   console.info('[VARIANT_SCAN_DONE]', {
     sessionName,
     sourceId,
@@ -4494,7 +5142,718 @@ async function findCheapestAllowedVariation({
     status: 'no_cheaper_allowed_variant',
     count: variants.length
   });
-  return null;
+  return includeMeta
+    ? {
+        variantPayload: null,
+        variantScanUsed: true,
+        variantScanSource: resolvedVariationSource,
+        checkedVariantCount: variants.length,
+        rejectReason: '',
+        skipReason: 'NO_CHEAPER_ALLOWED_VARIANT'
+      }
+    : null;
+}
+
+async function findCheapestVisibleBrowserVariation({
+  finalCandidate = {},
+  originalProfile = {},
+  currentResult = {},
+  testMode = false,
+  sessionName = '',
+  sourceId = null,
+  messageId = '',
+  fetchImpl = global.fetch,
+  browserEnricher = enrichAmazonAffiliateProductsWithOfferData
+} = {}) {
+  if (!isBrowserVariantScanEnabled()) {
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      source: 'browser',
+      reason: 'BROWSER_SCAN_DISABLED'
+    });
+    return {
+      variantPayload: null,
+      variantScanUsed: false,
+      variantScanSource: 'skipped',
+      checkedVariantCount: 0,
+      rejectReason: '',
+      skipReason: 'BROWSER_SCAN_DISABLED'
+    };
+  }
+
+  if (typeof fetchImpl !== 'function') {
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      source: 'browser',
+      reason: 'BROWSER_FETCH_UNAVAILABLE'
+    });
+    return {
+      variantPayload: null,
+      variantScanUsed: false,
+      variantScanSource: 'skipped',
+      checkedVariantCount: 0,
+      rejectReason: '',
+      skipReason: 'BROWSER_FETCH_UNAVAILABLE'
+    };
+  }
+
+  const targetUrl =
+    cleanText(finalCandidate.normalizedUrl || finalCandidate.detailPageUrl || currentResult.optimizedAffiliateUrl || currentResult.affiliateUrl) ||
+    buildAmazonAffiliateLinkRecord(finalCandidate.asin, { asin: finalCandidate.asin }).normalizedUrl;
+  const currentPrice = resolveFirstSimilarPositivePrice(
+    currentResult.optimizedPriceValue,
+    finalCandidate.priceValue,
+    currentResult.similarCheaperPriceValue,
+    currentResult.optimizedPrice,
+    currentResult.similarCheaperPrice
+  );
+
+  if (!targetUrl || currentPrice === null) {
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(finalCandidate.asin).toUpperCase(),
+      source: 'browser',
+      reason: !targetUrl ? 'BROWSER_TARGET_URL_MISSING' : 'PRICE_MISSING'
+    });
+    return {
+      variantPayload: null,
+      variantScanUsed: false,
+      variantScanSource: 'skipped',
+      checkedVariantCount: 0,
+      rejectReason: '',
+      skipReason: !targetUrl ? 'BROWSER_TARGET_URL_MISSING' : 'PRICE_MISSING'
+    };
+  }
+
+  try {
+    const response = await fetchImpl(targetUrl, {
+      headers: AMAZON_SEARCH_FETCH_HEADERS
+    });
+
+    if (!response?.ok) {
+      console.warn('[VARIANT_SCAN_ABORT]', {
+        sessionName,
+        sourceId,
+        messageId,
+        asin: cleanText(finalCandidate.asin).toUpperCase(),
+        source: 'browser',
+        status: Number(response?.status) || 0
+      });
+      return {
+        variantPayload: null,
+        variantScanUsed: false,
+        variantScanSource: 'browser',
+        checkedVariantCount: 0,
+        rejectReason: '',
+        skipReason: `BROWSER_FETCH_${Number(response?.status) || 0}`
+      };
+    }
+
+    const html = await response.text();
+    const visibleVariants = extractVisibleAmazonVariantOffersFromHtml(html, {
+      baseUrl: response.url || targetUrl,
+      limit: getConfiguredBrowserVariantVisibleLimit()
+    })
+      .filter((variant) => resolveFirstSimilarPositivePrice(variant.priceValue) !== null)
+      .sort((left, right) => (left.priceValue || Number.POSITIVE_INFINITY) - (right.priceValue || Number.POSITIVE_INFINITY));
+
+    console.info('[VARIANT_SCAN_BROWSER_USED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(finalCandidate.asin).toUpperCase(),
+      targetUrl,
+      visibleCount: visibleVariants.length,
+      visibleLimit: getConfiguredBrowserVariantVisibleLimit()
+    });
+    console.info('[VARIANT_SCAN_VISIBLE_OPTIONS]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(finalCandidate.asin).toUpperCase(),
+      source: 'browser',
+      count: visibleVariants.length,
+      options: visibleVariants.slice(0, getConfiguredBrowserVariantVisibleLimit()).map((variant) => ({
+        asin: cleanText(variant.asin).toUpperCase(),
+        label: cleanText(variant.variationLabel || variant.title),
+        price: Number.isFinite(variant.priceValue) ? formatPrice(variant.priceValue) : null
+      }))
+    });
+
+    if (!visibleVariants.length) {
+      console.info('[VARIANT_SCAN_SKIPPED]', {
+        sessionName,
+        sourceId,
+        messageId,
+        asin: cleanText(finalCandidate.asin).toUpperCase(),
+        source: 'browser',
+        reason: 'NO_VISIBLE_BROWSER_VARIANTS'
+      });
+      return {
+        variantPayload: null,
+        variantScanUsed: true,
+        variantScanSource: 'browser',
+        checkedVariantCount: 0,
+        rejectReason: '',
+        skipReason: 'NO_VISIBLE_BROWSER_VARIANTS'
+      };
+    }
+
+    const cheaperVisibleVariants = visibleVariants.filter((variant) => Number.isFinite(variant.priceValue) && variant.priceValue < currentPrice);
+    if (!cheaperVisibleVariants.length) {
+      console.info('[VARIANT_SCAN_SKIPPED]', {
+        sessionName,
+        sourceId,
+        messageId,
+        asin: cleanText(finalCandidate.asin).toUpperCase(),
+        source: 'browser',
+        reason: 'NO_VISIBLE_CHEAPER_BROWSER_VARIANTS'
+      });
+      return {
+        variantPayload: null,
+        variantScanUsed: true,
+        variantScanSource: 'browser',
+        checkedVariantCount: visibleVariants.length,
+        rejectReason: '',
+        skipReason: 'NO_VISIBLE_CHEAPER_BROWSER_VARIANTS'
+      };
+    }
+
+    const enrichLimit = getConfiguredBrowserVariantEnrichLimit();
+    console.info('[VARIANT_SCAN_TOP_PRICES]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(finalCandidate.asin).toUpperCase(),
+      source: 'browser',
+      enrichLimit,
+      topVariants: cheaperVisibleVariants.slice(0, enrichLimit).map((variant) => ({
+        asin: cleanText(variant.asin).toUpperCase(),
+        label: cleanText(variant.variationLabel || variant.title),
+        price: Number.isFinite(variant.priceValue) ? formatPrice(variant.priceValue) : null
+      }))
+    });
+    const enrichedVisibleVariants = await browserEnricher(cheaperVisibleVariants.slice(0, enrichLimit), {
+      limit: enrichLimit
+    });
+    const mergedVisibleVariants = enrichedVisibleVariants.map((variant, index) => {
+      const fallbackVariant = cheaperVisibleVariants[index] || {};
+      return {
+        ...fallbackVariant,
+        ...variant,
+        asin: cleanText(variant?.asin || fallbackVariant.asin).toUpperCase(),
+        title: cleanText(variant?.title || fallbackVariant.title || finalCandidate.title),
+        priceValue: resolveFirstSimilarPositivePrice(variant?.priceValue, fallbackVariant.priceValue, variant?.priceDisplay),
+        variationLabel: cleanText(variant?.variationLabel || fallbackVariant.variationLabel),
+        variationAttributes:
+          Array.isArray(variant?.variationAttributes) && variant.variationAttributes.length
+            ? variant.variationAttributes
+            : fallbackVariant.variationAttributes || [],
+        normalizedUrl: cleanText(variant?.normalizedUrl || fallbackVariant.normalizedUrl),
+        detailPageUrl: cleanText(variant?.detailPageUrl || fallbackVariant.detailPageUrl),
+        affiliateUrl: cleanText(variant?.affiliateUrl || fallbackVariant.affiliateUrl),
+        imageUrl: cleanText(resolveOptimizedCandidateImageUrl(variant) || fallbackVariant.imageUrl || finalCandidate.imageUrl)
+      };
+    });
+
+    return findCheapestAllowedVariation({
+      finalCandidate,
+      originalProfile,
+      currentResult,
+      testMode,
+      sessionName,
+      sourceId,
+      messageId,
+      variationLoader: async () => ({
+        status: mergedVisibleVariants.length ? 'success' : 'no_hits',
+        cacheHit: false,
+        items: mergedVisibleVariants
+      }),
+      variationSource: 'browser',
+      includeMeta: true
+    });
+  } catch (error) {
+    console.warn('[VARIANT_SCAN_ABORT]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(finalCandidate.asin).toUpperCase(),
+      source: 'browser',
+      reason: error instanceof Error ? error.message : 'BROWSER_SCAN_FAILED'
+    });
+    return {
+      variantPayload: null,
+      variantScanUsed: false,
+      variantScanSource: 'browser',
+      checkedVariantCount: 0,
+      rejectReason: '',
+      skipReason: error instanceof Error ? error.message : 'BROWSER_SCAN_FAILED'
+    };
+  }
+}
+
+function shouldAttemptPaapiVariantFallback(browserVariantResult = null) {
+  if (!browserVariantResult) {
+    return true;
+  }
+
+  if (browserVariantResult.variantPayload) {
+    return false;
+  }
+
+  const skipReason = cleanText(browserVariantResult.skipReason);
+  if (!browserVariantResult.variantScanUsed) {
+    return true;
+  }
+
+  if (skipReason === 'NO_VISIBLE_BROWSER_VARIANTS') {
+    return true;
+  }
+
+  if (/^BROWSER_FETCH_\d+$/.test(skipReason) || skipReason === 'BROWSER_SCAN_FAILED') {
+    return true;
+  }
+
+  return Number(browserVariantResult.checkedVariantCount || 0) <= 0;
+}
+
+function mergeVariantScanAggregate(aggregate = {}, stepResult = {}, fallbackSource = 'skipped') {
+  const nextAggregate = {
+    variantPayload: aggregate.variantPayload || null,
+    variantScanUsed: aggregate.variantScanUsed === true,
+    variantScanSource: aggregate.variantScanSource || 'skipped',
+    checkedVariantCount: Number(aggregate.checkedVariantCount || 0),
+    rejectReason: cleanText(aggregate.rejectReason),
+    skipReason: cleanText(aggregate.skipReason)
+  };
+
+  if (!stepResult || typeof stepResult !== 'object') {
+    return nextAggregate;
+  }
+
+  if (stepResult.variantScanUsed === true) {
+    nextAggregate.variantScanUsed = true;
+    nextAggregate.checkedVariantCount += Number(stepResult.checkedVariantCount || 0);
+    nextAggregate.variantScanSource = cleanText(stepResult.variantScanSource || fallbackSource) || fallbackSource;
+  }
+
+  if (stepResult.variantPayload) {
+    nextAggregate.variantPayload = stepResult.variantPayload;
+    nextAggregate.variantScanSource = cleanText(stepResult.variantScanSource || fallbackSource) || fallbackSource;
+    nextAggregate.rejectReason = '';
+    nextAggregate.skipReason = '';
+    return nextAggregate;
+  }
+
+  if (cleanText(stepResult.rejectReason)) {
+    nextAggregate.rejectReason = cleanText(stepResult.rejectReason);
+  }
+  if (cleanText(stepResult.skipReason)) {
+    nextAggregate.skipReason = cleanText(stepResult.skipReason);
+  }
+
+  return nextAggregate;
+}
+
+async function resolveCheapestAllowedVariantAcrossSources({
+  finalCandidate = {},
+  originalProfile = {},
+  currentResult = {},
+  testMode = false,
+  sessionName = '',
+  sourceId = null,
+  messageId = '',
+  creatorVariationLoader = loadAmazonCreatorFamilyVariations,
+  paapiVariationLoader = loadAmazonAffiliateVariations,
+  fetchImpl = global.fetch,
+  browserEnricher = enrichAmazonAffiliateProductsWithOfferData
+} = {}) {
+  let aggregate = {
+    variantPayload: null,
+    variantScanUsed: false,
+    variantScanSource: 'skipped',
+    checkedVariantCount: 0,
+    rejectReason: '',
+    skipReason: ''
+  };
+
+  const creatorVariantResult = await findCheapestAllowedVariation({
+    finalCandidate,
+    originalProfile,
+    currentResult,
+    testMode,
+    sessionName,
+    sourceId,
+    messageId,
+    variationLoader: creatorVariationLoader,
+    variationSource: 'creator',
+    includeMeta: true
+  });
+  aggregate = mergeVariantScanAggregate(aggregate, creatorVariantResult, 'creator');
+  if (aggregate.variantPayload) {
+    return aggregate;
+  }
+
+  const browserVariantResult = await findCheapestVisibleBrowserVariation({
+    finalCandidate,
+    originalProfile,
+    currentResult,
+    testMode,
+    sessionName,
+    sourceId,
+    messageId,
+    fetchImpl,
+    browserEnricher
+  });
+  aggregate = mergeVariantScanAggregate(aggregate, browserVariantResult, 'browser');
+  if (aggregate.variantPayload) {
+    return aggregate;
+  }
+
+  if (!shouldAttemptPaapiVariantFallback(browserVariantResult)) {
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(finalCandidate.asin).toUpperCase(),
+      source: 'paapi',
+      reason: 'PAAPI_FALLBACK_NOT_NEEDED',
+      browserSkipReason: cleanText(browserVariantResult?.skipReason)
+    });
+    return aggregate;
+  }
+
+  const paapiVariantResult = await findCheapestAllowedVariation({
+    finalCandidate,
+    originalProfile,
+    currentResult,
+    testMode,
+    sessionName,
+    sourceId,
+    messageId,
+    variationLoader: paapiVariationLoader,
+    variationSource: 'paapi',
+    includeMeta: true
+  });
+  return mergeVariantScanAggregate(aggregate, paapiVariantResult, 'paapi');
+}
+
+async function resolveCheapestFinalOffer(candidate = {}, originalDeal = {}, options = {}) {
+  const similarCheck = candidate && typeof candidate === 'object' ? { ...candidate } : {};
+  const sessionName = cleanText(options.sessionName);
+  const sourceId = options.sourceId ?? null;
+  const messageId = cleanText(options.messageId);
+  const testMode = options.testMode === true;
+  const generatorInput = originalDeal?.generatorInput && typeof originalDeal.generatorInput === 'object' ? originalDeal.generatorInput : {};
+  const generatorContext =
+    originalDeal?.generatorContext && typeof originalDeal.generatorContext === 'object' ? originalDeal.generatorContext : {};
+  const originalProfile = buildOriginalProfileForFinalOffer(originalDeal, similarCheck);
+  const originalCandidate = buildOptimizedCandidateFromSimilarCheck(similarCheck);
+  const originalCandidatePrice = resolveFirstSimilarPositivePrice(
+    originalCandidate.priceValue,
+    similarCheck.optimizedPriceValue,
+    similarCheck.similarCheaperPriceValue,
+    similarCheck.optimizedPrice,
+    similarCheck.similarCheaperPrice
+  );
+
+  console.info('[FINAL_OFFER_RESOLVE_START]', {
+    sessionName,
+    sourceId,
+    messageId,
+    originalAsin: cleanText(originalProfile.asin).toUpperCase(),
+    candidateAsin: cleanText(originalCandidate.asin).toUpperCase(),
+    candidatePrice: originalCandidatePrice === null ? null : formatPrice(originalCandidatePrice)
+  });
+
+  const baseEvaluation = evaluateFinalOfferCandidate({
+    offerCandidate: originalCandidate,
+    originalProfile,
+    comparisonPrice: originalProfile.price,
+    testMode,
+    minimumDifferencePercent: 3
+  });
+  const allowBaselineVariantSearch = options.allowBaselineVariantSearch === true;
+  const allowVariantScanDespiteBaseReject =
+    allowBaselineVariantSearch &&
+    cleanText(originalCandidate.asin).toUpperCase() === cleanText(originalProfile.asin).toUpperCase() &&
+    ['PRICE_NOT_CHEAPER', 'SAVING_TOO_LOW'].includes(cleanText(baseEvaluation.rejectReason));
+  let resolvedSimilarCheck = {
+    ...similarCheck,
+    optimizedPriceValue: originalCandidatePrice,
+    similarCheaperPriceValue: originalCandidatePrice ?? similarCheck.similarCheaperPriceValue,
+    optimizedPrice: originalCandidatePrice === null ? similarCheck.optimizedPrice : formatPrice(originalCandidatePrice),
+    similarCheaperPrice:
+      originalCandidatePrice === null ? similarCheck.similarCheaperPrice : formatPrice(originalCandidatePrice),
+    optimizedAsin: originalCandidate.asin || similarCheck.optimizedAsin,
+    similarCheaperAsin: originalCandidate.asin || similarCheck.similarCheaperAsin,
+    optimizedTitle: originalCandidate.title || similarCheck.optimizedTitle,
+    similarCheaperTitle: originalCandidate.title || similarCheck.similarCheaperTitle,
+    optimizedAffiliateUrl: originalCandidate.affiliateUrl || similarCheck.optimizedAffiliateUrl,
+    affiliateUrl: originalCandidate.affiliateUrl || similarCheck.affiliateUrl,
+    optimizedImageUrl: originalCandidate.imageUrl || similarCheck.optimizedImageUrl,
+    optimizedSellerClass: baseEvaluation.sellerDetection.sellerClass || similarCheck.optimizedSellerClass,
+    similarCheaperSellerClass: baseEvaluation.sellerDetection.sellerClass || similarCheck.similarCheaperSellerClass,
+    optimizedSellerSource: baseEvaluation.sellerDetection.sellerSource || similarCheck.optimizedSellerSource,
+    similarCheaperSellerSource: baseEvaluation.sellerDetection.sellerSource || similarCheck.similarCheaperSellerSource,
+    optimizedMerchantName: baseEvaluation.sellerDetection.merchantName || similarCheck.optimizedMerchantName || '',
+    similarCheaperMerchantName: baseEvaluation.sellerDetection.merchantName || similarCheck.similarCheaperMerchantName || '',
+    optimizedIsAmazonFulfilled: baseEvaluation.sellerDetection.isAmazonFulfilled === true,
+    similarCheaperIsAmazonFulfilled: baseEvaluation.sellerDetection.isAmazonFulfilled === true,
+    optimizedIsPrimeEligible: baseEvaluation.sellerDetection.isPrimeEligible === true,
+    similarCheaperIsPrimeEligible: baseEvaluation.sellerDetection.isPrimeEligible === true,
+    optimizedRawSellerKeysFound: baseEvaluation.sellerDetection.rawSellerKeysFound || [],
+    similarCheaperRawSellerKeysFound: baseEvaluation.sellerDetection.rawSellerKeysFound || [],
+    productRoleComparison: baseEvaluation.productRoleComparison,
+    productRoleComparable: baseEvaluation.productRoleComparison.allowed === true,
+    originalProductRoleInfo: originalProfile.productRoleInfo || similarCheck.originalProductRoleInfo,
+    optimizedProductRoleInfo: baseEvaluation.candidateRoleInfo,
+    quantityComparison: baseEvaluation.quantityComparison,
+    quantityComparable: baseEvaluation.quantityComparison.allowed === true,
+    originalQuantityInfo: originalProfile.quantityInfo || similarCheck.originalQuantityInfo,
+    optimizedQuantityInfo: baseEvaluation.candidateQuantityInfo,
+    similarityScore: baseEvaluation.scoring.score,
+    similarCheaperScore: baseEvaluation.scoring.score,
+    differenceAmount: formatPrice(baseEvaluation.differenceAmount),
+    differencePercent: baseEvaluation.differencePercent,
+    variantSelected: false,
+    variantLabel: similarCheck.variantLabel || resolveSimilarVariantLabel(originalCandidate),
+    variantScanUsed: false,
+    variantScanSource: 'skipped',
+    checkedVariantCount: 0,
+    originalCandidatePriceValue: originalCandidatePrice
+  };
+
+  if (!baseEvaluation.allowed && !allowVariantScanDespiteBaseReject) {
+    console.info('[FINAL_OFFER_RESOLVED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(originalCandidate.asin).toUpperCase(),
+      rejectReason: baseEvaluation.rejectReason,
+      variantScanUsed: false,
+      variantScanSource: 'skipped',
+      checkedVariantCount: 0
+    });
+    return {
+      finalAsin: cleanText(originalCandidate.asin).toUpperCase(),
+      finalTitle: cleanText(originalCandidate.title),
+      finalPrice: originalCandidatePrice,
+      finalImage: cleanText(originalCandidate.imageUrl),
+      finalUrl: cleanText(originalCandidate.affiliateUrl || originalCandidate.normalizedUrl),
+      finalSellerClass: baseEvaluation.sellerDetection.sellerClass || 'UNKNOWN',
+      finalVariantLabel: resolvedSimilarCheck.variantLabel,
+      originalCandidatePrice,
+      variantScanUsed: false,
+      variantScanSource: 'skipped',
+      checkedVariantCount: 0,
+      rejectReason: baseEvaluation.rejectReason,
+      resolvedSimilarCheck
+    };
+  }
+
+  let checkedVariantCount = 0;
+  let variantScanUsed = false;
+  let variantScanSource = 'skipped';
+  let variantSkipReason = '';
+
+  if (allowVariantScanDespiteBaseReject) {
+    console.info('[VARIANT_SCAN_SKIPPED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(originalCandidate.asin).toUpperCase(),
+      source: 'baseline_candidate',
+      reason: 'BASELINE_PRODUCT_USED_FOR_FAMILY_SCAN'
+    });
+  }
+
+  const variantResolution = await resolveCheapestAllowedVariantAcrossSources({
+    finalCandidate: originalCandidate,
+    originalProfile,
+    currentResult: resolvedSimilarCheck,
+    testMode,
+    sessionName,
+    sourceId,
+    messageId,
+    creatorVariationLoader: options.creatorVariationLoader || options.variationLoader || loadAmazonCreatorFamilyVariations,
+    paapiVariationLoader: options.paapiVariationLoader || loadAmazonAffiliateVariations,
+    fetchImpl: options.fetchImpl || global.fetch,
+    browserEnricher: options.browserEnricher || enrichAmazonAffiliateProductsWithOfferData
+  });
+
+  if (variantResolution?.variantScanUsed === true) {
+    variantScanUsed = true;
+    variantScanSource = variantResolution.variantScanSource || 'skipped';
+    checkedVariantCount = Number(variantResolution.checkedVariantCount || 0);
+  }
+  if (cleanText(variantResolution?.skipReason)) {
+    variantSkipReason = cleanText(variantResolution.skipReason);
+  }
+  if (!variantSkipReason && cleanText(variantResolution?.rejectReason)) {
+    variantSkipReason = cleanText(variantResolution.rejectReason);
+  }
+  if (variantResolution?.variantPayload) {
+    resolvedSimilarCheck = applyVariantToSimilarResult(resolvedSimilarCheck, variantResolution.variantPayload);
+  }
+
+  const finalCandidate = buildOptimizedCandidateFromSimilarCheck(resolvedSimilarCheck);
+  const finalEvaluation = evaluateFinalOfferCandidate({
+    offerCandidate: finalCandidate,
+    originalProfile,
+    comparisonPrice: originalProfile.price,
+    testMode,
+    minimumDifferencePercent: 3
+  });
+
+  resolvedSimilarCheck = {
+    ...resolvedSimilarCheck,
+    optimizedPriceValue: finalEvaluation.candidatePrice,
+    similarCheaperPriceValue: finalEvaluation.candidatePrice,
+    optimizedPrice: finalEvaluation.candidatePrice === null ? resolvedSimilarCheck.optimizedPrice : formatPrice(finalEvaluation.candidatePrice),
+    similarCheaperPrice:
+      finalEvaluation.candidatePrice === null ? resolvedSimilarCheck.similarCheaperPrice : formatPrice(finalEvaluation.candidatePrice),
+    optimizedAsin: finalCandidate.asin || resolvedSimilarCheck.optimizedAsin,
+    similarCheaperAsin: finalCandidate.asin || resolvedSimilarCheck.similarCheaperAsin,
+    optimizedTitle: finalCandidate.title || resolvedSimilarCheck.optimizedTitle,
+    similarCheaperTitle: finalCandidate.title || resolvedSimilarCheck.similarCheaperTitle,
+    optimizedAffiliateUrl: finalCandidate.affiliateUrl || resolvedSimilarCheck.optimizedAffiliateUrl,
+    affiliateUrl: finalCandidate.affiliateUrl || resolvedSimilarCheck.affiliateUrl,
+    optimizedImageUrl: finalCandidate.imageUrl || resolvedSimilarCheck.optimizedImageUrl,
+    optimizedSellerClass: finalEvaluation.sellerDetection.sellerClass || resolvedSimilarCheck.optimizedSellerClass,
+    similarCheaperSellerClass: finalEvaluation.sellerDetection.sellerClass || resolvedSimilarCheck.similarCheaperSellerClass,
+    optimizedSellerSource: finalEvaluation.sellerDetection.sellerSource || resolvedSimilarCheck.optimizedSellerSource,
+    similarCheaperSellerSource: finalEvaluation.sellerDetection.sellerSource || resolvedSimilarCheck.similarCheaperSellerSource,
+    optimizedMerchantName: finalEvaluation.sellerDetection.merchantName || resolvedSimilarCheck.optimizedMerchantName || '',
+    similarCheaperMerchantName: finalEvaluation.sellerDetection.merchantName || resolvedSimilarCheck.similarCheaperMerchantName || '',
+    optimizedIsAmazonFulfilled: finalEvaluation.sellerDetection.isAmazonFulfilled === true,
+    similarCheaperIsAmazonFulfilled: finalEvaluation.sellerDetection.isAmazonFulfilled === true,
+    optimizedIsPrimeEligible: finalEvaluation.sellerDetection.isPrimeEligible === true,
+    similarCheaperIsPrimeEligible: finalEvaluation.sellerDetection.isPrimeEligible === true,
+    optimizedRawSellerKeysFound: finalEvaluation.sellerDetection.rawSellerKeysFound || [],
+    similarCheaperRawSellerKeysFound: finalEvaluation.sellerDetection.rawSellerKeysFound || [],
+    productRoleComparison: finalEvaluation.productRoleComparison,
+    productRoleComparable: finalEvaluation.productRoleComparison.allowed === true,
+    optimizedProductRoleInfo: finalEvaluation.candidateRoleInfo,
+    quantityComparison: finalEvaluation.quantityComparison,
+    quantityComparable: finalEvaluation.quantityComparison.allowed === true,
+    optimizedQuantityInfo: finalEvaluation.candidateQuantityInfo,
+    similarityScore: finalEvaluation.scoring.score,
+    similarCheaperScore: finalEvaluation.scoring.score,
+    differenceAmount: formatPrice(finalEvaluation.differenceAmount),
+    differencePercent: finalEvaluation.differencePercent,
+    variantScanUsed,
+    variantScanSource,
+    checkedVariantCount
+  };
+
+  const productRuleEvaluation = evaluateProductRules({
+    title: cleanText(finalCandidate.title),
+    brand: cleanText(finalCandidate.brand || originalProfile.brand || generatorInput.brand),
+    finalPrice: finalEvaluation.candidatePrice,
+    rating: finalCandidate.rating ?? generatorInput.rating ?? generatorContext?.keepa?.rating ?? null,
+    reviewCount: finalCandidate.reviewCount ?? generatorInput.reviewCount ?? generatorContext?.keepa?.reviewCount ?? null,
+    category: cleanText(generatorInput.category),
+    features: finalCandidate.features || generatorInput.features || [],
+    sellerClass: finalEvaluation.sellerDetection.sellerClass || 'UNKNOWN',
+    isBrandProduct: generatorInput.isBrandProduct,
+    isNoName: generatorInput.isNoName,
+    isChinaProduct: generatorInput.isChinaProduct,
+    merchantName: finalEvaluation.sellerDetection.merchantName || '',
+    marketComparisonAvailable:
+      generatorContext?.learning?.marketComparisonUsed === true ||
+      cleanText(generatorContext?.learning?.marketComparisonStatus).toLowerCase() === 'success',
+    marketComparisonStatus:
+      cleanText(generatorContext?.learning?.marketComparisonStatus || generatorContext?.internet?.status) || 'missing',
+    scope: 'optimized_final_offer'
+  });
+
+  resolvedSimilarCheck.productRuleEvaluation = productRuleEvaluation;
+
+  if (cleanText(variantSkipReason)) {
+    console.info('[FINAL_OFFER_VARIANT_SKIPPED_REASON]', {
+      sessionName,
+      sourceId,
+      messageId,
+      asin: cleanText(originalCandidate.asin).toUpperCase(),
+      reason: variantSkipReason
+    });
+  }
+
+  if (productRuleEvaluation?.matchedRule && productRuleEvaluation.allowed !== true) {
+    const ruleRejectReason = cleanText(productRuleEvaluation.reasonCode) || 'PRODUCT_RULE_BLOCKED';
+
+    console.info('[FINAL_OFFER_RESOLVED]', {
+      sessionName,
+      sourceId,
+      messageId,
+      originalAsin: cleanText(originalProfile.asin).toUpperCase(),
+      finalAsin: cleanText(finalCandidate.asin).toUpperCase(),
+      finalPrice: finalEvaluation.candidatePrice === null ? null : formatPrice(finalEvaluation.candidatePrice),
+      finalSellerClass: finalEvaluation.sellerDetection.sellerClass,
+      variantScanUsed,
+      variantScanSource,
+      checkedVariantCount,
+      rejectReason: ruleRejectReason,
+      productRule: productRuleEvaluation.matchedRuleName || ''
+    });
+
+    return {
+      finalAsin: cleanText(finalCandidate.asin).toUpperCase(),
+      finalTitle: cleanText(finalCandidate.title),
+      finalPrice: finalEvaluation.candidatePrice,
+      finalImage: cleanText(finalCandidate.imageUrl),
+      finalUrl: cleanText(finalCandidate.affiliateUrl || finalCandidate.normalizedUrl),
+      finalSellerClass: finalEvaluation.sellerDetection.sellerClass || 'UNKNOWN',
+      finalVariantLabel: cleanText(resolvedSimilarCheck.variantLabel || resolveSimilarVariantLabel(finalCandidate)),
+      originalCandidatePrice,
+      variantScanUsed,
+      variantScanSource,
+      checkedVariantCount,
+      rejectReason: ruleRejectReason,
+      productRuleEvaluation,
+      productRuleReason: cleanText(productRuleEvaluation.reason),
+      resolvedSimilarCheck
+    };
+  }
+
+  console.info('[FINAL_OFFER_RESOLVED]', {
+    sessionName,
+    sourceId,
+    messageId,
+    originalAsin: cleanText(originalProfile.asin).toUpperCase(),
+    finalAsin: cleanText(finalCandidate.asin).toUpperCase(),
+    finalPrice: finalEvaluation.candidatePrice === null ? null : formatPrice(finalEvaluation.candidatePrice),
+    finalSellerClass: finalEvaluation.sellerDetection.sellerClass,
+    variantScanUsed,
+    variantScanSource,
+    checkedVariantCount,
+    rejectReason: finalEvaluation.rejectReason || '',
+    productRule: productRuleEvaluation?.matchedRuleName || ''
+  });
+
+  return {
+    finalAsin: cleanText(finalCandidate.asin).toUpperCase(),
+    finalTitle: cleanText(finalCandidate.title),
+    finalPrice: finalEvaluation.candidatePrice,
+    finalImage: cleanText(finalCandidate.imageUrl),
+    finalUrl: cleanText(finalCandidate.affiliateUrl || finalCandidate.normalizedUrl),
+    finalSellerClass: finalEvaluation.sellerDetection.sellerClass || 'UNKNOWN',
+    finalVariantLabel: cleanText(resolvedSimilarCheck.variantLabel || resolveSimilarVariantLabel(finalCandidate)),
+    originalCandidatePrice,
+    variantScanUsed,
+    variantScanSource,
+    checkedVariantCount,
+    rejectReason: finalEvaluation.rejectReason || '',
+    productRuleEvaluation,
+    resolvedSimilarCheck
+  };
 }
 
 function buildSimilarProductProfile(generatorInput = {}, scrapedDeal = {}) {
@@ -4637,7 +5996,6 @@ function formatSimilarSellerDebugBoolean(value, rawSellerKeysFound = [], keyNeed
 }
 
 function detectSimilarSellerClass(candidate = {}, options = {}) {
-  const testMode = options.testMode === true;
   const asin = cleanText(candidate.asin).toUpperCase();
   const merchantName = cleanText(candidate.merchantName);
   const merchantNameLower = merchantName.toLowerCase();
@@ -4705,22 +6063,22 @@ function detectSimilarSellerClass(candidate = {}, options = {}) {
     rejectReason = '';
     sellerSource = 'MerchantInfo enthaelt Amazon.';
   } else if (isAmazonFulfilled) {
-    sellerClass = 'FBA';
+    sellerClass = 'FBA_PREMIUM';
     shipping = 'FBA';
     allowed = true;
     rejectReason = '';
     sellerSource = 'DeliveryInfo.IsAmazonFulfilled=true.';
   } else if (/\b(fulfilled by amazon|versand durch amazon|fba)\b/i.test(availability)) {
-    sellerClass = 'FBA';
+    sellerClass = 'FBA_PREMIUM';
     shipping = 'FBA';
     allowed = true;
     rejectReason = '';
     sellerSource = 'Availability enthaelt Versand durch Amazon/FBA.';
   } else if (isPrimeEligible) {
-    sellerClass = 'FBA_OR_AMAZON_UNKNOWN';
+    sellerClass = 'FBA_UNKNOWN';
     shipping = 'Prime / Amazon unklar';
-    allowed = testMode;
-    rejectReason = testMode ? '' : 'SELLER_NOT_ALLOWED';
+    allowed = true;
+    rejectReason = '';
     sellerSource = hasAmazonFulfilledKey
       ? 'Prime=true, aber IsAmazonFulfilled ist nicht true.'
       : 'Prime=true aber MerchantInfo fehlt und IsAmazonFulfilled fehlt.';
@@ -5039,9 +6397,8 @@ function resolveSimilarOriginalSellerDebug(eligibility = {}, generatorInput = {}
   const merchantName = looksLikeTelegramDealText(merchantNameCandidate) ? '' : merchantNameCandidate;
   const shippedKnown = generatorInput?.shippedByAmazon === true || generatorInput?.shippedByAmazon === false;
   const noRealSellerFields = !merchantName && !shippedKnown;
-  const fallbackSellerClass = eligibility.sellerClass || cleanText(generatorInput?.sellerClass) || 'UNKNOWN';
-  const sellerClass =
-    fallbackSellerClass === 'FBA_OR_AMAZON_UNKNOWN' && noRealSellerFields ? 'UNKNOWN' : fallbackSellerClass;
+  const fallbackSellerClass = normalizeSimilarSellerClass(eligibility.sellerClass || generatorInput?.sellerClass || 'UNKNOWN');
+  const sellerClass = fallbackSellerClass === 'FBA_UNKNOWN' && noRealSellerFields ? 'UNKNOWN' : fallbackSellerClass;
   const sellerSource =
     noRealSellerFields
       ? 'Keine echten Seller Felder in API Response gefunden.'
@@ -5115,7 +6472,13 @@ async function runSimilarProductOptimizationCheck({
   structuredMessage = {},
   generatorInput = {},
   generatorContext = {},
-  scrapedDeal = {}
+  scrapedDeal = {},
+  searchProductsImpl = searchAmazonAffiliateProducts,
+  enrichCandidatesImpl = enrichCandidatesWithOfferData,
+  creatorVariationLoader = loadAmazonCreatorFamilyVariations,
+  paapiVariationLoader = loadAmazonAffiliateVariations,
+  fetchImpl = global.fetch,
+  browserEnricher = enrichAmazonAffiliateProductsWithOfferData
 } = {}) {
   const disabledReason = getOptimizedDealsDisabledReason();
   if (disabledReason) {
@@ -5240,6 +6603,121 @@ async function runSimilarProductOptimizationCheck({
     });
   }
 
+  const originalBaselineResult = maybeStoreProductIntelligenceMaster({
+    profile: productIntelligenceProfile,
+    candidate: {
+      asin: originalProfile.asin,
+      brand: originalProfile.brand,
+      title: originalProfile.title,
+      price: originalProfile.price
+    },
+    sellerClass: eligibility.sellerClass,
+    similarityScore: 100,
+    source: 'current_deal'
+  });
+
+  if (originalProfile.price !== null && originalProfile.asin) {
+    const originalFamilyCandidate = buildOriginalProductFamilyCandidate({
+      originalProfile,
+      generatorInput,
+      scrapedDeal,
+      originalSellerDebug,
+      eligibility,
+      originalDataSources
+    });
+    const sameFamilySeed = buildSameFamilySimilarCheckSeed({
+      originalProfile,
+      originalCandidate: originalFamilyCandidate,
+      originalDataSources,
+      originalSellerDebug,
+      eligibility,
+      productIntelligenceProfile,
+      baselineResult: originalBaselineResult,
+      strictScoreThreshold,
+      minimumPostScoreThreshold,
+      shortQuery: similarProductTestMode ? shortQuery : ''
+    });
+    const familyVariantResolution = await resolveCheapestFinalOffer(
+      sameFamilySeed,
+      {
+        originalProfile,
+        generatorInput,
+        generatorContext
+      },
+      {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        testMode: similarProductTestMode,
+        allowBaselineVariantSearch: true,
+        creatorVariationLoader,
+        paapiVariationLoader,
+        fetchImpl,
+        browserEnricher
+      }
+    );
+
+    if (
+      !cleanText(familyVariantResolution?.rejectReason) &&
+      cleanText(familyVariantResolution?.finalAsin).toUpperCase() &&
+      cleanText(familyVariantResolution?.finalAsin).toUpperCase() !== cleanText(originalProfile.asin).toUpperCase() &&
+      Number.isFinite(familyVariantResolution?.finalPrice) &&
+      familyVariantResolution.finalPrice < originalProfile.price
+    ) {
+      console.info('[SIMILAR_SCAN_ABORT]', {
+        sessionName,
+        sourceId: source?.id ?? null,
+        messageId: structuredMessage?.messageId || '',
+        asin: originalProfile.asin,
+        reason: 'same_product_family_variant_selected',
+        finalAsin: familyVariantResolution.finalAsin,
+        variantScanSource: familyVariantResolution.variantScanSource || 'skipped',
+        checkedVariantCount: familyVariantResolution.checkedVariantCount || 0
+      });
+
+      return {
+        ...(familyVariantResolution.resolvedSimilarCheck || sameFamilySeed),
+        checked: true,
+        allowed: true,
+        similarCheaperFound: true,
+        sellerClass: eligibility.sellerClass,
+        sourceTelegramText: originalDataSources.sourceTelegramText,
+        sourceGroup: originalDataSources.sourceGroup,
+        originalUrl: originalDataSources.originalUrl,
+        originalAsin: originalDataSources.originalAsin,
+        sellerSource: originalSellerDebug.sellerSource,
+        merchantName: originalSellerDebug.merchantName || '',
+        amazonFulfilledLabel: originalSellerDebug.amazonFulfilledLabel,
+        primeLabel: originalSellerDebug.primeLabel,
+        rawSellerKeysFound: originalSellerDebug.rawSellerKeysFound,
+        originalTitle: originalProfile.title,
+        originalPrice: originalProfile.price === null ? 'n/a' : formatPrice(originalProfile.price),
+        originalPriceValue: originalProfile.price,
+        originalSourceGroup: resolveOptimizedOriginalSourceGroup({ source, structuredMessage, generatorInput }),
+        candidateCount: 0,
+        bestScore: 100,
+        query: 'same_product_family',
+        shortQuery: similarProductTestMode ? shortQuery : '',
+        similarSearchQuery: 'same_product_family',
+        similarSearchQueryType: 'product_family',
+        productIntelligence: productIntelligenceProfile,
+        baselineMaster: originalBaselineResult?.master || null,
+        baselineResult: originalBaselineResult || null,
+        strictScoreThreshold,
+        minimumPostScoreThreshold
+      };
+    }
+  }
+
+  console.info('[SIMILAR_SCAN_START]', {
+    sessionName,
+    sourceId: source?.id ?? null,
+    messageId: structuredMessage?.messageId || '',
+    asin: originalProfile.asin,
+    sellerClass: eligibility.sellerClass,
+    query: primaryQuery,
+    shortQuery: similarProductTestMode ? shortQuery : ''
+  });
   console.info('[SIMILAR_PRODUCT_SEARCH_STARTED]', {
     sessionName,
     sourceId: source?.id ?? null,
@@ -5303,19 +6781,6 @@ async function runSimilarProductOptimizationCheck({
     });
   }
 
-  const originalBaselineResult = maybeStoreProductIntelligenceMaster({
-    profile: productIntelligenceProfile,
-    candidate: {
-      asin: originalProfile.asin,
-      brand: originalProfile.brand,
-      title: originalProfile.title,
-      price: originalProfile.price
-    },
-    sellerClass: eligibility.sellerClass,
-    similarityScore: 100,
-    source: 'current_deal'
-  });
-
   const searchResults = [];
   const candidateMap = new Map();
 
@@ -5331,7 +6796,7 @@ async function runSimilarProductOptimizationCheck({
       });
     }
 
-    const searchResult = await searchAmazonAffiliateProducts({
+    const searchResult = await searchProductsImpl({
       keywords: searchQuery.query,
       itemCount: searchResultLimit
     });
@@ -5358,7 +6823,7 @@ async function runSimilarProductOptimizationCheck({
   }
 
   const rawCandidates = preselectSimilarCandidatesForOfferEnrichment([...candidateMap.values()], originalProfile, searchResultLimit);
-  const candidates = await enrichCandidatesWithOfferData(rawCandidates);
+  const candidates = await enrichCandidatesImpl(rawCandidates);
   const primarySearchResult = searchResults[0] || {};
   const searchStatus = searchResults.some((entry) => entry.status === 'success')
     ? 'success'
@@ -5974,20 +7439,32 @@ async function runSimilarProductOptimizationCheck({
     ignoredAsPriceError: alternativeBaselineResult?.priceErrorProtected === true,
     query: primaryQuery,
     shortQuery: similarProductTestMode ? shortQuery : '',
-    candidate: bestCandidate
+    candidate: bestCandidate,
+    variantScanUsed: false,
+    variantScanSource: 'skipped',
+    checkedVariantCount: 0
   };
 
-  const cheaperVariantPayload = await findCheapestAllowedVariation({
+  const variantResolution = await resolveCheapestAllowedVariantAcrossSources({
     finalCandidate: bestCandidate,
     originalProfile,
     currentResult: result,
     testMode: similarProductTestMode,
     sessionName,
     sourceId: source?.id ?? null,
-    messageId: structuredMessage?.messageId || ''
+    messageId: structuredMessage?.messageId || '',
+    creatorVariationLoader,
+    paapiVariationLoader,
+    fetchImpl,
+    browserEnricher
   });
-  if (cheaperVariantPayload) {
-    result = applyVariantToSimilarResult(result, cheaperVariantPayload);
+  if (variantResolution?.variantScanUsed === true) {
+    result.variantScanUsed = true;
+    result.variantScanSource = variantResolution.variantScanSource || 'skipped';
+    result.checkedVariantCount = Number(variantResolution.checkedVariantCount || 0);
+  }
+  if (variantResolution?.variantPayload) {
+    result = applyVariantToSimilarResult(result, variantResolution.variantPayload);
   }
 
   if (result.softOptimizedDeal === true) {
@@ -6093,6 +7570,93 @@ function shortenSimilarText(value = '', maxLength = 120) {
   return `${text.slice(0, maxLength - 3).trim()}...`;
 }
 
+function appendUniqueGeneratorOptionLine(lines = [], value = '') {
+  const normalizedValue = cleanText(value);
+  if (!normalizedValue || lines.includes(normalizedValue)) {
+    return;
+  }
+
+  lines.push(normalizedValue);
+}
+
+function buildGeneratorDisplayOptions({
+  couponDetected = false,
+  couponCode = '',
+  variantLabel = '',
+  variantSelected = false,
+  primaryOptions = [],
+  extraOptions = []
+} = {}) {
+  const nextPrimaryOptions = [];
+  const nextExtraOptions = [];
+  const normalizedCouponCode = cleanText(couponCode);
+  const normalizedVariantLabel = cleanText(variantLabel);
+
+  for (const option of Array.isArray(primaryOptions) ? primaryOptions : []) {
+    appendUniqueGeneratorOptionLine(nextPrimaryOptions, option);
+  }
+
+  if (couponDetected === true) {
+    appendUniqueGeneratorOptionLine(nextPrimaryOptions, TELEGRAM_COUPON_ACTIVE_OPTION);
+  }
+
+  for (const option of Array.isArray(extraOptions) ? extraOptions : []) {
+    appendUniqueGeneratorOptionLine(nextExtraOptions, option);
+  }
+
+  if (normalizedCouponCode) {
+    appendUniqueGeneratorOptionLine(nextExtraOptions, `${TELEGRAM_RABATTGUTSCHEIN_PREFIX} ${normalizedCouponCode}`);
+  }
+
+  if (variantSelected === true && normalizedVariantLabel) {
+    appendUniqueGeneratorOptionLine(nextExtraOptions, TELEGRAM_BEST_VARIANT_HEADLINE);
+    appendUniqueGeneratorOptionLine(nextExtraOptions, normalizedVariantLabel);
+  }
+
+  return {
+    primaryOptions: nextPrimaryOptions,
+    extraOptions: nextExtraOptions,
+    couponCode: normalizedCouponCode
+  };
+}
+
+function buildGeneratorStylePostPayload({
+  title = '',
+  affiliateUrl = '',
+  currentPrice = '',
+  oldPrice = '',
+  couponDetected = false,
+  couponCode = '',
+  variantLabel = '',
+  variantSelected = false,
+  primaryOptions = [],
+  extraOptions = [],
+  freeText = ''
+} = {}) {
+  const displayOptions = buildGeneratorDisplayOptions({
+    couponDetected,
+    couponCode,
+    variantLabel,
+    variantSelected,
+    primaryOptions,
+    extraOptions
+  });
+
+  return generatePostText({
+    productTitle: cleanText(title) || 'Amazon Produkt',
+    freiText: cleanText(freeText),
+    textBaustein: displayOptions.primaryOptions,
+    alterPreis: oldPrice,
+    neuerPreis: currentPrice,
+    alterPreisLabel: 'Vorher',
+    neuerPreisLabel: 'Jetzt',
+    amazonLink: cleanText(affiliateUrl),
+    werbung: false,
+    extraOptions: displayOptions.extraOptions,
+    rabattgutscheinCode: displayOptions.couponCode
+  });
+}
+
 function resolveOptimizedCouponContext({ generatorInput = {}, similarCheck = {}, structuredMessage = {} } = {}) {
   const couponCode =
     cleanText(similarCheck.couponCode) ||
@@ -6144,8 +7708,6 @@ function buildOptimizedSimilarDealPost(similarCheck = {}) {
   const reason = escapeTelegramHtml(shortenSimilarText(similarCheck.similarCheaperReason || 'Aehnliches Produkt guenstiger gefunden.', 120));
   const affiliateUrl = cleanText(similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl);
   const couponCode = cleanText(similarCheck.couponCode);
-  const couponInfo = escapeTelegramHtml(cleanText(similarCheck.couponInfo) || 'Kein Coupon erkannt');
-  const variantInfo = escapeTelegramHtml(resolveOptimizedVariantInfo(similarCheck));
   const originalQuantity = cleanText(similarCheck.originalQuantity);
   const optimizedQuantity = cleanText(similarCheck.optimizedQuantity);
   const originalUnitPrice = cleanText(similarCheck.originalUnitPrice);
@@ -6158,14 +7720,15 @@ function buildOptimizedSimilarDealPost(similarCheck = {}) {
     originalUnitPrice || optimizedUnitPrice
       ? `\u{1F4B6} Grundpreis: ${escapeTelegramHtml(originalUnitPrice || 'n/a')} \u2192 ${escapeTelegramHtml(optimizedUnitPrice || 'n/a')}`
       : '';
-  const generatorPost = generatePostText({
-    productTitle: optimizedTitleRaw,
-    neuerPreis: similarCheck.optimizedPriceValue || similarCheck.similarCheaperPriceValue || similarCheck.optimizedPrice || similarCheck.similarCheaperPrice,
-    amazonLink: affiliateUrl,
-    textBaustein: '',
-    extraOptions: couponCode ? [COUPON_OPTION_LABEL] : [],
-    freiText: '',
-    rabattgutscheinCode: couponCode
+  const generatorPost = buildGeneratorStylePostPayload({
+    title: optimizedTitleRaw,
+    affiliateUrl,
+    currentPrice:
+      similarCheck.optimizedPriceValue || similarCheck.similarCheaperPriceValue || similarCheck.optimizedPrice || similarCheck.similarCheaperPrice,
+    couponDetected: similarCheck.couponDetected === true,
+    couponCode,
+    variantLabel: similarCheck.variantLabel || '',
+    variantSelected: similarCheck.variantSelected === true
   }).telegramCaption.trim();
 
   return [
@@ -6188,12 +7751,6 @@ function buildOptimizedSimilarDealPost(similarCheck = {}) {
     `\u{1F525} Neuer Preis: ${optimizedPrice}`,
     '',
     `\u{1F4B0} Ersparnis: ${escapeTelegramHtml(similarCheck.differenceAmount || 'n/a')} (${escapeTelegramHtml(String(similarCheck.differencePercent ?? 'n/a'))}%)`,
-    '',
-    '\u{1F39F} Coupon:',
-    couponInfo,
-    '',
-    '\u{1F3A8} Beste Variante:',
-    variantInfo,
     '',
     ...(similarCheck.variantSelected === true
       ? [
@@ -6223,6 +7780,7 @@ async function publishSimilarProductOptimizedChannel({
   source = {},
   structuredMessage = {},
   generatorInput = {},
+  generatorContext = {},
   similarCheck = null
 } = {}) {
   const disabledReason = getOptimizedDealsDisabledReason();
@@ -6250,14 +7808,43 @@ async function publishSimilarProductOptimizedChannel({
     return { sent: false, reason: optimizedChannelCache.lastSkipReason };
   }
 
+  const finalOfferResolution = await resolveCheapestFinalOffer(
+    similarCheck,
+    {
+      generatorInput,
+      generatorContext
+    },
+    {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      testMode: isSimilarProductTestModeActive()
+    }
+  );
+
+  if (finalOfferResolution?.resolvedSimilarCheck) {
+    similarCheck = finalOfferResolution.resolvedSimilarCheck;
+  }
+
+  if (cleanText(finalOfferResolution?.rejectReason)) {
+    console.info('[SIMILAR_PRODUCT_OPTIMIZED_CHANNEL_SKIPPED]', {
+      sessionName,
+      sourceId: source?.id ?? null,
+      messageId: structuredMessage?.messageId || '',
+      asin: finalOfferResolution.finalAsin || similarCheck?.similarCheaperAsin || '',
+      reason: finalOfferResolution.rejectReason,
+      variantScanUsed: finalOfferResolution.variantScanUsed === true,
+      variantScanSource: finalOfferResolution.variantScanSource || 'skipped',
+      checkedVariantCount: finalOfferResolution.checkedVariantCount || 0
+    });
+    optimizedChannelCache.lastSkipReason = finalOfferResolution.rejectReason;
+    return { sent: false, reason: finalOfferResolution.rejectReason };
+  }
+
   const optimizedSellerClass = normalizeSimilarSellerClass(
     similarCheck.optimizedSellerClass || similarCheck.similarCheaperSellerClass || similarCheck.similarCheaperShipping
   );
-  const optimizedTestMode = isSimilarProductTestModeActive();
-  const optimizedSellerAllowed =
-    optimizedSellerClass === 'AMAZON_DIRECT' ||
-    optimizedSellerClass === 'FBA' ||
-    (optimizedTestMode && optimizedSellerClass === 'FBA_OR_AMAZON_UNKNOWN');
+  const optimizedSellerAllowed = isAllowedSimilarOptimizedSellerClass(optimizedSellerClass);
 
   if (
     cleanText(similarCheck.apiStatus).toUpperCase() === 'THROTTLED' ||
@@ -6508,17 +8095,24 @@ async function publishSimilarProductOptimizedChannel({
     disableWebPagePreview: false,
     titlePreview: similarCheck.similarCheaperTitle || 'Optimierter Deal',
     hasAffiliateLink: true,
-    postContext: 'similar_product_optimized'
+    postContext: 'similar_product_optimized',
+    duplicateContext: {
+      channelType: 'optimized',
+      targetRef: chatId,
+      asin: cleanText(similarCheck.similarCheaperAsin).toUpperCase(),
+      title: cleanText(similarCheck.optimizedTitle || similarCheck.similarCheaperTitle) || 'Optimierter Deal',
+      price: cleanText(similarCheck.optimizedPrice || similarCheck.similarCheaperPrice),
+      url: cleanText(similarCheck.optimizedAffiliateUrl || similarCheck.affiliateUrl),
+      originalUrl: cleanText(similarCheck.affiliateUrl)
+    }
   });
   let couponCodeResult = null;
-  if (cleanText(similarCheck.couponCode)) {
+  if (result?.duplicateBlocked !== true && cleanText(similarCheck.couponCode)) {
     try {
-      couponCodeResult = await sendTelegramPost({
-        text: ['\u{1F4CB} CODE:', cleanText(similarCheck.couponCode)].join('\n'),
+      couponCodeResult = await sendTelegramCouponFollowUp({
+        couponCode: cleanText(similarCheck.couponCode),
         chatId,
-        disableWebPagePreview: true,
         titlePreview: 'Optimierter Deal Code',
-        hasAffiliateLink: false,
         postContext: 'similar_product_optimized_code'
       });
     } catch (couponCodeError) {
@@ -6624,7 +8218,13 @@ async function publishSimilarProductOptimizedChannel({
     telegramMessageId: result?.messageId || null
   });
 
-  return { sent: true, messageId: result?.messageId || null };
+  return {
+    sent: result?.duplicateBlocked !== true,
+    messageId: result?.duplicateBlocked === true ? null : result?.messageId || null,
+    duplicateBlocked: result?.duplicateBlocked === true,
+    duplicateKey: result?.duplicateKey || null,
+    reason: result?.duplicateBlocked === true ? 'DUPLICATE_BLOCKED' : ''
+  };
 }
 
 function classifyRelaxedAmazonMatchScore(matchScore = 0, sourceFacts = {}, candidate = {}) {
@@ -7817,9 +9417,67 @@ function extractTelegramDealPricing(text = '') {
   };
 }
 
+const TELEGRAM_COUPON_CODE_STOPWORDS = new Set([
+  'VORHER',
+  'JETZT',
+  'SPARE',
+  'GRATIS',
+  'AMAZON',
+  'PRIME',
+  'COUPON',
+  'COUPONCODE',
+  'RABATT',
+  'RABATTCODE',
+  'GUTSCHEIN',
+  'GUTSCHEINCODE',
+  'ARTIKEL',
+  'AUSGEWAEHLTEN',
+  'AUSGEWAEHLTE',
+  'AUSGEWAEHLTER',
+  'LIEFERUNG'
+]);
+
+const TELEGRAM_COUPON_CODE_PATTERNS = [
+  /\b(?:mit|nutze|verwende|benutze|use)\s+(?:dem\s+)?(?:code|rabattcode|gutscheincode|couponcode)\s*:?\s*([A-Z0-9-]{5,20})\b/iu,
+  /\b(?:rabattcode|gutscheincode|couponcode)\s*[:\-]?\s*([A-Z0-9-]{5,20})\b/iu,
+  /\b(?:code|coupon|gutschein)\s*:\s*([A-Z0-9-]{5,20})\b/iu,
+  /\b(?:mit\s+gutschein|mit\s+coupon)\s*:?\s*([A-Z0-9-]{5,20})\b/iu
+];
+
+function normalizeTelegramCouponCodeCandidate(value = '') {
+  return cleanText(String(value || '').replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9-]+$/g, '')).toUpperCase();
+}
+
+function isPlausibleTelegramCouponCodeCandidate(value = '') {
+  const candidate = normalizeTelegramCouponCodeCandidate(value);
+  if (!candidate || candidate.length < 5 || candidate.length > 20) {
+    return false;
+  }
+
+  if (!/^[A-Z0-9][A-Z0-9-]{4,19}$/.test(candidate)) {
+    return false;
+  }
+
+  return !TELEGRAM_COUPON_CODE_STOPWORDS.has(candidate);
+}
+
 function extractTelegramCouponCode(text = '') {
-  const match = String(text || '').match(/\b(?:code|coupon|gutschein(?:code)?)[:\s-]*([A-Z0-9-]{4,})\b/i);
-  return cleanText(match?.[1] || '').toUpperCase();
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  for (const line of lines) {
+    for (const pattern of TELEGRAM_COUPON_CODE_PATTERNS) {
+      const match = line.match(pattern);
+      const candidate = normalizeTelegramCouponCodeCandidate(match?.[1] || '');
+      if (isPlausibleTelegramCouponCodeCandidate(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return '';
 }
 
 function extractTelegramTitle(text = '', fallback = '') {
@@ -8102,21 +9760,33 @@ function buildTelegramReaderTemplatePayload({
   currentPrice = '',
   oldPrice = '',
   couponCode = '',
+  couponDetected = false,
+  variantLabel = '',
+  variantSelected = false,
+  primaryOptions = [],
   extraOptions = []
 }) {
   const finalTitle = sanitizeReaderPostTitle(title, 'Amazon Produkt') || 'Amazon Produkt';
+  const displayOptions = buildGeneratorDisplayOptions({
+    couponDetected,
+    couponCode,
+    variantLabel,
+    variantSelected,
+    primaryOptions,
+    extraOptions
+  });
   const generatorRenderInput = {
     productTitle: finalTitle,
     freiText: '',
-    textBaustein: [],
-    alterPreis: '',
+    textBaustein: displayOptions.primaryOptions,
+    alterPreis: cleanText(oldPrice),
     neuerPreis: cleanText(currentPrice),
     alterPreisLabel: 'Vorher',
     neuerPreisLabel: 'Jetzt',
     amazonLink: cleanText(affiliateUrl),
     werbung: false,
-    extraOptions: [...(Array.isArray(extraOptions) ? extraOptions : []), ...(cleanText(couponCode) ? [COUPON_OPTION_LABEL] : [])],
-    rabattgutscheinCode: cleanText(couponCode)
+    extraOptions: displayOptions.extraOptions,
+    rabattgutscheinCode: displayOptions.couponCode
   };
   console.info('[READER_OWN_TEMPLATE_DISABLED]', {
     title: finalTitle,
@@ -10919,7 +12589,8 @@ async function buildTelegramReaderGeneratorInput({
     affiliateUrl,
     currentPrice: invalidPriceState.invalid ? '' : rawCurrentPrice,
     oldPrice: '',
-    couponCode: '',
+    couponCode,
+    couponDetected: scrapedDealWithFallbacks?.couponDetected === true,
     extraOptions: []
   });
   const imagePayload = resolveReaderImagePayload({
@@ -11528,8 +13199,35 @@ async function sendReaderTestGroupPostDirect({
     chatId: targetChatId,
     titlePreview: cleanText(generatorInput?.title).slice(0, 120),
     hasAffiliateLink: Boolean(cleanText(generatorInput?.link)),
-    postContext: 'generic'
+    postContext: 'generic',
+    duplicateContext: {
+      channelType: 'reader_test_group',
+      targetRef: targetChatId,
+      asin: cleanText(generatorInput?.asin).toUpperCase(),
+      title: cleanText(generatorInput?.title),
+      price: cleanText(generatorInput?.currentPrice || generatorInput?.price || generatorInput?.finalPrice),
+      url: cleanText(generatorInput?.normalizedUrl || generatorInput?.link),
+      originalUrl: cleanText(generatorInput?.link)
+    }
   });
+  const couponCodeResult =
+    directResult?.duplicateBlocked === true
+      ? null
+      : await sendTelegramCouponFollowUp({
+          couponCode: cleanText(generatorInput?.couponCode),
+          chatId: targetChatId,
+          titlePreview: cleanText(generatorInput?.title).slice(0, 120) || 'Testgruppen Rabattcode',
+          postContext: 'reader_test_group_coupon_follow_up'
+        }).catch((error) => {
+          console.warn('[TESTGROUP_CODE_SEND_FAILED]', {
+            sessionName,
+            sourceId: source?.id ?? null,
+            messageId: structuredMessage?.messageId || '',
+            asin: cleanText(generatorInput?.asin).toUpperCase() || '',
+            error: error instanceof Error ? error.message : 'CODE-Folgepost konnte nicht gesendet werden.'
+          });
+          return null;
+        });
 
   return {
     success: true,
@@ -11550,11 +13248,13 @@ async function sendReaderTestGroupPostDirect({
             targetRef: targetChatId || null,
             targetName: 'Reader Test Group',
             messageId: directResult?.messageId || null,
+            couponCodeMessageId: couponCodeResult?.messageId || null,
             extraMessageIds: Array.isArray(directResult?.extraMessageIds) ? directResult.extraMessageIds : [],
             method: directResult?.method || 'sendMessage'
           }
         ],
         messageId: directResult?.messageId || null,
+        couponCodeMessageId: couponCodeResult?.messageId || null,
         chatId: directResult?.chatId || targetChatId || null
       }
     },
@@ -11566,6 +13266,7 @@ async function sendReaderTestGroupPostDirect({
           targetRef: targetChatId || null,
           targetName: 'Reader Test Group',
           messageId: directResult?.messageId || null,
+          couponCodeMessageId: couponCodeResult?.messageId || null,
           extraMessageIds: Array.isArray(directResult?.extraMessageIds) ? directResult.extraMessageIds : [],
           method: directResult?.method || 'sendMessage'
         }
@@ -11585,6 +13286,32 @@ async function sendReaderTestGroupPostDirect({
 }
 
 async function processTelegramReaderPipeline(sessionName, source, structuredMessage, options = {}) {
+  const copybotState = getCopybotRuntimeState();
+  if (copybotState.enabled !== true) {
+    console.warn('[COPYBOT_SKIP_PIPELINE_DISABLED]', {
+      sessionName,
+      sourceId: source?.id || null,
+      group: structuredMessage?.group || '',
+      messageId: structuredMessage?.messageId || '',
+      reason: copybotState.reason,
+      envEnabled: copybotState.envEnabled,
+      settingEnabled: copybotState.settingEnabled
+    });
+    return {
+      accepted: false,
+      status: 'skipped',
+      reason: 'Copybot deaktiviert.',
+      reasonCode: 'copybot_disabled',
+      decision: 'SKIP',
+      queueId: null,
+      queueStatus: '',
+      messageId: null,
+      postedToTestGroup: false,
+      forcedToTestGroup: false,
+      trigger: cleanText(options.trigger) || 'reader'
+    };
+  }
+
   let detectedAsin = extractAsin(structuredMessage.text) || extractAsin(structuredMessage.link) || extractAsin(structuredMessage.externalLink);
   const explicitAmazonLink =
     findAmazonLinkInText(structuredMessage.text) ||
@@ -13291,6 +15018,7 @@ async function processTelegramReaderPipeline(sessionName, source, structuredMess
         source,
         structuredMessage,
         generatorInput,
+        generatorContext,
         similarCheck: similarProductCheck
       });
       if (optimizedChannelResult?.sent === true || optimizedChannelResult?.messageId) {
@@ -13946,6 +15674,50 @@ async function handleWatchedTelegramMessage(sessionName, message, options = {}) 
     updateChannelCheckpoint(matchedChannel.id, message.id, structuredMessage.timestamp);
   }
   appendRecentMessage(normalizedSessionName, structuredMessage);
+
+  const copybotState = getCopybotRuntimeState();
+  if (copybotState.enabled !== true) {
+    console.warn('[COPYBOT_SKIP_INPUT_DISABLED]', {
+      sessionName: normalizedSessionName,
+      sourceId: source?.id || null,
+      group: structuredMessage.group,
+      messageId: structuredMessage.messageId,
+      reason: copybotState.reason,
+      envEnabled: copybotState.envEnabled,
+      settingEnabled: copybotState.settingEnabled
+    });
+    logTelegramReaderEvent({
+      level: 'warning',
+      eventType: 'copybot.skip.input.disabled',
+      sourceId: source?.id || null,
+      message: 'Telegram Input uebersprungen, weil Copybot deaktiviert ist.',
+      payload: {
+        sessionName: normalizedSessionName,
+        group: structuredMessage.group,
+        messageId: structuredMessage.messageId,
+        copybotState
+      }
+    });
+
+    return {
+      structuredMessage,
+      source,
+      matchedChannel,
+      effectiveChannel,
+      pipelineResult: {
+        accepted: false,
+        status: 'skipped',
+        reason: 'Copybot deaktiviert.',
+        reasonCode: 'copybot_disabled',
+        decision: 'SKIP',
+        queueId: null,
+        queueStatus: '',
+        messageId: null,
+        postedToTestGroup: false,
+        forcedToTestGroup: false
+      }
+    };
+  }
 
   const sessionRow = getSessionRowByName(normalizedSessionName);
   if (sessionRow) {
@@ -16048,6 +17820,7 @@ export const __testablesTelegramUserClient = {
   resolveScrapedDealSellerIdentity,
   resolveFbmSellerProfileReviewBlock,
   evaluateTelegramReaderGeneratorCandidate,
+  extractTelegramCouponCode,
   resolveReaderTitlePayload,
   resolveReaderPricePayload,
   resolveReaderImagePayload,
@@ -16057,7 +17830,11 @@ export const __testablesTelegramUserClient = {
   collectProtectedSourceMatches,
   classifyRelaxedAmazonMatchScore,
   extractSourceProductFacts,
+  resolveOptimizedCouponContext,
+  buildOptimizedSimilarDealPost,
   findCheapestAllowedVariation,
+  resolveCheapestFinalOffer,
+  runSimilarProductOptimizationCheck,
   resolveProductVerification,
   isOwnAmazonAffiliateLink,
   buildReaderCompactDebugBlockV3,

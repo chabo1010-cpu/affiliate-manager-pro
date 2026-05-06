@@ -9,7 +9,12 @@ process.env.APP_DB_PATH = path.join(tempRoot, 'deals.db');
 process.env.TELEGRAM_BOT_TOKEN = 'test-token';
 process.env.TELEGRAM_CHAT_ID = '-1001234567890';
 
-const { sendTelegramDealPost, sendTelegramPost, __testablesTelegramSender } = await import('../services/telegramSenderService.js');
+const {
+  sendTelegramCouponFollowUp,
+  sendTelegramDealPost,
+  sendTelegramPost,
+  __testablesTelegramSender
+} = await import('../services/telegramSenderService.js');
 
 const { splitTelegramPhotoPostText, trimTelegramPhotoCaption } = __testablesTelegramSender;
 const tinyPngDataUrl =
@@ -293,6 +298,61 @@ await test('sendTelegramDealPost faellt bei sendPhoto-Fehler auf sendMessage mit
     assert.match(fallbackPayload.text, /79,99€/);
     assert.match(fallbackPayload.text, /https:\/\/www\.amazon\.de\/dp\/B0TEST1234\?tag=codeundcoup08-21/);
     assert.equal(result.method, 'sendMessage');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+await test('sendTelegramCouponFollowUp nutzt denselben Copy-Button wie der Generator', async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+
+  global.fetch = async (url, init = {}) => {
+    requests.push({
+      url: String(url),
+      init
+    });
+
+    return {
+      ok: true,
+      text: async () =>
+        JSON.stringify({
+          ok: true,
+          result: {
+            message_id: requests.length,
+            chat: {
+              id: process.env.TELEGRAM_CHAT_ID
+            }
+          }
+        })
+    };
+  };
+
+  try {
+    const result = await sendTelegramCouponFollowUp({
+      couponCode: 'LVYF4QEK',
+      chatId: process.env.TELEGRAM_CHAT_ID,
+      titlePreview: 'Generator Rabattcode'
+    });
+
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/sendMessage$/);
+
+    const payload = JSON.parse(requests[0].init.body);
+    assert.equal(payload.text, 'CODE:\nLVYF4QEK');
+    assert.deepEqual(payload.reply_markup, {
+      inline_keyboard: [
+        [
+          {
+            text: '📋 Zum Kopieren hier klicken',
+            copy_text: {
+              text: 'LVYF4QEK'
+            }
+          }
+        ]
+      ]
+    });
+    assert.equal(result?.messageId, 1);
   } finally {
     global.fetch = originalFetch;
   }

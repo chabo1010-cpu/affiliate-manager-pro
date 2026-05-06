@@ -459,7 +459,17 @@ export async function sendTelegramDealToTargets(input = {}) {
         imageUrl: input.imageUrl,
         chatId: target.chatId,
         fallbackText: text,
-        rabattgutscheinCode: input.rabattgutscheinCode
+        rabattgutscheinCode: input.rabattgutscheinCode,
+        duplicateContext: {
+          channelType: cleanText(queuePayload.telegramDuplicateChannelType || queuePayload.meta?.telegramRoutingChannel || 'telegram'),
+          targetRef: target.chatId,
+          asin: cleanText(queuePayload.asin).toUpperCase(),
+          title: cleanText(queuePayload.title),
+          price: cleanText(queuePayload.currentPrice),
+          url: cleanText(queuePayload.normalizedUrl || queuePayload.link),
+          originalUrl: cleanText(queuePayload.link),
+          postContext: cleanText(queuePayload.telegramDuplicatePostContext || '')
+        }
       });
 
       deliveredTargets.push({

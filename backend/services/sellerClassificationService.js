@@ -58,6 +58,16 @@ const BUYBOX_COMBINED_AMAZON_PATTERNS = [
     regex: /^verk(?:ae|a)ufer\s+amazon(?:\.de)?$/
   }
 ];
+const BUYBOX_COMBINED_THIRDPARTY_PATTERNS = [
+  {
+    key: 'versender_verkaufer_drittanbieter',
+    regex: /versender(?:\s+(?:und|and))?\s+verk(?:ae|a)ufer\s+(?!amazon(?:\.de)?(?:\s|$))[^.,;\n]+/
+  },
+  {
+    key: 'verkaufer_versender_drittanbieter',
+    regex: /verk(?:ae|a)ufer(?:\s+(?:und|and))?\s+versender\s+(?!amazon(?:\.de)?(?:\s|$))[^.,;\n]+/
+  }
+];
 const SOLD_BY_AMAZON_PATTERNS = [
   {
     key: 'verkauf_durch_amazon',
@@ -510,6 +520,14 @@ function collectCombinedAmazonPatternKeys(normalizedMerchantText = '', detection
   ]);
 }
 
+function collectCombinedThirdPartyPatternKeys(normalizedMerchantText = '', detectionSource = '') {
+  if (sourceSupportsCombinedSellerShippingDetection(detectionSource) !== true) {
+    return [];
+  }
+
+  return collectMatchedPatternKeys(normalizedMerchantText, BUYBOX_COMBINED_THIRDPARTY_PATTERNS);
+}
+
 function normalizeLegacySellerType(value = '') {
   const normalized = cleanText(String(value || '')).toUpperCase();
 
@@ -667,6 +685,7 @@ export function extractSellerSignalsFromText(value = '', options = {}) {
 
   const normalizedMerchantText = normalizeSellerTextForMatching(merchantText);
   const matchedDirectAmazonPatterns = collectCombinedAmazonPatternKeys(normalizedMerchantText, rawDetectionSource);
+  const matchedCombinedThirdPartyPatterns = collectCombinedThirdPartyPatternKeys(normalizedMerchantText, rawDetectionSource);
   const matchedSoldAmazonPatterns = collectMatchedPatternKeys(normalizedMerchantText, SOLD_BY_AMAZON_PATTERNS);
   const matchedShippedAmazonPatterns = collectMatchedPatternKeys(normalizedMerchantText, SHIPPED_BY_AMAZON_PATTERNS);
   const matchedSoldThirdPartyPatterns = collectMatchedPatternKeys(normalizedMerchantText, SOLD_BY_THIRDPARTY_PATTERNS);
@@ -682,11 +701,12 @@ export function extractSellerSignalsFromText(value = '', options = {}) {
   }
 
   const soldByAmazon = matchedDirectAmazonPatterns.length > 0 || matchedSoldAmazonPatterns.length > 0;
-  const soldByThirdParty = matchedSoldThirdPartyPatterns.length > 0;
+  const soldByThirdParty = matchedCombinedThirdPartyPatterns.length > 0 || matchedSoldThirdPartyPatterns.length > 0;
   const shippedByAmazon = matchedDirectAmazonPatterns.length > 0 || matchedShippedAmazonPatterns.length > 0;
-  const shippedByThirdParty = matchedShippedThirdPartyPatterns.length > 0;
+  const shippedByThirdParty = matchedCombinedThirdPartyPatterns.length > 0 || matchedShippedThirdPartyPatterns.length > 0;
   const matchedPatterns = uniqueCleanValues([
     ...matchedDirectAmazonPatterns,
+    ...matchedCombinedThirdPartyPatterns,
     ...matchedSoldAmazonPatterns,
     ...matchedShippedAmazonPatterns,
     ...matchedSoldThirdPartyPatterns,

@@ -31,11 +31,21 @@ function requireAdmin(req, res, next) {
 }
 
 router.get('/queue', (req, res) => {
-  res.json({ items: listPublishingQueue() });
+  const limit = Number(req.query?.limit);
+  res.json({
+    items: listPublishingQueue({
+      limit: Number.isFinite(limit) && limit > 0 ? limit : undefined
+    })
+  });
 });
 
 router.get('/logs', (req, res) => {
-  res.json({ items: listPublishingLogs() });
+  const limit = Number(req.query?.limit);
+  res.json({
+    items: listPublishingLogs({
+      limit: Number.isFinite(limit) && limit > 0 ? limit : undefined
+    })
+  });
 });
 
 router.get('/workers/status', (req, res) => {
