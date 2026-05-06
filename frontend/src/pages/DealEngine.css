@@ -1,6 +1,7 @@
 .engine-page {
   display: grid;
   gap: 1rem;
+  min-width: 0;
 }
 
 .engine-hero,
@@ -12,9 +13,9 @@
 .engine-hero {
   padding: 1.25rem;
   background:
-    radial-gradient(circle at top right, rgba(56, 189, 248, 0.12), transparent 28%),
-    radial-gradient(circle at bottom left, rgba(34, 197, 94, 0.12), transparent 26%),
-    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(8, 13, 24, 0.98));
+    radial-gradient(circle at top right, rgba(212, 175, 55, 0.12), transparent 28%),
+    radial-gradient(circle at bottom left, rgba(93, 159, 232, 0.08), transparent 26%),
+    linear-gradient(180deg, rgba(19, 24, 32, 0.98), rgba(12, 15, 20, 0.99));
 }
 
 .engine-hero::before,
@@ -28,12 +29,19 @@
   left: 1rem;
   right: 1rem;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(56, 189, 248, 0.35), transparent);
+  background: linear-gradient(90deg, transparent, rgba(212, 175, 55, 0.38), transparent);
 }
 
 .engine-hero-grid {
   display: grid;
   gap: 1rem;
+}
+
+@media (min-width: 1160px) {
+  .engine-hero-grid {
+    grid-template-columns: minmax(0, 1.35fr) auto;
+    align-items: start;
+  }
 }
 
 .engine-hero-copy {
@@ -61,7 +69,7 @@
   padding: 0.9rem 1rem;
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(212, 175, 55, 0.08);
 }
 
 .engine-inline-alert p {
@@ -73,8 +81,17 @@
   display: grid;
   gap: 0.95rem;
   background:
-    radial-gradient(circle at top right, rgba(34, 211, 238, 0.08), transparent 26%),
-    linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(9, 15, 28, 0.97));
+    radial-gradient(circle at top right, rgba(212, 175, 55, 0.08), transparent 26%),
+    linear-gradient(180deg, rgba(20, 25, 32, 0.97), rgba(12, 15, 20, 0.99));
+}
+
+.engine-panel-compact {
+  gap: 0.8rem;
+}
+
+.engine-panel .page-title {
+  font-size: clamp(1.1rem, 1.8vw, 1.4rem);
+  line-height: 1.18;
 }
 
 .engine-panel-header,
@@ -96,6 +113,17 @@
   display: grid;
   gap: 0.85rem;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  align-items: stretch;
+}
+
+.engine-summary-grid,
+.engine-action-grid,
+.engine-tab-grid,
+.engine-rule-list,
+.engine-log-list,
+.engine-detail-list {
+  display: grid;
+  gap: 0.85rem;
 }
 
 .engine-card,
@@ -107,7 +135,9 @@
   padding: 0.95rem 1rem;
   border-radius: 20px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: linear-gradient(180deg, rgba(17, 24, 39, 0.92), rgba(9, 15, 28, 0.96));
+  background: linear-gradient(180deg, rgba(22, 27, 35, 0.96), rgba(14, 18, 24, 0.98));
+  min-width: 0;
+  height: 100%;
 }
 
 .engine-card h3,
@@ -121,6 +151,168 @@
   margin: 0;
   color: #93a2b9;
   line-height: 1.45;
+}
+
+.engine-card-compact {
+  gap: 0.45rem;
+}
+
+.engine-card-compact h3 {
+  font-size: 1.15rem;
+}
+
+.engine-card-action {
+  background: linear-gradient(180deg, rgba(60, 48, 18, 0.18), rgba(16, 20, 27, 0.98));
+}
+
+.engine-card-rule {
+  background: linear-gradient(180deg, rgba(28, 22, 40, 0.18), rgba(14, 18, 24, 0.98));
+}
+
+.engine-card-log {
+  background: linear-gradient(180deg, rgba(11, 14, 19, 0.98), rgba(7, 9, 13, 1));
+}
+
+.engine-card-action button,
+.engine-flow-card button {
+  align-self: start;
+}
+
+.engine-chip-row,
+.engine-rule-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.engine-rule-meta span,
+.engine-tab-button small {
+  color: #8fa0b9;
+  font-size: 0.82rem;
+}
+
+.engine-action-stack {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.engine-tab-stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.engine-tab-shell {
+  gap: 1rem;
+}
+
+.engine-tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.engine-tab-button {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 148px;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+  color: #dbeafe;
+  text-align: left;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.engine-tab-button span {
+  font-weight: 600;
+}
+
+.engine-tab-button:hover {
+  border-color: rgba(212, 175, 55, 0.32);
+  background: rgba(212, 175, 55, 0.08);
+  transform: translateY(-1px);
+}
+
+.engine-tab-button.active {
+  border-color: rgba(212, 175, 55, 0.42);
+  background: linear-gradient(180deg, rgba(212, 175, 55, 0.14), rgba(212, 175, 55, 0.06));
+  box-shadow: inset 0 0 0 1px rgba(212, 175, 55, 0.16);
+  color: #f4e4ac;
+}
+
+.engine-tab-content {
+  display: grid;
+  gap: 1rem;
+}
+
+.engine-list-compact,
+.engine-list-section {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.engine-log-item,
+.engine-card-log {
+  background: linear-gradient(180deg, rgba(12, 18, 33, 0.96), rgba(8, 13, 24, 0.98));
+}
+
+.engine-log-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.engine-log-toolbar label {
+  display: grid;
+  gap: 0.35rem;
+  min-width: min(100%, 240px);
+}
+
+.engine-log-body {
+  margin: 0;
+  color: #dbeafe;
+  font-family: 'IBM Plex Mono', 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.84rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.engine-code-compact {
+  min-height: 0;
+  font-size: 0.84rem;
+}
+
+.engine-detail-card {
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(20, 24, 32, 0.94), rgba(12, 15, 20, 0.98));
+  padding: 0.9rem 1rem;
+}
+
+.engine-detail-card summary {
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+  color: #dbeafe;
+}
+
+.engine-detail-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.engine-detail-content {
+  display: grid;
+  gap: 0.9rem;
+  padding-top: 0.85rem;
+}
+
+.engine-empty {
+  padding: 0.85rem 0.95rem;
+  border: 1px dashed rgba(148, 163, 184, 0.14);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.025);
 }
 
 .engine-tone-success {
@@ -239,6 +431,19 @@
     align-items: start;
   }
 
+  .engine-summary-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .engine-tab-grid-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .engine-tab-grid-rules {
+    grid-template-columns: minmax(320px, 0.95fr) minmax(0, 1.15fr);
+    align-items: start;
+  }
+
   .engine-settings-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -279,5 +484,10 @@
 
   .engine-actions button {
     width: 100%;
+  }
+
+  .engine-tab-button {
+    width: 100%;
+    min-width: 0;
   }
 }

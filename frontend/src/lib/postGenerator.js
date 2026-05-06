@@ -122,10 +122,14 @@ function normalizePrimaryOptions(value) {
   return trimmed ? [trimmed] : [];
 }
 
-const TELEGRAM_TITLE_MAX_LENGTH = 90;
+const TELEGRAM_TITLE_MAX_LENGTH = 110;
 const TELEGRAM_TITLE_PRESERVE_THRESHOLD = 80;
 const TELEGRAM_TITLE_MIN_WORD_COUNT = 3;
+const TELEGRAM_TITLE_TARGET_WIDTH = 100;
+const TELEGRAM_TITLE_MAX_WIDTH = 108;
 const SHORT_TITLE_MAX_LENGTH = TELEGRAM_TITLE_MAX_LENGTH;
+const TITLE_VISUAL_NARROW_CHARS = new Set(['i', 'l', 'j', 't', 'I', 'f', 'r', '1']);
+const TITLE_VISUAL_WIDE_CHARS = new Set(['m', 'w', 'M', 'W', 'O', 'Q', 'G', 'D', '@', '&', '%']);
 const TITLE_MODEL_WORDS = new Set(['cr0557', 'noos', 'dnm', 'dest']);
 const TITLE_FILLER_WORDS = new Set([
   'the',
@@ -153,6 +157,16 @@ const COLOR_NORMALIZATIONS = [
   [/\bblue\b/gi, 'Blue'],
   [/\bdenim\b/gi, 'Denim']
 ];
+const TITLE_DUPLICATE_TRANSLATION_RULES = [
+  {
+    required: [/\bzahnb(?:u|ue|\u00fc)rste\b/iu, /\btoothbrush\b/iu],
+    remove: [/\belectric\s+toothbrush\b/giu, /\btoothbrush\b/giu, /\belektrische(?:n|r|s|m)?\b/giu]
+  },
+  {
+    required: [/\bkopfhoerer\b|\bkopfh(?:o|oe|\u00f6)rer\b/iu, /\bheadphones?\b/iu],
+    remove: [/\bheadphones?\b/giu]
+  }
+];
 const PRODUCT_TYPE_RULES = [
   { pattern: /\b(?:kochgeschirr|topf|pfannen?)\s*-?\s*set\b/i, value: 'Kochgeschirr Set' },
   { pattern: /\bgeschenk(?:e|set)?\b|\bgeschenke\b/i, value: 'Geschenkset' },
@@ -172,11 +186,13 @@ const PRODUCT_TYPE_RULES = [
   { pattern: /\bshirt\b|\bt-?shirt\b/i, value: 'Shirt' },
   { pattern: /\bkleid\b|\bdress\b/i, value: 'Kleid' },
   { pattern: /\bschuhe\b|\bsneaker\b|\bshoes\b/i, value: 'Sneaker' },
+  { pattern: /\b(?:zahnb(?:u|ue|\u00fc)rste|toothbrush)\b/i, value: 'Zahnbuerste' },
   { pattern: /\bkratzbaum\b|\bkatzenbaum\b/i, value: 'Kratzbaum' }
 ];
 const FEATURE_RULES = [
   { pattern: /\bchronograph(?:en)?\b/i, value: 'Chronograph' },
   { pattern: /\bgaming\b/i, value: 'Gaming' },
+  { pattern: /\b(?:gefuettert|gef(?:u|ue|\u00fc)ttert|insulated|padded)\b/i, value: 'gefuettert' },
   { pattern: /\bwide\s+leg\b/i, value: 'Wide Leg' },
   { pattern: /\bslim\s+fit\b/i, value: 'Slim Fit' },
   { pattern: /\bregular\s+fit\b/i, value: 'Regular Fit' },
@@ -204,11 +220,104 @@ const MATERIAL_FEATURE_RULES = [
 ];
 
 function normalizeTitleText(value) {
-  return cleanText(value)
+  return cleanText(removeDuplicateLocalizedTitlePhrases(value))
     .replace(/[()[\]{}]/g, ' ')
     .replace(/\s*\|\s*/g, ', ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function hasVisibleTelegramEmoji(char = '') {
+  return /\p{Extended_Pictographic}|\p{Emoji_Presentation}/u.test(char);
+}
+
+function estimateTelegramCharacterWidth(char = '') {
+  if (!char) {
+    return 0;
+  }
+
+  if (/\s/u.test(char)) {
+    return 0.34;
+  }
+
+  if (hasVisibleTelegramEmoji(char)) {
+    return 2.2;
+  }
+
+  if (TITLE_VISUAL_NARROW_CHARS.has(char)) {
+    return 0.56;
+  }
+
+  if (TITLE_VISUAL_WIDE_CHARS.has(char)) {
+    return 1.42;
+  }
+
+  if (/[.,:;'"`]/u.test(char)) {
+    return 0.3;
+  }
+
+  if (/[-_/+|()[\]{}]/u.test(char)) {
+    return 0.48;
+  }
+
+  if (/\d/u.test(char)) {
+    return 0.92;
+  }
+
+  if (/[A-ZÄÖÜ]/u.test(char)) {
+    return 1.1;
+  }
+
+  if (/[mwäöüß]/iu.test(char)) {
+    return 1.18;
+  }
+
+  if (/\p{L}/u.test(char)) {
+    return 0.98;
+  }
+
+  return 1;
+}
+
+export function estimateTelegramTextWidth(text = '') {
+  return Array.from(cleanText(text)).reduce((sum, char) => sum + estimateTelegramCharacterWidth(char), 0);
+}
+
+function titleFitsTelegramBounds(title, maxLength = TELEGRAM_TITLE_MAX_LENGTH, maxWidth = TELEGRAM_TITLE_MAX_WIDTH) {
+  const trimmed = cleanText(title).replace(/\s+/g, ' ');
+  if (!trimmed) {
+    return true;
+  }
+
+  return trimmed.length <= maxLength && estimateTelegramTextWidth(trimmed) <= maxWidth;
+}
+
+function removeDuplicateLocalizedTitlePhrases(value) {
+  let normalized = cleanText(value);
+
+  TITLE_DUPLICATE_TRANSLATION_RULES.forEach((rule) => {
+    if (!rule.required.every((pattern) => pattern.test(normalized))) {
+      return;
+    }
+
+    rule.remove.forEach((pattern) => {
+      normalized = normalized.replace(pattern, ' ');
+    });
+  });
+
+  return normalized
+    .replace(/\s+,/g, ',')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function hasTelegramTitleCleanupSignals(title = '') {
+  const trimmed = cleanText(title);
+  if (!trimmed) {
+    return false;
+  }
+
+  return removeDuplicateLocalizedTitlePhrases(trimmed) !== trimmed;
 }
 
 function toTitleCase(value) {
@@ -349,6 +458,11 @@ function extractGiftFeature(title) {
 }
 
 function extractProductLine(title, brand = '', productType = '') {
+  const namedSeriesMatch = cleanText(title).match(/\b(?:pro\s+series\s+\d+|pike\s+lake|dual\s+zone|diamondclean\s+smart)\b/i);
+  if (namedSeriesMatch?.[0]) {
+    return toDisplayCase(namedSeriesMatch[0]);
+  }
+
   const firstSegment = compactTitleWords(normalizeTitleText(title).split(',')[0] || title);
   const tokens = firstSegment.split(/\s+/).filter(Boolean);
   const normalizedBrand = cleanText(brand).toLowerCase();
@@ -512,9 +626,16 @@ function countTitleWords(value) {
     .filter(Boolean).length;
 }
 
-function enforceTelegramTitleLength(title, maxLength = TELEGRAM_TITLE_MAX_LENGTH) {
+function cleanTrimmedTitleTail(value) {
+  return cleanText(value)
+    .replace(/[,\s-]+$/g, '')
+    .replace(/\b(?:und|oder|mit|fuer|f(?:u|ue|\u00fc)r|with|and|or)$/i, '')
+    .trim();
+}
+
+function enforceTelegramTitleLength(title, maxLength = TELEGRAM_TITLE_MAX_LENGTH, maxWidth = TELEGRAM_TITLE_MAX_WIDTH) {
   const normalizedTitle = cleanText(title).replace(/\s+/g, ' ');
-  if (normalizedTitle.length <= maxLength) {
+  if (titleFitsTelegramBounds(normalizedTitle, maxLength, maxWidth)) {
     return normalizedTitle;
   }
 
@@ -522,26 +643,75 @@ function enforceTelegramTitleLength(title, maxLength = TELEGRAM_TITLE_MAX_LENGTH
   const protectedPrefix = cleanText(protectedMatch?.[1] || '');
   const remainder = cleanText(protectedMatch?.[2] || '');
 
-  if (protectedPrefix && protectedPrefix.length < maxLength - 8) {
-    const remainingSpace = maxLength - protectedPrefix.length - 3;
-    const shortenedRemainder = smartTrimTitle(remainder, remainingSpace);
+  if (protectedPrefix) {
+    const remainingLength = Math.max(20, maxLength - protectedPrefix.length - 3);
+    const remainingWidth = Math.max(18, maxWidth - estimateTelegramTextWidth(`${protectedPrefix} â€“ `));
+    const shortenedRemainder = smartTrimTitle(remainder, remainingLength, remainingWidth);
     const rebuilt = cleanText(`${protectedPrefix} – ${shortenedRemainder}`);
-    if (rebuilt.length <= maxLength && shortenedRemainder) {
+    if (shortenedRemainder && titleFitsTelegramBounds(rebuilt, maxLength, maxWidth)) {
       return rebuilt;
     }
   }
 
+  const ellipsisWidth = estimateTelegramTextWidth('...');
   const ellipsisMaxLength = Math.max(20, maxLength - 3);
-  return `${smartTrimTitle(normalizedTitle, ellipsisMaxLength)}...`;
+  const ellipsisMaxWidth = Math.max(18, maxWidth - ellipsisWidth);
+  const shortenedBase = smartTrimTitle(normalizedTitle, ellipsisMaxLength, ellipsisMaxWidth);
+  return shortenedBase ? `${shortenedBase}...` : smartTrimTitle(normalizedTitle, maxLength, maxWidth);
 }
 
-function smartTrimTitle(title, maxLength = SHORT_TITLE_MAX_LENGTH) {
-  const trimmed = cleanText(title);
-  if (trimmed.length <= maxLength) {
+function smartTrimTitle(title, maxLength = SHORT_TITLE_MAX_LENGTH, maxWidth = TELEGRAM_TITLE_MAX_WIDTH) {
+  const trimmed = cleanText(title).replace(/\s+/g, ' ');
+  if (titleFitsTelegramBounds(trimmed, maxLength, maxWidth)) {
     return trimmed;
   }
 
-  const cutAt = Math.max(
+  const characters = Array.from(trimmed);
+  let width = 0;
+  let visibleLength = 0;
+  let lastPreferredCut = -1;
+  let lastSafeCut = -1;
+
+  for (let index = 0; index < characters.length; index += 1) {
+    const char = characters[index];
+    const nextChar = characters[index + 1] || '';
+    const nextLength = visibleLength + char.length;
+    const nextWidth = width + estimateTelegramCharacterWidth(char);
+
+    if (nextLength > maxLength || nextWidth > maxWidth) {
+      break;
+    }
+
+    visibleLength = nextLength;
+    width = nextWidth;
+
+    if (/\s/u.test(nextChar)) {
+      lastSafeCut = index + 1;
+    }
+
+    if ((/\s/u.test(nextChar) || !nextChar) && /[,:;/-]/u.test(char)) {
+      lastPreferredCut = index + 1;
+    }
+  }
+
+  const directCandidate = cleanTrimmedTitleTail(characters.join('').slice(0, visibleLength));
+  const minimumReasonableCut = Math.floor(Math.min(characters.length, maxLength) * 0.55);
+  const preferredCutIndex = lastPreferredCut >= minimumReasonableCut ? lastPreferredCut : -1;
+  const safeCutIndex = lastSafeCut >= minimumReasonableCut ? lastSafeCut : -1;
+  const selectedCutIndex = preferredCutIndex > -1 ? preferredCutIndex : safeCutIndex > -1 ? safeCutIndex : visibleLength;
+  const widthAwareCandidate = cleanTrimmedTitleTail(characters.slice(0, selectedCutIndex).join(''));
+
+  if (countTitleWords(widthAwareCandidate) >= TELEGRAM_TITLE_MIN_WORD_COUNT) {
+    return widthAwareCandidate;
+  }
+
+  if (countTitleWords(directCandidate) >= TELEGRAM_TITLE_MIN_WORD_COUNT) {
+    return directCandidate;
+  }
+
+  return widthAwareCandidate || directCandidate || cleanTrimmedTitleTail(trimmed.slice(0, maxLength));
+  /*
+
     trimmed.lastIndexOf(' – ', maxLength),
     trimmed.lastIndexOf(' - ', maxLength),
     trimmed.lastIndexOf(', ', maxLength),
@@ -553,6 +723,7 @@ function smartTrimTitle(title, maxLength = SHORT_TITLE_MAX_LENGTH) {
     .replace(/[,\s-]+$/g, '')
     .replace(/\b(?:und|oder|mit|fuer|fÃ¼r|with|and|or)$/i, '')
     .trim();
+*/
 }
 
 function appendUniqueTitlePart(parts, value) {
@@ -688,7 +859,11 @@ function buildLongTelegramTitleCandidate(originalTitle, maxLength = TELEGRAM_TIT
     .filter(Boolean);
   const cleanedFullTitle = joinUniqueTitleParts(cleanedSegments);
 
-  if (cleanedFullTitle && cleanedFullTitle.length <= maxLength && countTitleWords(cleanedFullTitle) >= TELEGRAM_TITLE_MIN_WORD_COUNT) {
+  if (
+    cleanedFullTitle &&
+    titleFitsTelegramBounds(cleanedFullTitle, maxLength, TELEGRAM_TITLE_MAX_WIDTH) &&
+    countTitleWords(cleanedFullTitle) >= TELEGRAM_TITLE_MIN_WORD_COUNT
+  ) {
     return cleanedFullTitle;
   }
 
@@ -697,7 +872,7 @@ function buildLongTelegramTitleCandidate(originalTitle, maxLength = TELEGRAM_TIT
   const selectedExtras = [...preferredExtras];
   let candidate = joinUniqueTitleParts([mainSegment, ...selectedExtras]);
 
-  while (selectedExtras.length > 0 && candidate.length > maxLength) {
+  while (selectedExtras.length > 0 && !titleFitsTelegramBounds(candidate, maxLength, TELEGRAM_TITLE_MAX_WIDTH)) {
     selectedExtras.pop();
     candidate = joinUniqueTitleParts([mainSegment, ...selectedExtras]);
   }
@@ -713,7 +888,9 @@ function buildLongTelegramTitleCandidate(originalTitle, maxLength = TELEGRAM_TIT
     candidate = cleanedFullTitle || mainSegment || normalizedTitle;
   }
 
-  return candidate.length <= maxLength ? candidate : enforceTelegramTitleLength(candidate, maxLength);
+  return titleFitsTelegramBounds(candidate, maxLength, TELEGRAM_TITLE_MAX_WIDTH)
+    ? candidate
+    : enforceTelegramTitleLength(candidate, maxLength, TELEGRAM_TITLE_MAX_WIDTH);
 }
 
 function buildTelegramTitleInternal(originalTitle, maxLength = TELEGRAM_TITLE_MAX_LENGTH) {
@@ -722,11 +899,27 @@ function buildTelegramTitleInternal(originalTitle, maxLength = TELEGRAM_TITLE_MA
     return '';
   }
 
-  if (safeOriginalTitle.length <= TELEGRAM_TITLE_PRESERVE_THRESHOLD) {
+  const normalizedOriginalTitle = normalizeTitleText(safeOriginalTitle);
+  const hasCleanupSignals = hasTelegramTitleCleanupSignals(safeOriginalTitle);
+
+  if (
+    safeOriginalTitle.length <= TELEGRAM_TITLE_PRESERVE_THRESHOLD &&
+    !hasCleanupSignals &&
+    titleFitsTelegramBounds(safeOriginalTitle, maxLength, TELEGRAM_TITLE_MAX_WIDTH)
+  ) {
     return safeOriginalTitle;
   }
 
-  return buildLongTelegramTitleCandidate(safeOriginalTitle, maxLength);
+  if (
+    normalizedOriginalTitle &&
+    hasCleanupSignals &&
+    countTitleWords(normalizedOriginalTitle) >= TELEGRAM_TITLE_MIN_WORD_COUNT &&
+    titleFitsTelegramBounds(normalizedOriginalTitle, maxLength, TELEGRAM_TITLE_TARGET_WIDTH)
+  ) {
+    return normalizedOriginalTitle;
+  }
+
+  return buildLongTelegramTitleCandidate(normalizedOriginalTitle || safeOriginalTitle, maxLength);
 }
 
 export function buildTelegramTitle(originalTitle, maxLength = TELEGRAM_TITLE_MAX_LENGTH) {
@@ -738,10 +931,10 @@ export function buildTelegramTitle(originalTitle, maxLength = TELEGRAM_TITLE_MAX
       stage: 'buildTelegramTitle',
       error: error instanceof Error ? error.message : 'Titel konnte nicht gekuerzt werden.'
     });
-    if (safeOriginalTitle.length <= TELEGRAM_TITLE_PRESERVE_THRESHOLD) {
+    if (titleFitsTelegramBounds(safeOriginalTitle, maxLength, TELEGRAM_TITLE_MAX_WIDTH)) {
       return safeOriginalTitle;
     }
-    return enforceTelegramTitleLength(compactTitleWords(originalTitle) || safeOriginalTitle, maxLength);
+    return enforceTelegramTitleLength(compactTitleWords(originalTitle) || safeOriginalTitle, maxLength, TELEGRAM_TITLE_MAX_WIDTH);
   }
 }
 

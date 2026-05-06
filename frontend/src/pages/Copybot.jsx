@@ -6,6 +6,7 @@ import TelegramGroupManager from '../components/telegram/TelegramGroupManager';
 import TelegramUserClientPanel from '../components/telegram/TelegramUserClientPanel';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
+const COPYBOT_LOAD_TIMEOUT_MS = 2000;
 
 const copybotTabs = [
   { label: 'Uebersicht', path: '/copybot' },
@@ -52,6 +53,9 @@ function CopybotPage() {
   const [status, setStatus] = useState('');
   const [telegramReaderSessionName, setTelegramReaderSessionName] = useState('default-user');
   const [loading, setLoading] = useState(true);
+  const [togglePending, setTogglePending] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [sourceForm, setSourceForm] = useState({
     id: 0,
     name: '',
@@ -107,52 +111,137 @@ function CopybotPage() {
     notes: ''
   });
 
-  async function apiFetch(path, options = {}) {
-    const response = await fetch(`${API_BASE_URL}${path}`, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-User-Role': user?.role || '',
-        ...(options.headers || {})
+  async function apiFetch(path, options = {}, timeoutMs = COPYBOT_LOAD_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}${path}`, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Role': user?.role || '',
+          ...(options.headers || {})
+        }
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data?.error || `Request fehlgeschlagen (${response.status})`);
       }
-    });
-    const data = await response.json().catch(() => ({}));
 
-    if (!response.ok) {
-      throw new Error(data?.error || `Request fehlgeschlagen (${response.status})`);
+      return data;
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`Timeout nach ${timeoutMs}ms: ${path}`);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
     }
+  }
 
-    return data;
+  function showToast(message, tone = 'success') {
+    setToast({ message, tone });
   }
 
   async function loadAll() {
+    const startedAt = performance.now();
+    console.info('[COPYBOT_LOAD_START]', {
+      tab: currentTab
+    });
     setLoading(true);
+    setStatus('');
     try {
-      const [overviewData, pricingData, samplingData, sourceData, reviewData, logData] = await Promise.all([
-        apiFetch('/api/copybot/overview'),
-        apiFetch('/api/copybot/pricing-rules'),
-        apiFetch('/api/copybot/sampling-rules'),
-        apiFetch('/api/copybot/sources'),
-        apiFetch('/api/copybot/review-queue'),
-        apiFetch('/api/copybot/logs')
-      ]);
+      const requests = [{ key: 'overview', path: '/api/copybot/overview' }];
+      if (currentTab === '/copybot/telegram-sources' || currentTab === '/copybot/whatsapp-sources') {
+        requests.push({ key: 'pricing', path: '/api/copybot/pricing-rules' });
+        requests.push({ key: 'sampling', path: '/api/copybot/sampling-rules' });
+        requests.push({ key: 'sources', path: '/api/copybot/sources' });
+      } else if (currentTab === '/copybot/pricing-rules') {
+        requests.push({ key: 'pricing', path: '/api/copybot/pricing-rules' });
+      } else if (currentTab === '/copybot/sampling') {
+        requests.push({ key: 'sampling', path: '/api/copybot/sampling-rules' });
+      } else if (currentTab === '/copybot/review') {
+        requests.push({ key: 'review', path: '/api/copybot/review-queue?limit=40' });
+      } else if (currentTab === '/copybot/logs') {
+        requests.push({ key: 'logs', path: '/api/copybot/logs?limit=80' });
+      }
 
-      setOverview(overviewData);
-      setPricingRules(pricingData.items || []);
-      setSamplingRules(samplingData.items || []);
-      setSources(sourceData.items || []);
-      setReviewItems(reviewData.items || []);
-      setLogs(logData.items || []);
+      const results = await Promise.allSettled(requests.map((item) => apiFetch(item.path)));
+
+      requests.forEach((request, index) => {
+        const result = results[index];
+        if (result.status !== 'fulfilled') {
+          return;
+        }
+
+        if (request.key === 'overview') {
+          setOverview(result.value);
+          console.info('[COPYBOT_STATUS_LOADED]', {
+            tab: currentTab,
+            enabled: result.value?.copybotEnabled === true,
+            reason: result.value?.copybotRuntime?.reason || '',
+            lastChangedAt: result.value?.statusAudit?.lastChangedAt || null
+          });
+        }
+        if (request.key === 'pricing') {
+          setPricingRules(result.value.items || []);
+        }
+        if (request.key === 'sampling') {
+          setSamplingRules(result.value.items || []);
+        }
+        if (request.key === 'sources') {
+          setSources(result.value.items || []);
+        }
+        if (request.key === 'review') {
+          setReviewItems(result.value.items || []);
+        }
+        if (request.key === 'logs') {
+          setLogs(result.value.items || []);
+        }
+      });
+
+      const errors = results
+        .filter((item) => item.status === 'rejected')
+        .map((item) => (item.reason instanceof Error ? item.reason.message : 'Copybot-Daten konnten nicht geladen werden.'));
+
+      if (errors.length) {
+        setStatus(errors[0]);
+        console.error('[COPYBOT_LOAD_ERROR]', {
+          tab: currentTab,
+          errors
+        });
+      }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Copybot-Daten konnten nicht geladen werden.');
+      const message = error instanceof Error ? error.message : 'Copybot-Daten konnten nicht geladen werden.';
+      setStatus(message);
+      console.error('[COPYBOT_LOAD_ERROR]', {
+        tab: currentTab,
+        errorMessage: message
+      });
     } finally {
+      console.info('[COPYBOT_LOAD_DONE]', {
+        tab: currentTab,
+        durationMs: Math.round(performance.now() - startedAt)
+      });
       setLoading(false);
     }
   }
 
   useEffect(() => {
     void loadAll();
-  }, [user?.role]);
+  }, [currentTab, reloadKey, user?.role]);
+
+  useEffect(() => {
+    if (!toast) {
+      return undefined;
+    }
+
+    const timerId = window.setTimeout(() => setToast(null), 2600);
+    return () => window.clearTimeout(timerId);
+  }, [toast]);
 
   useEffect(() => {
     if (!pricingRules.length) {
@@ -200,9 +289,15 @@ function CopybotPage() {
   }, [currentTab, sources]);
 
   async function handleToggleCopybot() {
-    if (!isAdmin || !overview) {
+    if (!isAdmin || !overview || togglePending) {
       return;
     }
+
+    setTogglePending(true);
+    console.info('[COPYBOT_TOGGLE_REQUEST]', {
+      currentEnabled: overview.copybotEnabled === true,
+      nextEnabled: overview.copybotEnabled !== true
+    });
 
     try {
       const data = await apiFetch('/api/copybot/settings', {
@@ -210,10 +305,41 @@ function CopybotPage() {
         body: JSON.stringify({ copybotEnabled: !overview.copybotEnabled })
       });
 
-      setOverview((prev) => (prev ? { ...prev, copybotEnabled: Boolean(data.copybotEnabled) } : prev));
-      setStatus(data.copybotEnabled ? 'Copybot global aktiviert.' : 'Copybot global deaktiviert.');
+      setOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              copybotEnabled: Boolean(data.copybotEnabled),
+              copybotRuntime: data.copybotRuntime || prev.copybotRuntime,
+              statusAudit: data.statusAudit || prev.statusAudit,
+              processingStatus: {
+                input: Boolean(data.copybotEnabled) ? 'aktiv' : 'pausiert',
+                queue: Boolean(data.copybotEnabled) ? 'aktiv' : 'pausiert'
+              }
+            }
+          : prev
+      );
+      console.info('[COPYBOT_TOGGLE_SUCCESS]', {
+        enabled: data.copybotEnabled === true,
+        reason: data.copybotRuntime?.reason || '',
+        lastChangedAt: data.statusAudit?.lastChangedAt || null
+      });
+      setStatus(
+        data.copybotEnabled
+          ? 'Copybot global aktiviert.'
+          : `Copybot deaktiviert${data.copybotRuntime?.reason ? ` (${data.copybotRuntime.reason})` : ''}.`
+      );
+      showToast(data.copybotEnabled ? 'Copybot wurde aktiviert.' : 'Copybot wurde deaktiviert.', 'success');
+      setReloadKey((current) => current + 1);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Copybot-Status konnte nicht gespeichert werden.');
+      const message = error instanceof Error ? error.message : 'Copybot-Status konnte nicht gespeichert werden.';
+      console.error('[COPYBOT_TOGGLE_ERROR]', {
+        errorMessage: message
+      });
+      setStatus(message);
+      showToast('Copybot konnte nicht geaendert werden.', 'error');
+    } finally {
+      setTogglePending(false);
     }
   }
 
@@ -253,7 +379,7 @@ function CopybotPage() {
         success_rate: '',
         notes: ''
       });
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Quelle konnte nicht gespeichert werden.');
     }
@@ -266,7 +392,7 @@ function CopybotPage() {
         body: JSON.stringify({ isActive: item.is_active !== 1 })
       });
       setStatus(`Quelle ${item.is_active === 1 ? 'deaktiviert' : 'aktiviert'}.`);
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Quellenstatus konnte nicht aktualisiert werden.');
     }
@@ -276,7 +402,7 @@ function CopybotPage() {
     try {
       await apiFetch(`/api/copybot/sources/${item.id}`, { method: 'DELETE' });
       setStatus('Quelle deaktiviert.');
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Quelle konnte nicht deaktiviert werden.');
     }
@@ -289,7 +415,7 @@ function CopybotPage() {
         body: JSON.stringify({})
       });
       setStatus('Quellentest ausgefuehrt.');
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Quellentest fehlgeschlagen.');
     }
@@ -341,7 +467,7 @@ function CopybotPage() {
         manual_blacklist_keywords: '',
         manual_whitelist_brands: ''
       });
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Preispruef-Logik konnte nicht gespeichert werden.');
     }
@@ -377,7 +503,7 @@ function CopybotPage() {
         min_discount: '',
         notes: ''
       });
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Sampling-Regel konnte nicht gespeichert werden.');
     }
@@ -390,25 +516,48 @@ function CopybotPage() {
         body: JSON.stringify({})
       });
       setStatus(action === 'approve' ? 'Deal freigegeben.' : 'Deal verworfen.');
-      void loadAll();
+      setReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Review-Aktion fehlgeschlagen.');
     }
   }
 
   function renderOverview() {
+    const statusAudit = overview?.statusAudit || {};
+    const processingStatus = overview?.processingStatus || {};
+
     return (
       <div style={{ display: 'grid', gap: '1rem' }}>
         <section className="card" style={{ padding: '1.25rem', display: 'grid', gap: '1rem' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
-            <div>
+            <div style={{ display: 'grid', gap: '0.4rem' }}>
               <p className="section-title">Copybot</p>
               <h1 className="page-title">Uebersicht</h1>
-              <p className="page-subtitle">Quellenbasiertes Deal-Aggregat mit Preispruefung, Sampling und Review.</p>
+              <p className="page-subtitle">Quellenbasiertes Deal-Aggregat mit Preispruefung, Sampling, Review und echtem Live Kill-Switch.</p>
+              <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap' }}>
+                <span className={`status-chip ${overview?.copybotEnabled ? 'success' : 'warning'}`}>
+                  {overview?.copybotEnabled ? 'aktiv' : 'pausiert'}
+                </span>
+                <span className={`status-chip ${processingStatus.input === 'aktiv' ? 'success' : 'warning'}`}>
+                  Input {processingStatus.input || '-'}
+                </span>
+                <span className={`status-chip ${processingStatus.queue === 'aktiv' ? 'success' : 'warning'}`}>
+                  Queue {processingStatus.queue || '-'}
+                </span>
+              </div>
             </div>
-            <button className="primary" onClick={() => void handleToggleCopybot()} disabled={!isAdmin || !overview}>
-              {overview?.copybotEnabled ? 'Copybot deaktivieren' : 'Copybot aktivieren'}
-            </button>
+            <article className="action-card" style={{ minWidth: 'min(100%, 320px)', alignContent: 'start' }}>
+              <p className="section-title">Globaler Toggle</p>
+              <h3 className="card-title">{overview?.copybotEnabled ? 'Copybot aktiv' : 'Copybot deaktiviert'}</h3>
+              <p className="meta-text">
+                {overview?.copybotEnabled
+                  ? 'Neue Quellen werden gelesen, verarbeitet und an Queue/Output weitergegeben.'
+                  : 'Neue Inputs werden sauber uebersprungen, bis der Schalter wieder aktiv ist.'}
+              </p>
+              <button className="primary" onClick={() => void handleToggleCopybot()} disabled={!isAdmin || !overview || togglePending}>
+                {togglePending ? 'Speichere...' : overview?.copybotEnabled ? 'Copybot deaktivieren' : 'Copybot aktivieren'}
+              </button>
+            </article>
           </div>
           <div className="responsive-grid">
             {[
@@ -440,6 +589,21 @@ function CopybotPage() {
               <strong>{overview?.copybotEnabled ? 'Aktiv' : 'Deaktiviert'}</strong>
               <p className="text-muted" style={{ marginBottom: 0 }}>
                 Wenn deaktiviert, werden keine neuen Quellen verarbeitet oder Deals importiert.
+              </p>
+              {overview?.copybotRuntime?.reason && overview.copybotEnabled !== true ? (
+                <p className="text-muted" style={{ marginTop: '0.5rem', marginBottom: 0 }}>
+                  Grund: {overview.copybotRuntime.reason}
+                </p>
+              ) : null}
+            </div>
+            <div className="info-card">
+              <p className="section-title">Letzter Statuswechsel</p>
+              <strong>{formatDateTime(statusAudit.lastChangedAt)}</strong>
+              <p className="text-muted" style={{ marginBottom: 0 }}>
+                Durch {statusAudit.changedBy || '-'} · Quelle {statusAudit.source || '-'}
+              </p>
+              <p className="text-muted" style={{ marginBottom: 0 }}>
+                {statusAudit.message || 'Noch kein dokumentierter Wechsel.'}
               </p>
             </div>
           </div>
@@ -949,6 +1113,12 @@ function CopybotPage() {
 
         {loading ? <section className="card" style={{ padding: '1.25rem' }}>Laedt Copybot-Daten...</section> : renderCurrentTab()}
       </div>
+
+      {toast ? (
+        <div className={`toast ${toast.tone === 'error' ? 'error' : toast.tone === 'info' ? 'info' : 'success'}`}>
+          <p>{toast.message}</p>
+        </div>
+      ) : null}
     </Layout>
   );
 }

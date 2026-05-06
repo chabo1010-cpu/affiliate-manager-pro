@@ -12,9 +12,9 @@
 .ops-hero {
   padding: 1.3rem;
   background:
-    radial-gradient(circle at top right, rgba(34, 211, 238, 0.12), transparent 28%),
-    radial-gradient(circle at bottom left, rgba(14, 165, 233, 0.08), transparent 26%),
-    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(10, 15, 27, 0.98));
+    radial-gradient(circle at top right, rgba(212, 175, 55, 0.12), transparent 28%),
+    radial-gradient(circle at bottom left, rgba(93, 159, 232, 0.06), transparent 26%),
+    linear-gradient(180deg, rgba(19, 24, 32, 0.98), rgba(12, 15, 20, 0.99));
 }
 
 .ops-hero::before,
@@ -30,12 +30,19 @@
   left: 1rem;
   right: 1rem;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.38), transparent);
+  background: linear-gradient(90deg, transparent, rgba(212, 175, 55, 0.4), transparent);
 }
 
 .ops-hero-grid {
   display: grid;
   gap: 1rem;
+}
+
+@media (min-width: 1180px) {
+  .ops-hero-grid {
+    grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.95fr);
+    align-items: start;
+  }
 }
 
 .ops-hero-copy {
@@ -76,7 +83,7 @@
   padding: 0.85rem 0.95rem;
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.025);
   transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
 }
 
@@ -91,8 +98,8 @@
 
 .ops-quick-link:hover {
   transform: translateY(-2px);
-  border-color: rgba(34, 211, 238, 0.24);
-  background: rgba(34, 211, 238, 0.07);
+  border-color: rgba(212, 175, 55, 0.24);
+  background: rgba(212, 175, 55, 0.08);
 }
 
 .ops-inline-alert {
@@ -101,8 +108,8 @@
   gap: 0.75rem;
   padding: 0.85rem 0.95rem;
   border-radius: 18px;
-  border: 1px solid rgba(245, 158, 11, 0.14);
-  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(212, 175, 55, 0.14);
+  background: rgba(212, 175, 55, 0.08);
 }
 
 .ops-inline-alert p {
@@ -145,7 +152,7 @@
   padding: 1rem 1.05rem;
   border-radius: 22px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: linear-gradient(180deg, rgba(17, 24, 39, 0.92), rgba(9, 15, 28, 0.96));
+  background: linear-gradient(180deg, rgba(22, 27, 35, 0.96), rgba(14, 18, 24, 0.98));
   box-shadow: 0 18px 45px rgba(3, 7, 18, 0.25);
   transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
@@ -159,7 +166,7 @@
 .ops-flow-column:hover,
 .ops-feed-item:hover {
   transform: translateY(-2px);
-  border-color: rgba(56, 189, 248, 0.2);
+  border-color: rgba(212, 175, 55, 0.22);
   box-shadow: 0 22px 50px rgba(6, 15, 29, 0.32);
 }
 
@@ -185,7 +192,7 @@
 }
 
 .ops-tone-info {
-  --ops-glow: rgba(34, 211, 238, 0.28);
+  --ops-glow: rgba(212, 175, 55, 0.22);
 }
 
 .ops-tone-success::after,
@@ -260,8 +267,8 @@
   display: grid;
   gap: 1rem;
   background:
-    radial-gradient(circle at top right, rgba(34, 211, 238, 0.08), transparent 26%),
-    linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(9, 15, 28, 0.97));
+    radial-gradient(circle at top right, rgba(212, 175, 55, 0.08), transparent 26%),
+    linear-gradient(180deg, rgba(20, 25, 32, 0.97), rgba(12, 15, 20, 0.99));
 }
 
 .ops-flow-panel {
@@ -280,7 +287,7 @@
   padding: 1rem;
   border-radius: 22px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(255, 255, 255, 0.03);
+  background: linear-gradient(180deg, rgba(25, 30, 38, 0.9), rgba(16, 20, 27, 0.96));
 }
 
 .ops-flow-column h3 {
@@ -305,7 +312,7 @@
   padding: 0.85rem 0.9rem;
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(15, 23, 42, 0.62);
+  background: rgba(11, 15, 21, 0.78);
 }
 
 .ops-node strong {
@@ -328,7 +335,7 @@
   padding: 0.85rem 0.9rem;
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.025);
 }
 
 .ops-mini-stat span {
@@ -358,7 +365,7 @@
   padding: 0.8rem 0.9rem;
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.025);
   transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -375,7 +382,7 @@
 .ops-channel-stats span {
   padding: 0.7rem 0.8rem;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.025);
   color: #d7e3f2;
   font-size: 0.84rem;
 }
@@ -418,10 +425,10 @@
     top: 50%;
     right: -0.85rem;
     transform: translateY(-50%);
-    color: #67e8f9;
+    color: #e0b94b;
     font-size: 1.1rem;
     font-weight: 700;
-    text-shadow: 0 0 18px rgba(34, 211, 238, 0.3);
+    text-shadow: 0 0 18px rgba(212, 175, 55, 0.26);
   }
 }
 

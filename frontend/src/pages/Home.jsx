@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import Layout from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
 import './Home.css'
@@ -779,6 +780,34 @@ function HomePage() {
     }
   ]
 
+  const quickActions = [
+    {
+      to: '/copybot',
+      title: 'Copybot',
+      detail: copybotOverview?.copybotEnabled ? 'Eingang aktiv und live' : 'Pausiert und sicher blockiert'
+    },
+    {
+      to: '/publishing',
+      title: 'Output',
+      detail: `${openQueueCount} offene Jobs | ${queueSummary.sent} bereits versendet`
+    },
+    {
+      to: '/deal-engine',
+      title: 'Deal Engine',
+      detail: 'Produktregeln, Routing und Sicherheitsregeln'
+    },
+    {
+      to: '/product-intelligence',
+      title: 'Produkt-Intelligenz',
+      detail: 'Varianten, Masterpreise und optimierte Deals'
+    },
+    {
+      to: '/settings',
+      title: 'Zugaenge & Live Status',
+      detail: 'Maskierte Keys, Reader, Amazon und Systemzustand'
+    }
+  ]
+
   useEffect(() => {
     if (loading) {
       return
@@ -843,8 +872,33 @@ function HomePage() {
           <div className="ops-hero-grid">
             <div className="ops-hero-copy">
               <p className="section-title">Affiliate Manager Pro</p>
-              <h1 className="page-title">System Dashboard</h1>
+              <h1 className="page-title">Affiliate Control Center</h1>
+              <p className="page-subtitle">
+                Eingang, Analyse, Queue und Publishing in einer ruhigen Premium-Uebersicht statt in voneinander
+                losgeloesten Admin-Inseln.
+              </p>
               <span className="ops-header-note">Letzter Check {formatDateTime(botOverview?.lastCheck)}</span>
+            </div>
+            <div className="ops-hero-aside">
+              <div className="ops-hero-chip-row">
+                <span className={`status-chip ${copybotOverview?.copybotEnabled ? 'success' : 'warning'}`}>
+                  Copybot {copybotOverview?.copybotEnabled ? 'aktiv' : 'pausiert'}
+                </span>
+                <span className={`status-chip ${telegramReaderActive ? 'success' : 'warning'}`}>
+                  Reader {telegramReaderActive ? 'aktiv' : 'pausiert'}
+                </span>
+                <span className={`status-chip ${queueActive ? 'success' : 'info'}`}>
+                  Queue {queueActive ? 'aktiv' : 'bereit'}
+                </span>
+              </div>
+              <div className="ops-quick-links">
+                {quickActions.map((item) => (
+                  <Link key={item.to} to={item.to} className="ops-quick-link">
+                    <span>{item.title}</span>
+                    <small>{item.detail}</small>
+                  </Link>
+                ))}
+              </div>
             </div>
           </div>
 
