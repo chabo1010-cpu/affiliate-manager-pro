@@ -2,8 +2,10 @@ export const PUBLISHING_QUEUE_STATUS = Object.freeze({
   pending: 'pending',
   sending: 'sending',
   sent: 'sent',
+  skipped: 'skipped',
   failed: 'failed',
-  retry: 'retry'
+  retry: 'retry',
+  hold: 'hold'
 });
 
 const LEGACY_STATUS_MAP = Object.freeze({
@@ -42,12 +44,20 @@ export function isSentPublishingQueueStatus(value) {
   return normalizePublishingQueueStatus(value) === PUBLISHING_QUEUE_STATUS.sent;
 }
 
+export function isSkippedPublishingQueueStatus(value) {
+  return normalizePublishingQueueStatus(value) === PUBLISHING_QUEUE_STATUS.skipped;
+}
+
 export function isFailedPublishingQueueStatus(value) {
   return normalizePublishingQueueStatus(value) === PUBLISHING_QUEUE_STATUS.failed;
 }
 
 export function isRetryPublishingQueueStatus(value) {
   return normalizePublishingQueueStatus(value) === PUBLISHING_QUEUE_STATUS.retry;
+}
+
+export function isHoldPublishingQueueStatus(value) {
+  return normalizePublishingQueueStatus(value) === PUBLISHING_QUEUE_STATUS.hold;
 }
 
 export function isWaitingPublishingQueueStatus(value) {

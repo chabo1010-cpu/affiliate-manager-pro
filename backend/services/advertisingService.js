@@ -782,9 +782,10 @@ export function getAdvertisingChannelCatalog() {
     },
     whatsapp: {
       enabled: whatsapp.enabled,
-      endpointConfigured: whatsapp.endpointConfigured,
+      endpointConfigured: whatsapp.providerConfigured,
       senderConfigured: whatsapp.senderConfigured,
       sender: whatsapp.sender,
+      providerMode: whatsapp.providerMode,
       retryLimit: whatsapp.retryLimit
     }
   };

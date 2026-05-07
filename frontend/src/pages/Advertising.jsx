@@ -221,6 +221,7 @@ function AdvertisingPage() {
   async function apiFetch(path, options = {}) {
     const response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         'X-User-Role': user?.role || '',

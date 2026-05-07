@@ -3,10 +3,13 @@ import { getReaderRuntimeConfig, getTelegramConfig, getTelegramTestGroupConfig }
 import { assertDealNotLocked, cleanText } from './dealHistoryService.js';
 import { buildGeneratorDealContext } from './generatorDealScoringService.js';
 import { logGeneratorDebug } from './generatorFlowService.js';
+import { OUTPUT_DISABLED_SKIP, evaluateOutputGate, recordOutputChannelEvent } from './outputChannelService.js';
 import { evaluateProductRules } from './productRulesService.js';
 import { createPublishingEntry, processPublishingQueueEntry } from './publisherService.js';
 import { isFailedPublishingQueueStatus, normalizePublishingQueueStatus } from './publishingQueueStateService.js';
 import { sendTelegramCouponFollowUp, sendTelegramPost } from './telegramSenderService.js';
+import { getWhatsappClientConfig } from './whatsappClientService.js';
+import { getWhatsappOutputTargetConfig } from './whatsappOutputTargetService.js';
 
 const db = getDb();
 const DEBUG_QUEUE_ID_PLACEHOLDER = '__QUEUE_ID__';
@@ -31,6 +34,83 @@ const telegramRoutingChannelCache = {
     error: ''
   }
 };
+
+function normalizeOutputKeyPart(value = '', fallback = 'default') {
+  const normalized = cleanText(String(value || '')).toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+
+  return normalized.replace(/[^a-z0-9@._:-]+/g, '-');
+}
+
+function buildRoutingOutputChannelKey(routeKey = '', targetChatId = '') {
+  const normalizedRoute = cleanText(routeKey).toLowerCase();
+  const routeRef =
+    normalizedRoute === 'approved'
+      ? APPROVED_CHANNEL_USERNAME || APPROVED_CHANNEL || targetChatId
+      : normalizedRoute === 'rejected'
+        ? REJECTED_CHANNEL_USERNAME || REJECTED_CHANNEL || targetChatId
+        : targetChatId;
+  const scope =
+    normalizedRoute === 'approved' ? 'approved-route' : normalizedRoute === 'rejected' ? 'rejected-route' : 'target';
+
+  return ['telegram', scope, routeRef].map((part, index) => normalizeOutputKeyPart(part, index === 2 ? 'default' : '')).join(':');
+}
+
+function buildWhatsappOutputChannelKey(targetId = null, targetRef = '') {
+  const numericTargetId = Number.parseInt(String(targetId ?? ''), 10);
+  if (Number.isFinite(numericTargetId)) {
+    return `whatsapp:target:${numericTargetId}`;
+  }
+
+  return ['whatsapp', 'target', targetRef || 'default'].map((part, index) => normalizeOutputKeyPart(part, index === 2 ? 'default' : '')).join(':');
+}
+
+function planWhatsappMirrorForApprovedRoute(routeKey = '') {
+  const normalizedRouteKey = cleanText(routeKey).toLowerCase();
+  const whatsappClient = getWhatsappClientConfig();
+  const mirrorTargets = getWhatsappOutputTargetConfig().targets.filter((target) => target.useForPublishing === true);
+  const activeTargets = mirrorTargets.filter((target) => target.isActive === true);
+
+  if (normalizedRouteKey !== 'approved') {
+    return {
+      eligible: false,
+      skipReason: 'not_approved_channel',
+      whatsappClient,
+      mirrorTargets: [],
+      activeTargets: []
+    };
+  }
+
+  if (whatsappClient.enabled !== true) {
+    return {
+      eligible: false,
+      skipReason: 'env_disabled',
+      whatsappClient,
+      mirrorTargets: [],
+      activeTargets
+    };
+  }
+
+  if (!activeTargets.length) {
+    return {
+      eligible: false,
+      skipReason: 'no_active_whatsapp_target',
+      whatsappClient,
+      mirrorTargets: [],
+      activeTargets: []
+    };
+  }
+
+  return {
+    eligible: true,
+    skipReason: '',
+    whatsappClient,
+    mirrorTargets,
+    activeTargets
+  };
+}
 
 console.info('[APPROVED_CHANNEL_READY]', {
   enabled: APPROVED_ENABLED,
@@ -1349,8 +1429,68 @@ async function publishSecondaryTelegramRoute({
   queueSourceType = '',
   generatorPostId = null,
   payload = {},
-  imageSource = 'none'
+  imageSource = 'none',
+  processorOverrides = {}
 } = {}) {
+  const normalizedRouteKey = cleanText(routeKey).toLowerCase();
+  const targetLabel =
+    normalizedRouteKey === 'approved'
+      ? APPROVED_CHANNEL_USERNAME || targetChatId
+      : normalizedRouteKey === 'rejected'
+        ? REJECTED_CHANNEL_USERNAME || targetChatId
+        : targetChatId;
+  const targetKind =
+    normalizedRouteKey === 'approved' ? 'live' : normalizedRouteKey === 'rejected' ? 'review' : 'standard';
+  const whatsappMirrorPlan = planWhatsappMirrorForApprovedRoute(normalizedRouteKey);
+  const whatsappMirrorTargets =
+    whatsappMirrorPlan.eligible !== true
+      ? []
+      : whatsappMirrorPlan.mirrorTargets.map((target) => ({
+          channelType: 'whatsapp',
+          isEnabled: true,
+          imageSource,
+          targetRef: target.targetRef,
+          targetLabel: target.targetLabel || target.name || target.targetRef,
+          targetMeta: {
+            targetId: target.id,
+            name: target.name,
+            targetRef: target.targetRef,
+            targetType: target.targetType,
+            channelUrl: target.channelUrl || target.targetRef,
+            requiresManualActivation: target.requiresManualActivation === true,
+            isSystem: target.isSystem === true,
+            outputChannelKey: buildWhatsappOutputChannelKey(target.id, target.targetRef),
+            mirrorRouteKey: normalizedRouteKey,
+            mirrorSource: 'telegram_published'
+          }
+        }));
+
+  if (normalizedRouteKey === 'approved') {
+    if (whatsappMirrorPlan.eligible === true) {
+      console.info('[WHATSAPP_MIRROR_REAL_FLOW_ELIGIBLE]', {
+        routeKey: normalizedRouteKey,
+        targetChatId,
+        queueSourceType,
+        activeTargetCount: whatsappMirrorPlan.activeTargets.length,
+        activeTargets: whatsappMirrorPlan.activeTargets.map((target) => ({
+          id: target.id,
+          name: target.name,
+          targetRef: target.targetRef,
+          targetType: target.targetType
+        }))
+      });
+    } else {
+      console.info('[WHATSAPP_MIRROR_REAL_FLOW_SKIP_REASON]', {
+        routeKey: normalizedRouteKey,
+        targetChatId,
+        queueSourceType,
+        reason: whatsappMirrorPlan.skipReason,
+        enabled: whatsappMirrorPlan.whatsappClient.enabled === true,
+        providerConfigured: whatsappMirrorPlan.whatsappClient.providerConfigured === true,
+        workerEnabled: whatsappMirrorPlan.whatsappClient.workerEnabled === true
+      });
+    }
+  }
   const queueEntry = createPublishingEntry({
     sourceType: queueSourceType,
     sourceId: generatorPostId,
@@ -1358,30 +1498,123 @@ async function publishSecondaryTelegramRoute({
     skipDealLock: true,
     payload: {
       ...payload,
+      telegramChatIds:
+        Array.isArray(payload.telegramChatIds) && payload.telegramChatIds.length
+          ? payload.telegramChatIds
+          : [targetChatId],
       skipDealLock: true,
-      skipPostedDealHistory: true
+      skipPostedDealHistory: true,
+      meta: {
+        ...((payload.meta && typeof payload.meta === 'object' && payload.meta) || {}),
+        whatsappMirrorRouteKey: normalizedRouteKey,
+        whatsappMirrorEnabled: whatsappMirrorTargets.length > 0
+      }
     },
-    targets: [{ channelType: 'telegram', isEnabled: true, imageSource }]
+    targets: [
+      {
+        channelType: 'telegram',
+        isEnabled: true,
+        imageSource,
+        targetRef: targetChatId,
+        targetLabel,
+        targetMeta: {
+          allowAdHoc: true,
+          routeKey: normalizedRouteKey,
+          outputChannelKey: buildRoutingOutputChannelKey(normalizedRouteKey, targetChatId),
+          channelKind: targetKind,
+          targetKind,
+          isLive: targetKind === 'live'
+        }
+      },
+      ...whatsappMirrorTargets
+    ]
   });
 
-  const queueProcessingResult = await processPublishingQueueEntry(queueEntry.id);
+  if (normalizedRouteKey === 'approved' && whatsappMirrorTargets.length) {
+    console.info('[WHATSAPP_MIRROR_REAL_FLOW_JOB_CREATED]', {
+      routeKey: normalizedRouteKey,
+      queueId: queueEntry?.id || null,
+      telegramTarget: targetChatId,
+      whatsappTargetCount: whatsappMirrorTargets.length,
+      whatsappTargets: whatsappMirrorTargets.map((target) => ({
+        targetRef: target.targetRef,
+        targetLabel: target.targetLabel,
+        targetType: target.targetMeta?.targetType || ''
+      }))
+    });
+  }
+
+  const queueProcessingResult = await processPublishingQueueEntry(queueEntry.id, {
+    processors: processorOverrides
+  });
   const summary = summarizeQueueResults(
     queueProcessingResult,
     {
-      telegramImageSource: imageSource
+      telegramImageSource: imageSource,
+      whatsappImageSource: imageSource
     },
     generatorPostId
   );
+  const whatsappTargets = (summary.queue?.targets || [])
+    .filter((target) => cleanText(target?.channel_type).toLowerCase() === 'whatsapp')
+    .map((target) => ({
+      id: Number(target.id || 0) || null,
+      targetRef: cleanText(target.target_ref),
+      targetLabel: cleanText(target.target_label),
+      status: normalizePublishingQueueStatus(target.status, target.status || 'pending'),
+      errorMessage: cleanText(target.error_message),
+      postedAt: target.posted_at || null,
+      targetMeta: (() => {
+        if (typeof target.target_meta_json !== 'string' || !target.target_meta_json) {
+          return null;
+        }
+
+        try {
+          return JSON.parse(target.target_meta_json);
+        } catch {
+          return null;
+        }
+      })()
+    }));
+  const whatsappStatus = (() => {
+    const statuses = whatsappTargets.map((target) => cleanText(target.status).toLowerCase()).filter(Boolean);
+    if (statuses.some((status) => status === 'failed')) {
+      return 'failed';
+    }
+    if (statuses.some((status) => status === 'retry')) {
+      return 'retry';
+    }
+    if (statuses.some((status) => status === 'hold')) {
+      return 'hold';
+    }
+    if (statuses.some((status) => status === 'sent')) {
+      return 'sent';
+    }
+    if (statuses.some((status) => status === 'skipped')) {
+      return 'skipped';
+    }
+    return statuses[0] || 'pending';
+  })();
 
   return {
     routeKey,
     queueId: summary.queue?.id || queueEntry?.id || null,
     queueStatus: summary.queue?.status || queueEntry?.status || 'pending',
+    targetStatus: summary.results.telegram?.status || 'pending',
     messageId: summary.results.telegram?.messageId || null,
     chatId: summary.results.telegram?.chatId || targetChatId || null,
     duplicateBlocked: summary.results.telegram?.duplicateBlocked === true,
     duplicateKey: summary.results.telegram?.duplicateKey || null,
-    lastSentAt: summary.results.telegram?.lastSentAt || null
+    lastSentAt: summary.results.telegram?.lastSentAt || null,
+    whatsappStatus,
+    whatsappTargets,
+    skippedReason:
+      (summary.queue?.targets || []).find((target) => cleanText(target?.channel_type).toLowerCase() === 'telegram')?.error_message || '',
+    shouldSendCouponFollowUp:
+      summary.results.telegram?.duplicateBlocked === true
+        ? false
+        : normalizePublishingQueueStatus(summary.results.telegram?.status, 'pending') === 'sent' &&
+          Boolean(summary.results.telegram?.messageId)
   };
 }
 
@@ -1531,7 +1764,7 @@ async function publishTelegramRoutingOutputs({
         imageSource: baseImageSource
       });
       const approvedCouponResult =
-        approvedResult.duplicateBlocked === true
+        approvedResult.shouldSendCouponFollowUp !== true
           ? null
           : await sendRouteCouponFollowUp({
               couponCode: cleanText(approvedPayload.couponCode),
@@ -1544,26 +1777,50 @@ async function publishTelegramRoutingOutputs({
             });
       results.approved = {
         ...results.approved,
-        status: normalizePublishingQueueStatus(approvedResult.queueStatus, approvedResult.queueStatus || 'sent'),
+        status: normalizePublishingQueueStatus(
+          approvedResult.targetStatus,
+          approvedResult.queueStatus || approvedResult.targetStatus || 'pending'
+        ),
         queueId: approvedResult.queueId,
         messageId: approvedResult.messageId,
         couponCodeMessageId: approvedCouponResult?.messageId || null,
-        duplicateBlocked: approvedResult.duplicateBlocked === true
+        duplicateBlocked: approvedResult.duplicateBlocked === true,
+        whatsappStatus: approvedResult.whatsappStatus || 'pending',
+        whatsappTargets: Array.isArray(approvedResult.whatsappTargets) ? approvedResult.whatsappTargets : []
       };
-      console.info('[APPROVED_SEND_OK]', {
-        generatorPostId,
-        chatId: routingConfig.approved.chatId,
-        queueId: approvedResult.queueId,
-        messageId: approvedResult.messageId,
-        couponCodeMessageId: approvedCouponResult?.messageId || null,
-        status: results.approved.status
-      });
-      console.info('[TELEGRAM_ROUTING_CHANNEL_SENT]', {
-        routeKey: 'approved',
-        generatorPostId,
-        queueId: approvedResult.queueId,
-        chatId: routingConfig.approved.chatId
-      });
+      if (results.approved.status === 'sent') {
+        console.info('[APPROVED_SEND_OK]', {
+          generatorPostId,
+          chatId: routingConfig.approved.chatId,
+          queueId: approvedResult.queueId,
+          messageId: approvedResult.messageId,
+          couponCodeMessageId: approvedCouponResult?.messageId || null,
+          status: results.approved.status
+        });
+        console.info('[APPROVED_TELEGRAM_PUBLISHED]', {
+          generatorPostId,
+          chatId: routingConfig.approved.chatId,
+          queueId: approvedResult.queueId,
+          messageId: approvedResult.messageId,
+          couponCodeMessageId: approvedCouponResult?.messageId || null,
+          whatsappStatus: approvedResult.whatsappStatus || 'pending',
+          whatsappTargetCount: Array.isArray(approvedResult.whatsappTargets) ? approvedResult.whatsappTargets.length : 0
+        });
+        console.info('[TELEGRAM_ROUTING_CHANNEL_SENT]', {
+          routeKey: 'approved',
+          generatorPostId,
+          queueId: approvedResult.queueId,
+          chatId: routingConfig.approved.chatId
+        });
+      } else {
+        console.info('[APPROVED_SEND_SKIPPED]', {
+          generatorPostId,
+          chatId: routingConfig.approved.chatId,
+          queueId: approvedResult.queueId,
+          status: results.approved.status,
+          reason: approvedResult.skippedReason || ''
+        });
+      }
     } catch (error) {
       results.approved = {
         ...results.approved,
@@ -1608,6 +1865,42 @@ async function publishTelegramRoutingOutputs({
   }
 
   if (routingDecision.bucket === 'rejected' && routingConfig.rejected.enabled) {
+    const rejectedOutputGate = evaluateOutputGate({
+      platform: 'telegram',
+      queueSourceType: 'generator_direct_rejected_route',
+      targetRef: routingConfig.rejected.chatId,
+      targetLabel: routingConfig.rejected.username || routingConfig.rejected.chatId,
+      payload: {
+        ...publishingPayload,
+        testMode: false
+      }
+    });
+
+    if (!rejectedOutputGate.allowed) {
+      results.rejected = {
+        ...results.rejected,
+        status: 'skipped',
+        error: rejectedOutputGate.message
+      };
+      recordOutputChannelEvent(rejectedOutputGate.channel, {
+        status: 'disabled_skip',
+        lastErrorAt: nowIso(),
+        lastErrorMessage: rejectedOutputGate.message,
+        eventType: 'output.disabled.skip',
+        messagePreview: generatorPostText || routingReason
+      });
+      console.warn('[OUTPUT_DISABLED_SKIP]', {
+        routeKey: 'rejected',
+        generatorPostId,
+        targetRef: routingConfig.rejected.chatId,
+        reason: rejectedOutputGate.message
+      });
+      console.info('[REJECTED_CHANNEL_SKIP]', {
+        generatorPostId,
+        decision: routingDecision.label,
+        reason: rejectedOutputGate.message
+      });
+    } else {
     try {
       const shortcheckText = buildRejectedShortcheck({
         input: routingInput,
@@ -1667,7 +1960,7 @@ async function publishTelegramRoutingOutputs({
         }
       });
       const rejectedCouponResult =
-        rejectedResult?.duplicateBlocked === true
+        rejectedResult?.duplicateBlocked === true || !rejectedResult?.messageId
           ? null
           : await sendRouteCouponFollowUp({
               couponCode: cleanText(publishingPayload.couponCode),
@@ -1685,6 +1978,12 @@ async function publishTelegramRoutingOutputs({
         couponCodeMessageId: rejectedCouponResult?.messageId || null,
         duplicateBlocked: rejectedResult?.duplicateBlocked === true
       };
+      recordOutputChannelEvent(rejectedOutputGate.channel, {
+        status: 'sent',
+        lastSentAt: nowIso(),
+        eventType: 'target.sent',
+        messagePreview: rejectedText
+      });
       console.info('[TELEGRAM_ROUTING_CHANNEL_SENT]', {
         routeKey: 'rejected',
         generatorPostId,
@@ -1696,11 +1995,19 @@ async function publishTelegramRoutingOutputs({
         status: 'failed',
         error: error instanceof Error ? error.message : 'Rejected-Route fehlgeschlagen.'
       };
+      recordOutputChannelEvent(rejectedOutputGate.channel, {
+        status: 'failed',
+        lastErrorAt: nowIso(),
+        lastErrorMessage: results.rejected.error,
+        eventType: 'target.failed',
+        messagePreview: generatorPostText || routingReason
+      });
       console.error('[TELEGRAM_ROUTING_CHANNEL_FAILED]', {
         routeKey: 'rejected',
         generatorPostId,
         error: results.rejected.error
       });
+    }
     }
   } else {
     const reason = buildRoutingSkipReason(routingConfig.rejected, 'decision_not_rejected_or_review');
@@ -2214,7 +2521,7 @@ export async function publishGeneratorPostDirect(input = {}) {
   }
 
   const primaryCouponResult =
-    summary.results.telegram?.duplicateBlocked === true
+    summary.results.telegram?.duplicateBlocked === true || !summary.results.telegram?.messageId
       ? null
       : await sendRouteCouponFollowUp({
           couponCode: cleanText(finalizedPublishingPayload.couponCode || input.couponCode),
@@ -2253,6 +2560,7 @@ export const __testablesDirectPublisher = {
   buildChannelResult,
   buildFinalRoutingInputState,
   buildRejectedCombinedPost,
+  publishSecondaryTelegramRoute,
   resolveTelegramRoutingDecision,
   isApprovedFinalRoutingSellerAllowed,
   summarizeQueueResults,

@@ -22,7 +22,9 @@ function AutobotPage() {
       setStatus('');
 
       try {
-        const response = await fetch(`${API_BASE_URL}/api/bot`);
+        const response = await fetch(`${API_BASE_URL}/api/bot`, {
+          credentials: 'include'
+        });
         const data = await response.json().catch(() => ({}));
 
         if (!response.ok) {

@@ -1,5 +1,12 @@
 import { getWhatsappDeliveryConfig } from '../env.js';
 import { cleanText } from './dealHistoryService.js';
+import { getWhatsappOutputTargetConfig } from './whatsappOutputTargetService.js';
+import { assertWhatsappRuntimeReady, getWhatsappRuntimeConfig, getWhatsappRuntimeState, waitForWhatsappSendCooldown } from './whatsappRuntimeService.js';
+import {
+  getRememberedWhatsappPhaseDelivery,
+  rememberWhatsappPhaseDelivery,
+  sendWhatsappPlaywrightPhase
+} from './whatsappPlaywrightWorkerService.js';
 
 const DEFAULT_TIMEOUT_MS = 12_000;
 
@@ -21,6 +28,10 @@ function buildWhatsappClientError(message, options = {}) {
 
   if (Number.isFinite(options.retryLimit)) {
     error.retryLimit = Number(options.retryLimit);
+  }
+
+  if (cleanText(options.code)) {
+    error.code = cleanText(options.code);
   }
 
   if (options.details !== undefined) {
@@ -80,6 +91,15 @@ function buildRequestBody(input = {}, config = getWhatsappClientConfig()) {
   const queuePayload = input.queuePayload && typeof input.queuePayload === 'object' ? input.queuePayload : {};
   const imageUrl = cleanText(input.imageUrl);
   const targetMeta = normalizeTargetMeta(input.targetMeta);
+  const steps = Array.isArray(input.steps)
+    ? input.steps.map((step, index) => ({
+        kind: cleanText(step.kind) || `step_${index + 1}`,
+        text: cleanText(step.text),
+        imageUrl: cleanText(step.imageUrl) || null,
+        sendId: cleanText(step.sendId) || null,
+        phaseIndex: Number.isFinite(Number(step.phaseIndex)) ? Number(step.phaseIndex) : index + 1
+      }))
+    : [];
 
   return {
     channel: 'whatsapp',
@@ -98,7 +118,12 @@ function buildRequestBody(input = {}, config = getWhatsappClientConfig()) {
     queueId: Number.isFinite(Number(input.queueId)) ? Number(input.queueId) : null,
     sourceType: cleanText(input.sourceType || queuePayload.databaseSourceType) || 'publisher_queue',
     origin: cleanText(input.origin || queuePayload.databaseOrigin) || 'automatic',
-    payloadVersion: 1
+    payloadVersion: 2,
+    sendId: cleanText(input.sendId) || null,
+    phase: cleanText(input.phase) || null,
+    phaseIndex: Number.isFinite(Number(input.phaseIndex)) ? Number(input.phaseIndex) : null,
+    phaseCount: Number.isFinite(Number(input.phaseCount)) ? Number(input.phaseCount) : steps.length || null,
+    steps
   };
 }
 
@@ -138,24 +163,192 @@ async function sendWhatsappRequest(input = {}, config = getWhatsappClientConfig(
 
 export function getWhatsappClientConfig() {
   const config = getWhatsappDeliveryConfig();
+  const runtime = getWhatsappRuntimeState();
+  const runtimeConfig = getWhatsappRuntimeConfig();
+  const targetConfig = getWhatsappOutputTargetConfig();
   const endpoint = cleanText(config.endpoint);
   const token = cleanText(config.token);
-  const sender = cleanText(config.sender);
+  const sender = cleanText(config.sender) || cleanText(targetConfig.targets?.[0]?.name);
+  const runtimeProviderMode = cleanText(runtime.providerMode || runtimeConfig.providerMode);
+  const providerMode =
+    runtimeProviderMode === 'playwright'
+      ? 'playwright'
+      : endpoint
+        ? 'delivery_gateway'
+        : runtimeConfig.playwrightAvailable === true
+          ? 'playwright'
+          : 'delivery_gateway';
+  const providerConfigured =
+    providerMode === 'playwright'
+      ? runtimeConfig.playwrightAvailable === true || runtime.providerConfigured === true
+      : Boolean(endpoint);
 
   return {
     enabled: config.enabled === true,
-    endpointConfigured: Boolean(endpoint),
+    endpointConfigured: providerConfigured,
+    providerConfigured,
+    providerMode,
+    providerLabel:
+      providerMode === 'playwright'
+        ? 'Playwright Worker'
+        : cleanText(runtime.providerLabel || runtimeConfig.providerLabel || 'Delivery Gateway'),
     endpoint,
     tokenConfigured: Boolean(token),
     token,
     senderConfigured: Boolean(sender),
     sender,
-    retryLimit: Number(config.retryLimit || 0)
+    retryLimit: Number(config.retryLimit || 0),
+    workerEnabled: runtime.workerEnabled === true,
+    controlEndpointConfigured: runtime.controlEndpointConfigured === true,
+    browserChannel: cleanText(runtime.browserChannel || runtimeConfig.browserChannel),
+    browserExecutablePath: cleanText(runtime.browserExecutablePath || runtimeConfig.browserExecutablePath)
   };
 }
 
 export function getWhatsappClientRetryLimit() {
   return getWhatsappClientConfig().retryLimit;
+}
+
+function buildWhatsappPhases(input = {}) {
+  const text = cleanText(input.text);
+  const imageUrl = cleanText(input.imageUrl);
+  const couponCode = cleanText(input.couponCode);
+  const sendId = cleanText(input.sendId);
+  const phases = [];
+
+  phases.push({
+    kind: 'main',
+    text,
+    imageUrl: imageUrl || null,
+    sendId: sendId ? `${sendId}:main` : '',
+    phaseIndex: 1
+  });
+
+  if (couponCode) {
+    phases.push({
+      kind: 'coupon',
+      text: couponCode,
+      imageUrl: null,
+      sendId: sendId ? `${sendId}:coupon` : '',
+      phaseIndex: 2
+    });
+  }
+
+  return phases;
+}
+
+async function sendWhatsappPhase(input = {}, config = getWhatsappClientConfig()) {
+  const requestBody = buildRequestBody(input, config);
+  const rememberedDelivery = getRememberedWhatsappPhaseDelivery(requestBody.sendId);
+  if (rememberedDelivery?.status === 'sent') {
+    return {
+      status: 'sent',
+      duplicatePrevented: true,
+      messageId: cleanText(rememberedDelivery.messageId),
+      deliveryId: cleanText(rememberedDelivery.deliveryId || rememberedDelivery.messageId),
+      sender: requestBody.sender,
+      targetRef: requestBody.targetRef,
+      targetLabel: requestBody.targetLabel,
+      phase: cleanText(requestBody.phase) || 'main',
+      phaseIndex: Number(requestBody.phaseIndex || 0),
+      endpoint: config.endpoint,
+      response: rememberedDelivery.response || null
+    };
+  }
+
+  let parsedResponse = null;
+  let rawResponse = '';
+  let providerResult = null;
+
+  if (config.providerMode === 'playwright') {
+    try {
+      providerResult = await sendWhatsappPlaywrightPhase({
+        ...input,
+        ...requestBody
+      });
+    } catch (error) {
+      throw buildWhatsappClientError(
+        error instanceof Error ? error.message : 'WhatsApp Playwright Worker hat den Versand abgebrochen.',
+        {
+          retryable: !(error instanceof Error && error.retryable === false),
+          retryLimit:
+            error instanceof Error && Number.isFinite(Number(error.retryLimit))
+              ? Number(error.retryLimit)
+              : config.retryLimit,
+          code: error instanceof Error ? error.code || '' : '',
+          details: error instanceof Error ? error.details || null : null
+        }
+      );
+    }
+  } else {
+    const response = await sendWhatsappRequest(input, config);
+    rawResponse = await response.text();
+    parsedResponse = parseJson(rawResponse, null);
+
+    if (!response.ok) {
+      throw buildWhatsappClientError(
+        resolveProviderMessage(parsedResponse, `WhatsApp Delivery Gateway antwortete mit ${response.status}.`),
+        {
+          retryable: isRetryableStatusCode(response.status),
+          retryLimit: config.retryLimit,
+          details: {
+            status: response.status,
+            body: parsedResponse || rawResponse || null
+          }
+        }
+      );
+    }
+
+    if (
+      parsedResponse &&
+      typeof parsedResponse === 'object' &&
+      (parsedResponse.ok === false ||
+        parsedResponse.success === false ||
+        cleanText(parsedResponse.status).toLowerCase() === 'error')
+    ) {
+      const retryable =
+        typeof parsedResponse.retryable === 'boolean'
+          ? parsedResponse.retryable
+          : isRetryableStatusCode(Number(parsedResponse.statusCode || parsedResponse.status_code || 500));
+
+      throw buildWhatsappClientError(
+        resolveProviderMessage(parsedResponse, 'WhatsApp Gateway hat den Versand abgelehnt.'),
+        {
+          retryable,
+          retryLimit: config.retryLimit,
+          details: parsedResponse
+        }
+      );
+    }
+
+    providerResult = {
+      status: cleanText(parsedResponse?.status) || 'sent',
+      duplicatePrevented: parsedResponse?.duplicatePrevented === true || parsedResponse?.duplicate_prevented === true,
+      messageId: cleanText(parsedResponse?.messageId || parsedResponse?.message_id),
+      deliveryId: cleanText(parsedResponse?.deliveryId || parsedResponse?.delivery_id),
+      response: parsedResponse || (rawResponse ? { raw: rawResponse } : null)
+    };
+  }
+
+  const normalizedResult = {
+    status: cleanText(providerResult?.status) || 'sent',
+    duplicatePrevented: providerResult?.duplicatePrevented === true,
+    messageId: cleanText(providerResult?.messageId),
+    deliveryId: cleanText(providerResult?.deliveryId || providerResult?.messageId),
+    sender: requestBody.sender,
+    targetRef: requestBody.targetRef,
+    targetLabel: requestBody.targetLabel,
+    phase: cleanText(requestBody.phase) || 'main',
+    phaseIndex: Number(requestBody.phaseIndex || 0),
+    endpoint: config.endpoint,
+    response: providerResult?.response || parsedResponse || (rawResponse ? { raw: rawResponse } : null)
+  };
+
+  if (cleanText(requestBody.sendId)) {
+    rememberWhatsappPhaseDelivery(requestBody.sendId, normalizedResult);
+  }
+
+  return normalizedResult;
 }
 
 export async function sendWhatsappDeal(input = {}) {
@@ -168,10 +361,15 @@ export async function sendWhatsappDeal(input = {}) {
     });
   }
 
-  if (!config.endpointConfigured) {
-    throw buildWhatsappClientError('WHATSAPP_DELIVERY_ENDPOINT fehlt im Backend.', {
-      retryable: false
-    });
+  if (!config.providerConfigured) {
+    throw buildWhatsappClientError(
+      config.providerMode === 'playwright'
+        ? 'WhatsApp Playwright Worker ist nicht vorbereitet.'
+        : 'WHATSAPP_DELIVERY_ENDPOINT fehlt im Backend.',
+      {
+        retryable: false
+      }
+    );
   }
 
   if (!text) {
@@ -180,55 +378,42 @@ export async function sendWhatsappDeal(input = {}) {
     });
   }
 
-  const requestBody = buildRequestBody(input, config);
-  const response = await sendWhatsappRequest(input, config);
-  const rawResponse = await response.text();
-  const parsedResponse = parseJson(rawResponse, null);
+  assertWhatsappRuntimeReady();
+  await waitForWhatsappSendCooldown();
 
-  if (!response.ok) {
-    throw buildWhatsappClientError(
-      resolveProviderMessage(parsedResponse, `WhatsApp Delivery Gateway antwortete mit ${response.status}.`),
-      {
-        retryable: isRetryableStatusCode(response.status),
-        retryLimit: config.retryLimit,
-        details: {
-          status: response.status,
-          body: parsedResponse || rawResponse || null
-        }
-      }
+  const phases = buildWhatsappPhases(input);
+  const phaseResults = [];
+  for (const phase of phases) {
+    phaseResults.push(
+      await sendWhatsappPhase(
+        {
+          ...input,
+          text: phase.text,
+          imageUrl: phase.imageUrl,
+          sendId: phase.sendId,
+          phase: phase.kind,
+          phaseIndex: phase.phaseIndex,
+          phaseCount: phases.length,
+          steps: phases
+        },
+        config
+      )
     );
+    await waitForWhatsappSendCooldown();
   }
 
-  if (
-    parsedResponse &&
-    typeof parsedResponse === 'object' &&
-    (parsedResponse.ok === false ||
-      parsedResponse.success === false ||
-      cleanText(parsedResponse.status).toLowerCase() === 'error')
-  ) {
-    const retryable =
-      typeof parsedResponse.retryable === 'boolean'
-        ? parsedResponse.retryable
-        : isRetryableStatusCode(Number(parsedResponse.statusCode || parsedResponse.status_code || 500));
-
-    throw buildWhatsappClientError(
-      resolveProviderMessage(parsedResponse, 'WhatsApp Gateway hat den Versand abgelehnt.'),
-      {
-        retryable,
-        retryLimit: config.retryLimit,
-        details: parsedResponse
-      }
-    );
-  }
+  const primaryResult = phaseResults[0] || {};
 
   return {
-    status: cleanText(parsedResponse?.status) || 'sent',
-    messageId: cleanText(parsedResponse?.messageId || parsedResponse?.message_id),
-    deliveryId: cleanText(parsedResponse?.deliveryId || parsedResponse?.delivery_id),
-    sender: requestBody.sender,
-    targetRef: requestBody.targetRef,
-    targetLabel: requestBody.targetLabel,
+    status: primaryResult.status || 'sent',
+    duplicatePrevented: phaseResults.some((result) => result.duplicatePrevented === true),
+    messageId: primaryResult.messageId,
+    deliveryId: primaryResult.deliveryId,
+    sender: primaryResult.sender,
+    targetRef: primaryResult.targetRef,
+    targetLabel: primaryResult.targetLabel,
     endpoint: config.endpoint,
-    response: parsedResponse || (rawResponse ? { raw: rawResponse } : null)
+    phases: phaseResults,
+    response: primaryResult.response || null
   };
 }

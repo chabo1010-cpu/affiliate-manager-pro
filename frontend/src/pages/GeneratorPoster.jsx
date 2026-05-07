@@ -562,6 +562,7 @@ function GeneratorPosterPage() {
     try {
       const response = await fetch(amazonScrapeApiUrl, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json'
         },
@@ -683,6 +684,7 @@ function GeneratorPosterPage() {
         try {
           const checkResponse = await fetch(dealsCheckApiUrl, {
             method: 'POST',
+            credentials: 'include',
             headers: {
               'Content-Type': 'application/json'
             },
@@ -755,6 +757,7 @@ function GeneratorPosterPage() {
       };
       const checkResponse = await fetch(dealsCheckApiUrl, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json'
         },
@@ -918,6 +921,7 @@ function GeneratorPosterPage() {
 
       const response = await fetch(directPublishApiUrl, {
         method: 'POST',
+        credentials: 'include',
         body: formData
       });
 

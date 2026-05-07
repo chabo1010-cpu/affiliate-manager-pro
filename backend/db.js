@@ -10,6 +10,8 @@ const storageConfig = getStorageConfig();
 const dataDir = storageConfig.dataDir;
 const dbPath = storageConfig.dbPath;
 const telegramUserSessionDir = storageConfig.telegramUserSessionDir;
+const whatsappSessionDir = storageConfig.whatsappSessionDir;
+const DEFAULT_WHATSAPP_ALERT_TARGET = '@WhatsappStatusFehler';
 const DEFAULT_KEEPA_DRAWER_CONFIGS_JSON = JSON.stringify({
   AMAZON: {
     active: true,
@@ -77,6 +79,10 @@ if (!fs.existsSync(dataDir)) {
 
 if (!fs.existsSync(telegramUserSessionDir)) {
   fs.mkdirSync(telegramUserSessionDir, { recursive: true });
+}
+
+if (!fs.existsSync(whatsappSessionDir)) {
+  fs.mkdirSync(whatsappSessionDir, { recursive: true });
 }
 
 const db = new Database(dbPath);
@@ -265,6 +271,8 @@ db.exec(`
     channel_type TEXT NOT NULL,
     is_enabled INTEGER NOT NULL DEFAULT 1,
     image_source TEXT NOT NULL DEFAULT 'none',
+    send_id TEXT,
+    delivery_ref TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     posted_at TEXT,
     error_message TEXT,
@@ -409,11 +417,51 @@ db.exec(`
     chat_id TEXT NOT NULL UNIQUE,
     is_active INTEGER NOT NULL DEFAULT 1,
     use_for_publishing INTEGER NOT NULL DEFAULT 1,
+    channel_kind TEXT NOT NULL DEFAULT 'test',
+    last_sent_at TEXT,
+    last_error TEXT,
+    last_error_at TEXT,
+    last_delivery_status TEXT NOT NULL DEFAULT 'idle',
+    last_tested_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
 
   CREATE INDEX IF NOT EXISTS idx_telegram_bot_targets_active ON telegram_bot_targets (is_active, use_for_publishing);
+
+  CREATE TABLE IF NOT EXISTS output_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL CHECK(platform IN ('telegram', 'whatsapp', 'facebook')),
+    channel_label TEXT NOT NULL,
+    channel_type TEXT NOT NULL DEFAULT 'standard',
+    source_kind TEXT NOT NULL DEFAULT 'manual',
+    target_ref TEXT,
+    target_label TEXT,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    is_blocked INTEGER NOT NULL DEFAULT 0,
+    allow_test_mode INTEGER NOT NULL DEFAULT 1,
+    allow_live_mode INTEGER NOT NULL DEFAULT 1,
+    is_dangerous_live INTEGER NOT NULL DEFAULT 0,
+    allowed_source_types_json TEXT NOT NULL DEFAULT '["*"]',
+    notes TEXT,
+    status_hint TEXT,
+    last_status TEXT NOT NULL DEFAULT 'idle',
+    last_sent_at TEXT,
+    last_error_at TEXT,
+    last_error_message TEXT,
+    last_queue_id INTEGER,
+    last_target_id INTEGER,
+    last_event_type TEXT,
+    last_message_preview TEXT,
+    meta_json TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_output_channels_platform_enabled ON output_channels (platform, is_enabled, sort_order);
+  CREATE INDEX IF NOT EXISTS idx_output_channels_live_guard ON output_channels (is_dangerous_live, is_enabled, is_blocked);
 
   CREATE TABLE IF NOT EXISTS app_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -474,8 +522,13 @@ db.exec(`
     repostCooldownHours INTEGER NOT NULL DEFAULT 12,
     telegramCopyButtonText TEXT NOT NULL DEFAULT '${DEFAULT_TELEGRAM_COPY_BUTTON_TEXT}',
     copybotEnabled INTEGER NOT NULL DEFAULT 0,
+    outputQueueEnabled INTEGER NOT NULL DEFAULT 1,
     telegramBotEnabled INTEGER NOT NULL DEFAULT 1,
     telegramBotDefaultRetryLimit INTEGER NOT NULL DEFAULT 3,
+    whatsappWorkerEnabled INTEGER NOT NULL DEFAULT 0,
+    whatsappAlertTelegramEnabled INTEGER NOT NULL DEFAULT 1,
+    whatsappAlertTelegramTarget TEXT DEFAULT '${DEFAULT_WHATSAPP_ALERT_TARGET}',
+    whatsappSendCooldownMs INTEGER NOT NULL DEFAULT 4000,
     facebookEnabled INTEGER NOT NULL DEFAULT 0,
     facebookSessionMode TEXT NOT NULL DEFAULT 'persistent',
     facebookDefaultRetryLimit INTEGER NOT NULL DEFAULT 3,
@@ -811,6 +864,63 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_keepa_example_library_label ON keepa_example_library (label, created_at DESC);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS auth_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'admin',
+    display_name TEXT NOT NULL DEFAULT 'Administrator',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_login_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_auth_users_role ON auth_users (role, is_active);
+
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    user_agent TEXT,
+    ip_address TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES auth_users(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions (user_id);
+  CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at ON auth_sessions (expires_at);
+
+  CREATE TABLE IF NOT EXISTS whatsapp_output_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    target_ref TEXT NOT NULL UNIQUE,
+    target_label TEXT,
+    target_type TEXT NOT NULL DEFAULT 'WHATSAPP_CHANNEL',
+    channel_url TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    use_for_publishing INTEGER NOT NULL DEFAULT 1,
+    is_system INTEGER NOT NULL DEFAULT 0,
+    requires_manual_activation INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    last_sent_at TEXT,
+    last_error TEXT,
+    last_error_at TEXT,
+    last_delivery_status TEXT NOT NULL DEFAULT 'idle',
+    last_tested_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_whatsapp_output_targets_active
+    ON whatsapp_output_targets (is_active, use_for_publishing);
+`);
+
 function ensureColumn(tableName, columnName, definition) {
   const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
   if (!columns.some((column) => column.name === columnName)) {
@@ -933,6 +1043,7 @@ ensureColumn(
   `telegramCopyButtonText TEXT NOT NULL DEFAULT '${DEFAULT_TELEGRAM_COPY_BUTTON_TEXT}'`
 );
 ensureColumn('app_settings', 'copybotEnabled', `copybotEnabled INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('app_settings', 'outputQueueEnabled', `outputQueueEnabled INTEGER NOT NULL DEFAULT 1`);
 ensureColumn('app_settings', 'telegramBotEnabled', `telegramBotEnabled INTEGER NOT NULL DEFAULT 1`);
 ensureColumn('app_settings', 'telegramReaderGroupSlotCount', `telegramReaderGroupSlotCount INTEGER NOT NULL DEFAULT 10`);
 ensureColumn('app_settings', 'schedulerBootstrapVersion', `schedulerBootstrapVersion INTEGER NOT NULL DEFAULT 0`);
@@ -941,6 +1052,14 @@ ensureColumn(
   'telegramBotDefaultRetryLimit',
   `telegramBotDefaultRetryLimit INTEGER NOT NULL DEFAULT 3`
 );
+ensureColumn('app_settings', 'whatsappWorkerEnabled', `whatsappWorkerEnabled INTEGER NOT NULL DEFAULT 0`);
+ensureColumn(
+  'app_settings',
+  'whatsappAlertTelegramEnabled',
+  `whatsappAlertTelegramEnabled INTEGER NOT NULL DEFAULT 0`
+);
+ensureColumn('app_settings', 'whatsappAlertTelegramTarget', `whatsappAlertTelegramTarget TEXT`);
+ensureColumn('app_settings', 'whatsappSendCooldownMs', `whatsappSendCooldownMs INTEGER NOT NULL DEFAULT 4000`);
 ensureColumn('app_settings', 'facebookEnabled', `facebookEnabled INTEGER NOT NULL DEFAULT 0`);
 ensureColumn('app_settings', 'facebookSessionMode', `facebookSessionMode TEXT NOT NULL DEFAULT 'persistent'`);
 ensureColumn(
@@ -949,6 +1068,37 @@ ensureColumn(
   `facebookDefaultRetryLimit INTEGER NOT NULL DEFAULT 3`
 );
 ensureColumn('app_settings', 'facebookDefaultTarget', `facebookDefaultTarget TEXT`);
+ensureColumn('telegram_bot_targets', 'channel_kind', `channel_kind TEXT NOT NULL DEFAULT 'test'`);
+ensureColumn('telegram_bot_targets', 'last_sent_at', `last_sent_at TEXT`);
+ensureColumn('telegram_bot_targets', 'last_error', `last_error TEXT`);
+ensureColumn('telegram_bot_targets', 'last_error_at', `last_error_at TEXT`);
+ensureColumn('telegram_bot_targets', 'last_delivery_status', `last_delivery_status TEXT NOT NULL DEFAULT 'idle'`);
+ensureColumn('telegram_bot_targets', 'last_tested_at', `last_tested_at TEXT`);
+ensureColumn('whatsapp_output_targets', 'target_type', `target_type TEXT NOT NULL DEFAULT 'WHATSAPP_CHANNEL'`);
+ensureColumn('whatsapp_output_targets', 'channel_url', `channel_url TEXT`);
+ensureColumn('whatsapp_output_targets', 'is_system', `is_system INTEGER NOT NULL DEFAULT 0`);
+ensureColumn(
+  'whatsapp_output_targets',
+  'requires_manual_activation',
+  `requires_manual_activation INTEGER NOT NULL DEFAULT 0`
+);
+ensureColumn('whatsapp_output_targets', 'sort_order', `sort_order INTEGER NOT NULL DEFAULT 100`);
+ensureColumn('whatsapp_output_targets', 'last_sent_at', `last_sent_at TEXT`);
+ensureColumn('whatsapp_output_targets', 'last_error', `last_error TEXT`);
+ensureColumn('whatsapp_output_targets', 'last_error_at', `last_error_at TEXT`);
+ensureColumn(
+  'whatsapp_output_targets',
+  'last_delivery_status',
+  `last_delivery_status TEXT NOT NULL DEFAULT 'idle'`
+);
+ensureColumn('whatsapp_output_targets', 'last_tested_at', `last_tested_at TEXT`);
+db.exec(`
+  UPDATE whatsapp_output_targets
+  SET target_type = 'WHATSAPP_CHANNEL'
+  WHERE target_type IS NULL
+     OR TRIM(target_type) = ''
+     OR LOWER(TRIM(target_type)) = 'whatsapp_channel'
+`);
 ensureColumn('telegram_reader_channels', 'slot_index', `slot_index INTEGER`);
 ensureColumn('telegram_reader_channels', 'last_checked_at', `last_checked_at TEXT`);
 
@@ -1075,6 +1225,8 @@ ensureColumn('generator_posts', 'posted_channels_json', `posted_channels_json TE
 ensureColumn('publishing_targets', 'target_ref', `target_ref TEXT`);
 ensureColumn('publishing_targets', 'target_label', `target_label TEXT`);
 ensureColumn('publishing_targets', 'target_meta_json', `target_meta_json TEXT`);
+ensureColumn('publishing_targets', 'send_id', `send_id TEXT`);
+ensureColumn('publishing_targets', 'delivery_ref', `delivery_ref TEXT`);
 ensureColumn('publishing_queue', 'deal_key', `deal_key TEXT`);
 ensureColumn('publishing_queue', 'attempt_count', `attempt_count INTEGER NOT NULL DEFAULT 0`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_publishing_queue_deal_key ON publishing_queue (deal_key)`);
@@ -1204,18 +1356,23 @@ if (!appSettingsRow?.count) {
         copybotEnabled,
         telegramBotEnabled,
         telegramBotDefaultRetryLimit,
+        whatsappWorkerEnabled,
+        whatsappAlertTelegramEnabled,
+        whatsappAlertTelegramTarget,
+        whatsappSendCooldownMs,
         facebookEnabled,
         facebookSessionMode,
         facebookDefaultRetryLimit,
         facebookDefaultTarget,
         telegramReaderGroupSlotCount,
         schedulerBootstrapVersion
-      ) VALUES (1, ?, ?, ?, 0, 1, 3, 0, 'persistent', 3, NULL, 10, 0)
+      ) VALUES (1, ?, ?, ?, 0, 1, 3, 0, 1, ?, 4000, 0, 'persistent', 3, NULL, 10, 0)
     `
   ).run(
     legacySettings?.repostCooldownEnabled ?? 1,
     legacySettings?.repostCooldownHours ?? 12,
-    legacySettings?.telegramCopyButtonText ?? DEFAULT_TELEGRAM_COPY_BUTTON_TEXT
+    legacySettings?.telegramCopyButtonText ?? DEFAULT_TELEGRAM_COPY_BUTTON_TEXT,
+    DEFAULT_WHATSAPP_ALERT_TARGET
   );
 } else {
   db.prepare(`DELETE FROM app_settings WHERE id != 1`).run();
@@ -1234,12 +1391,23 @@ if (!appSettingsRow?.count) {
           END,
           schedulerBootstrapVersion = COALESCE(schedulerBootstrapVersion, 0),
           telegramBotDefaultRetryLimit = COALESCE(telegramBotDefaultRetryLimit, 3),
+          whatsappWorkerEnabled = COALESCE(whatsappWorkerEnabled, 0),
+          whatsappAlertTelegramEnabled = CASE
+            WHEN whatsappAlertTelegramTarget IS NULL OR TRIM(whatsappAlertTelegramTarget) = '' THEN 1
+            ELSE COALESCE(whatsappAlertTelegramEnabled, 1)
+          END,
+          whatsappAlertTelegramTarget = COALESCE(NULLIF(TRIM(whatsappAlertTelegramTarget), ''), ?),
+          whatsappSendCooldownMs = CASE
+            WHEN whatsappSendCooldownMs IS NULL OR whatsappSendCooldownMs < 500 THEN 500
+            WHEN whatsappSendCooldownMs > 60000 THEN 60000
+            ELSE whatsappSendCooldownMs
+          END,
           facebookEnabled = COALESCE(facebookEnabled, 0),
           facebookSessionMode = COALESCE(NULLIF(TRIM(facebookSessionMode), ''), 'persistent'),
           facebookDefaultRetryLimit = COALESCE(facebookDefaultRetryLimit, 3)
       WHERE id = 1
     `
-  ).run(DEFAULT_TELEGRAM_COPY_BUTTON_TEXT);
+  ).run(DEFAULT_TELEGRAM_COPY_BUTTON_TEXT, DEFAULT_WHATSAPP_ALERT_TARGET);
 }
 
 db.exec(`

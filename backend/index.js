@@ -4,6 +4,7 @@ import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import { getApiPort, getReaderRuntimeConfig, getTelegramTestGroupConfig, getTelegramUserReaderConfig } from './env.js';
+import { attachAuthenticatedUser, requireAuthenticatedUser } from './middleware/auth.js';
 import authRoutes from './routes/auth.js';
 import botRoutes from './routes/bot.js';
 import copybotRoutes from './routes/copybot.js';
@@ -28,6 +29,7 @@ import { startKeepaScheduler } from './services/keepaService.js';
 import { startPublishingWorkerLoop } from './services/publisherService.js';
 import { startAdvertisingScheduler } from './services/advertisingService.js';
 import { startTelegramUserReaderRuntime } from './services/telegramUserClientService.js';
+import { startWhatsappHealthMonitor } from './services/whatsappRuntimeService.js';
 
 const backendStartedAt = new Date().toISOString();
 const restartManager = String(process.env.BACKEND_RESTART_MANAGER || '').trim().toLowerCase();
@@ -162,6 +164,7 @@ const allowedOrigins = new Set([
 
 app.use(
   cors({
+    credentials: true,
     origin(origin, callback) {
       if (!origin || allowedOrigins.has(origin)) {
         callback(null, true);
@@ -174,12 +177,14 @@ app.use(
 );
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(attachAuthenticatedUser);
 
 app.get('/api/health', (req, res) => {
   res.json(getHealthPayload());
 });
 
 app.use('/api/auth', authRoutes);
+app.use('/api', requireAuthenticatedUser);
 app.use('/api/bot', botRoutes);
 app.use('/api/copybot', copybotRoutes);
 app.use('/api/database', databaseRoutes);
@@ -236,6 +241,7 @@ console.info('[ROUTES_MOUNTED]', {
 
 startKeepaScheduler();
 startPublishingWorkerLoop();
+startWhatsappHealthMonitor();
 startAdvertisingScheduler();
 void startTelegramUserReaderRuntime().catch((error) => {
   console.warn('[NO_POST_REASON]', {

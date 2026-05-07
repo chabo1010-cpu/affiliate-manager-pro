@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import { useAuth } from '../context/AuthContext';
 import './Settings.css';
@@ -7,6 +7,7 @@ import './Settings.css';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
 const settingsApiUrl = `${API_BASE_URL}/api/deals/settings`;
 const liveStatusApiUrl = `${API_BASE_URL}/api/settings/live-status`;
+const outputChannelsApiUrl = `${API_BASE_URL}/api/settings/output-channels`;
 const restartApiUrl = `${API_BASE_URL}/api/system/restart-backend`;
 const healthApiUrl = `${API_BASE_URL}/api/health`;
 const DEFAULT_TELEGRAM_COPY_BUTTON_TEXT = '\u{1F4CB} Zum Kopieren hier klicken';
@@ -14,6 +15,7 @@ const SETTINGS_TIMEOUT_MS = 2200;
 
 const tabs = [
   { id: 'live', label: 'Zugaenge & Live Status' },
+  { id: 'output', label: 'Kanaele & Output' },
   { id: 'telegram', label: 'Telegram' },
   { id: 'amazon', label: 'Amazon' },
   { id: 'whatsapp', label: 'WhatsApp' },
@@ -59,14 +61,35 @@ function buildStatusText(flag, positive = 'aktiv', negative = 'pausiert') {
   return flag ? positive : negative;
 }
 
+function getOutputChannelTone(channel = {}) {
+  if (channel.isDangerousLive && channel.isEnabled !== true) {
+    return 'danger';
+  }
+  if (channel.isBlocked) {
+    return 'warning';
+  }
+  if (channel.lastStatus === 'failed' || channel.lastStatus === 'disabled_skip') {
+    return 'warning';
+  }
+  if (channel.isEnabled && channel.platformStatus?.active) {
+    return 'success';
+  }
+  return 'info';
+}
+
 function SettingsPage() {
   const { user } = useAuth();
+  const location = useLocation();
   const isAdmin = user?.role === 'admin';
   const [activeTab, setActiveTab] = useState('live');
   const [telegramCopyButtonText, setTelegramCopyButtonText] = useState(DEFAULT_TELEGRAM_COPY_BUTTON_TEXT);
   const [loading, setLoading] = useState(isAdmin);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [outputView, setOutputView] = useState('telegram');
+  const [outputSnapshot, setOutputSnapshot] = useState(null);
+  const [outputBusyKey, setOutputBusyKey] = useState('');
+  const [outputTestingKey, setOutputTestingKey] = useState('');
   const [settingsStatus, setSettingsStatus] = useState('');
   const [restartStatus, setRestartStatus] = useState('');
   const [restarting, setRestarting] = useState(false);
@@ -97,6 +120,7 @@ function SettingsPage() {
       const response = await fetch(path, {
         ...options,
         signal: controller.signal,
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
           'X-User-Role': user?.role || '',
@@ -135,9 +159,10 @@ function SettingsPage() {
     setSettingsStatus('');
 
     try {
-      const [settingsResponse, liveResponse] = await Promise.allSettled([
+      const [settingsResponse, liveResponse, outputResponse] = await Promise.allSettled([
         apiFetch(settingsApiUrl),
-        apiFetch(liveStatusApiUrl)
+        apiFetch(liveStatusApiUrl),
+        apiFetch(outputChannelsApiUrl)
       ]);
 
       if (settingsResponse.status === 'fulfilled') {
@@ -148,11 +173,19 @@ function SettingsPage() {
         setLiveStatus(liveResponse.value?.item || null);
       }
 
-      if (settingsResponse.status === 'rejected' || liveResponse.status === 'rejected') {
+      if (outputResponse.status === 'fulfilled') {
+        setOutputSnapshot(outputResponse.value?.item || null);
+      } else if (liveResponse.status === 'fulfilled') {
+        setOutputSnapshot(liveResponse.value?.item?.outputs || null);
+      }
+
+      if (settingsResponse.status === 'rejected' || liveResponse.status === 'rejected' || outputResponse.status === 'rejected') {
         const message =
           settingsResponse.status === 'rejected'
             ? settingsResponse.reason?.message || 'Settings konnten nicht geladen werden.'
-            : liveResponse.reason?.message || 'Live Status konnte nicht geladen werden.';
+            : liveResponse.status === 'rejected'
+              ? liveResponse.reason?.message || 'Live Status konnte nicht geladen werden.'
+              : outputResponse.reason?.message || 'Output Kanaele konnten nicht geladen werden.';
         setSettingsStatus(message);
       }
     } catch (error) {
@@ -171,6 +204,20 @@ function SettingsPage() {
   useEffect(() => {
     void loadSettings();
   }, [isAdmin, user?.role]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const requestedTab = params.get('tab');
+    const requestedOutputView = params.get('view');
+
+    if (requestedTab && tabs.some((tab) => tab.id === requestedTab)) {
+      setActiveTab(requestedTab);
+    }
+
+    if (requestedOutputView && ['telegram', 'whatsapp', 'facebook', 'live', 'security'].includes(requestedOutputView)) {
+      setOutputView(requestedOutputView);
+    }
+  }, [location.search]);
 
   useEffect(() => {
     if (!toast) {
@@ -271,6 +318,88 @@ function SettingsPage() {
     }
   };
 
+  const handleSaveOutputChannel = async (channelKey, patch) => {
+    if (!isAdmin || !channelKey) {
+      return;
+    }
+
+    setOutputBusyKey(channelKey);
+
+    try {
+      const data = await apiFetch(`${outputChannelsApiUrl}/${encodeURIComponent(channelKey)}`, {
+        method: 'PUT',
+        body: JSON.stringify(patch)
+      });
+      setOutputSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+
+        return {
+          ...current,
+          channels: (current.channels || []).map((item) => (item.channelKey === channelKey ? data?.item || item : item))
+        };
+      });
+      showToast('Output Kanal gespeichert.', 'success');
+      await loadSettings(true);
+    } catch (error) {
+      setSettingsStatus(error instanceof Error ? error.message : 'Output Kanal konnte nicht gespeichert werden.');
+      showToast('Output Kanal konnte nicht gespeichert werden.', 'error');
+    } finally {
+      setOutputBusyKey('');
+    }
+  };
+
+  const handleSaveOutputControls = async (patch) => {
+    if (!isAdmin) {
+      return;
+    }
+
+    setOutputBusyKey('controls');
+
+    try {
+      const data = await apiFetch(`${outputChannelsApiUrl}/controls`, {
+        method: 'PUT',
+        body: JSON.stringify(patch)
+      });
+      setOutputSnapshot((current) => ({
+        ...(current || {}),
+        controls: data?.item || current?.controls || null,
+        platforms: current?.platforms || {},
+        channels: current?.channels || []
+      }));
+      showToast('Output Controls gespeichert.', 'success');
+      await loadSettings(true);
+    } catch (error) {
+      setSettingsStatus(error instanceof Error ? error.message : 'Output Controls konnten nicht gespeichert werden.');
+      showToast('Output Controls konnten nicht gespeichert werden.', 'error');
+    } finally {
+      setOutputBusyKey('');
+    }
+  };
+
+  const handleRunOutputTest = async (channelKey) => {
+    if (!isAdmin || !channelKey) {
+      return;
+    }
+
+    setOutputTestingKey(channelKey);
+
+    try {
+      await apiFetch(`${outputChannelsApiUrl}/${encodeURIComponent(channelKey)}/test`, {
+        method: 'POST',
+        body: JSON.stringify({})
+      }, 10000);
+      showToast('Output Test verarbeitet.', 'success');
+      await loadSettings(true);
+    } catch (error) {
+      setSettingsStatus(error instanceof Error ? error.message : 'Output Test fehlgeschlagen.');
+      showToast('Output Test fehlgeschlagen.', 'error');
+    } finally {
+      setOutputTestingKey('');
+    }
+  };
+
   const modules = liveStatus?.config?.modules || {};
   const frontendOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
   const heroCards = useMemo(
@@ -345,6 +474,37 @@ function SettingsPage() {
     [liveStatus]
   );
 
+  const outputPlatformTabs = useMemo(
+    () => [
+      { id: 'telegram', label: 'Telegram Output' },
+      { id: 'whatsapp', label: 'WhatsApp Output' },
+      { id: 'facebook', label: 'Facebook Output' },
+      { id: 'live', label: 'Live Status' },
+      { id: 'security', label: 'Sicherheit' }
+    ],
+    []
+  );
+
+  const filteredOutputChannels = useMemo(() => {
+    const channels = outputSnapshot?.channels || [];
+    if (outputView === 'live') {
+      return channels.filter((channel) => channel.isDangerousLive || channel.channelType === 'live');
+    }
+
+    if (outputView === 'security') {
+      return channels.filter(
+        (channel) =>
+          channel.isBlocked ||
+          channel.isEnabled !== true ||
+          channel.lastStatus === 'disabled_skip' ||
+          Boolean(channel.warningText) ||
+          Boolean(channel.lastErrorMessage)
+      );
+    }
+
+    return channels.filter((channel) => channel.platform === outputView);
+  }, [outputSnapshot, outputView]);
+
   function renderLiveTab() {
     return (
       <section className="settings-panel card">
@@ -374,6 +534,190 @@ function SettingsPage() {
             </article>
           ))}
         </div>
+      </section>
+    );
+  }
+
+  function renderOutputChannelCard(channel) {
+    const tone = getOutputChannelTone(channel);
+    const busy = outputBusyKey === channel.channelKey;
+    const testing = outputTestingKey === channel.channelKey;
+    const statusLabel = channel.isBlocked
+      ? 'Gesperrt'
+      : channel.isEnabled
+        ? channel.platformStatus?.active
+          ? 'Aktiv'
+          : 'Wartet'
+        : 'Deaktiviert';
+
+    return (
+      <article key={channel.channelKey} className={`status-card settings-status-card settings-tone-${tone} output-channel-card`}>
+        <div className="settings-card-head">
+          <p className="section-title">{channel.platform}</p>
+          <span className={`status-chip ${tone}`}>{statusLabel}</span>
+        </div>
+        <h3 className="card-title">{channel.channelLabel}</h3>
+        <p className="meta-text">
+          Typ {channel.channelType} | Plattform {channel.platformStatus?.active ? 'aktiv' : 'aus'} | Queue{' '}
+          {outputSnapshot?.controls?.outputQueueEnabled ? 'aktiv' : 'aus'}
+        </p>
+        {channel.targetRef ? <p className="meta-text">Ziel: {channel.targetRef}</p> : null}
+        {channel.warningText ? <div className="warning-card output-warning-banner">{channel.warningText}</div> : null}
+        <div className="output-check-grid">
+          <p className="meta-text">Output-Kanal: {channel.isEnabled ? 'Aktiv' : 'Aus'}</p>
+          <p className="meta-text">Plattform: {channel.platformStatus?.active ? 'Aktiv' : 'Aus'}</p>
+          <p className="meta-text">Typ erlaubt: {(channel.allowedSourceTypes || []).join(', ') || '-'}</p>
+          <p className="meta-text">Modus: {channel.channelType}</p>
+          <p className="meta-text">Copybot: {outputSnapshot?.controls?.copybotEnabled ? 'Aktiv' : 'Aus'}</p>
+          <p className="meta-text">Kanal gesperrt: {channel.isBlocked ? 'Ja' : 'Nein'}</p>
+        </div>
+        <div className="output-history-grid">
+          <article className="info-card">
+            <p className="section-title">Letzte Sendung</p>
+            <h3 className="card-title">{formatDateTime(channel.lastSentAt)}</h3>
+            <p className="meta-text">{channel.lastMessagePreview || 'Noch keine gespeicherte Ausgabe.'}</p>
+          </article>
+          <article className="warning-card">
+            <p className="section-title">Letzter Fehler</p>
+            <h3 className="card-title">{formatDateTime(channel.lastErrorAt)}</h3>
+            <p className="meta-text">{channel.lastErrorMessage || 'Kein aktueller Fehler gespeichert.'}</p>
+          </article>
+        </div>
+        <div className="settings-panel-actions">
+          <button
+            type="button"
+            className={channel.isEnabled ? 'secondary' : 'primary'}
+            disabled={busy}
+            onClick={() => void handleSaveOutputChannel(channel.channelKey, { isEnabled: !channel.isEnabled })}
+          >
+            {busy ? 'Speichert...' : channel.isEnabled ? 'Deaktivieren' : 'Aktivieren'}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy}
+            onClick={() => void handleSaveOutputChannel(channel.channelKey, { isBlocked: !channel.isBlocked })}
+          >
+            {channel.isBlocked ? 'Entsperren' : 'Sperren'}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={testing}
+            onClick={() => void handleRunOutputTest(channel.channelKey)}
+          >
+            {testing ? 'Test laeuft...' : 'Test senden'}
+          </button>
+        </div>
+      </article>
+    );
+  }
+
+  function renderOutputTab() {
+    const platformCards = Object.entries(outputSnapshot?.platforms || {}).map(([key, item]) => ({
+      key,
+      title: item?.label || key,
+      value: item?.active ? 'Aktiv' : 'Aus',
+      detail: item?.detail || '-',
+      tone: item?.active ? 'success' : 'warning'
+    }));
+    const securityChannels = filteredOutputChannels;
+
+    return (
+      <section className="settings-panel card">
+        <div className="settings-panel-header">
+          <div>
+            <p className="section-title">Kanaele & Output</p>
+            <h2 className="page-title">Output-Kanaele, Live-Schutz und Tests</h2>
+          </div>
+          <div className="settings-panel-actions">
+            <button type="button" className="secondary" disabled={refreshing} onClick={() => void loadSettings(true)}>
+              {refreshing ? 'Lade neu...' : 'Status neu laden'}
+            </button>
+            <button
+              type="button"
+              className={outputSnapshot?.controls?.outputQueueEnabled ? 'secondary' : 'primary'}
+              disabled={outputBusyKey === 'controls'}
+              onClick={() =>
+                void handleSaveOutputControls({
+                  outputQueueEnabled: !(outputSnapshot?.controls?.outputQueueEnabled === true)
+                })
+              }
+            >
+              {outputBusyKey === 'controls'
+                ? 'Speichert...'
+                : outputSnapshot?.controls?.outputQueueEnabled
+                  ? 'Queue deaktivieren'
+                  : 'Queue aktivieren'}
+            </button>
+          </div>
+        </div>
+
+        <div className="tab-strip output-subtabs">
+          {outputPlatformTabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={outputView === tab.id ? 'tab-chip active' : 'tab-chip'}
+              onClick={() => setOutputView(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {outputView === 'live' ? (
+          <div className="settings-grid">
+            {platformCards.map((card) => (
+              <article key={card.key} className={`status-card settings-status-card settings-tone-${card.tone}`}>
+                <div className="settings-card-head">
+                  <p className="section-title">{card.title}</p>
+                  <span className={`status-chip ${card.tone}`}>{card.value}</span>
+                </div>
+                <h3 className="card-title">{card.value}</h3>
+                <p className="meta-text">{card.detail}</p>
+              </article>
+            ))}
+            <article className="status-card settings-status-card settings-tone-info">
+              <div className="settings-card-head">
+                <p className="section-title">Queue</p>
+                <span className={`status-chip ${outputSnapshot?.controls?.outputQueueEnabled ? 'success' : 'warning'}`}>
+                  {outputSnapshot?.controls?.outputQueueEnabled ? 'Aktiv' : 'Aus'}
+                </span>
+              </div>
+              <h3 className="card-title">{outputSnapshot?.controls?.outputQueueEnabled ? 'Aktiv' : 'Deaktiviert'}</h3>
+              <p className="meta-text">Finale Sends laufen nur, wenn die Queue freigegeben ist.</p>
+            </article>
+          </div>
+        ) : null}
+
+        {outputView === 'security' ? (
+          <div className="settings-grid">
+            {securityChannels.map((channel) => renderOutputChannelCard(channel))}
+            {!securityChannels.length ? (
+              <article className="info-card">
+                <p className="section-title">Sicherheitsansicht</p>
+                <h3 className="card-title">Keine gesperrten Kanaele gefunden</h3>
+                <p className="meta-text">
+                  Sobald ein Kanal blockiert, deaktiviert oder sicherheitsbedingt uebersprungen wird, erscheint er hier.
+                </p>
+              </article>
+            ) : null}
+          </div>
+        ) : null}
+
+        {outputView !== 'live' && outputView !== 'security' ? (
+          <div className="settings-grid">
+            {filteredOutputChannels.map((channel) => renderOutputChannelCard(channel))}
+            {!filteredOutputChannels.length ? (
+              <article className="info-card">
+                <p className="section-title">Keine Kanaele</p>
+                <h3 className="card-title">Noch keine Ziele gespeichert</h3>
+                <p className="meta-text">Sobald fuer diese Plattform Ziele vorhanden sind, erscheinen sie hier mit Status und Test-Button.</p>
+              </article>
+            ) : null}
+          </div>
+        ) : null}
       </section>
     );
   }
@@ -482,27 +826,49 @@ function SettingsPage() {
         <div className="settings-panel-header">
           <div>
             <p className="section-title">WhatsApp</p>
-            <h2 className="page-title">Client, Gateway und Senderstatus</h2>
+            <h2 className="page-title">Client, Session, Worker und Alert-Lage</h2>
           </div>
-          <button type="button" className="secondary" disabled={refreshing} onClick={() => void loadSettings(true)}>
-            Status neu laden
-          </button>
+          <div className="settings-panel-actions">
+            <button type="button" className="secondary" disabled={refreshing} onClick={() => void loadSettings(true)}>
+              Status neu laden
+            </button>
+            <Link to="/publishing/whatsapp" className="tab-chip">
+              WhatsApp Output oeffnen
+            </Link>
+          </div>
         </div>
         <div className="settings-grid">
           <article className="status-card">
             <p className="section-title">Client</p>
             <h3 className="card-title">{liveStatus?.whatsapp?.clientStatus || '-'}</h3>
-            <p className="meta-text">Retry Limit {liveStatus?.whatsapp?.retryLimit || 0}</p>
+            <p className="meta-text">Retry Limit {liveStatus?.whatsapp?.retryLimit || 0} | Queue offen {liveStatus?.whatsapp?.queueOpen || 0}</p>
           </article>
           <article className="info-card">
             <p className="section-title">Gateway</p>
             <h3 className="card-title">{liveStatus?.whatsapp?.endpointStatus || '-'}</h3>
-            <p className="meta-text">{liveStatus?.whatsapp?.endpointMasked || 'Kein Endpoint gesetzt'}</p>
+            <p className="meta-text">{liveStatus?.whatsapp?.endpointMasked || 'Kein Endpoint gesetzt'} | Control {liveStatus?.whatsapp?.controlStatus || '-'}</p>
           </article>
           <article className="status-card">
             <p className="section-title">Sender</p>
             <h3 className="card-title">{liveStatus?.whatsapp?.senderStatus || '-'}</h3>
             <p className="meta-text">{liveStatus?.whatsapp?.sender || 'Nicht gesetzt'}</p>
+          </article>
+          <article className="status-card">
+            <p className="section-title">Session</p>
+            <h3 className="card-title">{liveStatus?.whatsapp?.connectionStatus || '-'}</h3>
+            <p className="meta-text">
+              Worker {liveStatus?.whatsapp?.workerStatus || '-'} | Health {liveStatus?.whatsapp?.healthStatus || '-'}
+            </p>
+          </article>
+          <article className="info-card">
+            <p className="section-title">Letzter Post</p>
+            <h3 className="card-title">{formatDateTime(liveStatus?.whatsapp?.lastSuccessfulPostAt)}</h3>
+            <p className="meta-text">Zuletzt erfolgreicher WhatsApp Output.</p>
+          </article>
+          <article className="warning-card">
+            <p className="section-title">Letzter Fehler</p>
+            <h3 className="card-title">{formatDateTime(liveStatus?.whatsapp?.lastErrorAt)}</h3>
+            <p className="meta-text">{liveStatus?.whatsapp?.lastError || 'Keine aktuelle Fehlermeldung gespeichert.'}</p>
           </article>
         </div>
       </section>
@@ -640,6 +1006,9 @@ function SettingsPage() {
   }
 
   function renderActiveTab() {
+    if (activeTab === 'output') {
+      return renderOutputTab();
+    }
     if (activeTab === 'telegram') {
       return renderTelegramTab();
     }

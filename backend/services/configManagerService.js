@@ -7,7 +7,9 @@ import {
   getTelegramConfig,
   getTelegramTestGroupConfig,
   getTelegramUserReaderConfig,
-  getWhatsappDeliveryConfig
+  getWhatsappControlConfig,
+  getWhatsappDeliveryConfig,
+  getWhatsappPlaywrightConfig
 } from '../env.js';
 import { getTelegramBotClientConfig } from './telegramBotClientService.js';
 
@@ -205,6 +207,78 @@ export const CONFIG_MANAGER_ENV_STRUCTURE = [
         defaultValue: '3',
         example: '3',
         description: 'Retry-Limit fuer WhatsApp Jobs.'
+      },
+      {
+        key: 'WHATSAPP_KEEP_BROWSER_OPEN',
+        required: false,
+        secret: false,
+        defaultValue: '0',
+        example: '1',
+        description: 'Debug-Modus: laesst den sichtbaren Playwright-Browser offen und ueberspringt automatisches Close/Recovery.'
+      },
+      {
+        key: 'WHATSAPP_CONTROL_ENDPOINT',
+        required: false,
+        secret: false,
+        defaultValue: '',
+        example: 'http://127.0.0.1:8787/whatsapp/control',
+        description: 'Optionaler Control Endpoint fuer Session-, QR- und Health-Aktionen.'
+      },
+      {
+        key: 'WHATSAPP_CONTROL_TOKEN',
+        required: false,
+        secret: true,
+        defaultValue: '',
+        example: 'whatsapp_control_secret',
+        description: 'Optionales Auth-Token fuer den WhatsApp Control Endpoint.'
+      },
+      {
+        key: 'WHATSAPP_INSTANCE_ID',
+        required: false,
+        secret: false,
+        defaultValue: 'primary',
+        example: 'primary',
+        description: 'Technische Instanz-ID fuer die erste WhatsApp Worker Instanz.'
+      },
+      {
+        key: 'WHATSAPP_SESSION_DIR',
+        required: false,
+        secret: false,
+        defaultValue: './backend/data/whatsapp-session',
+        example: 'C:\\\\app\\\\data\\\\whatsapp-session',
+        description: 'Persistenter Speicherort fuer lokale WhatsApp Session-Metadaten.'
+      },
+      {
+        key: 'WHATSAPP_PLAYWRIGHT_BROWSER_CHANNEL',
+        required: false,
+        secret: false,
+        defaultValue: 'msedge',
+        example: 'chrome',
+        description: 'Bevorzugter lokaler Chromium-Kanal fuer den internen WhatsApp Worker.'
+      },
+      {
+        key: 'WHATSAPP_PLAYWRIGHT_EXECUTABLE_PATH',
+        required: false,
+        secret: false,
+        defaultValue: '',
+        example: 'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe',
+        description: 'Optionaler Pfad zu einem lokalen Chromium/Edge Browser fuer Playwright.'
+      },
+      {
+        key: 'WHATSAPP_PLAYWRIGHT_HEADLESS',
+        required: false,
+        secret: false,
+        defaultValue: '0',
+        example: '1',
+        description: 'Startet den internen WhatsApp Browser auf Wunsch headless.'
+      },
+      {
+        key: 'WHATSAPP_PLAYWRIGHT_WEB_URL',
+        required: false,
+        secret: false,
+        defaultValue: 'https://web.whatsapp.com/',
+        example: 'https://web.whatsapp.com/',
+        description: 'Basis-URL fuer den internen WhatsApp Web Worker.'
       }
     ]
   },
@@ -258,6 +332,8 @@ export function getConfigManagerSnapshot() {
   const telegramBotClientConfig = getTelegramBotClientConfig();
   const keepaConfig = getKeepaConfig();
   const whatsappConfig = getWhatsappDeliveryConfig();
+  const whatsappControlConfig = getWhatsappControlConfig();
+  const whatsappPlaywrightConfig = getWhatsappPlaywrightConfig();
 
   return {
     envPath: storageConfig.envPath,
@@ -296,7 +372,17 @@ export function getConfigManagerSnapshot() {
         tokenConfigured: Boolean(cleanText(whatsappConfig.token)),
         maskedToken: maskSecret(whatsappConfig.token, { visibleStart: 3, visibleEnd: 2 }),
         sender: cleanText(whatsappConfig.sender),
-        retryLimit: whatsappConfig.retryLimit
+        retryLimit: whatsappConfig.retryLimit,
+        controlEndpointConfigured: Boolean(cleanText(whatsappControlConfig.endpoint)),
+        controlEndpoint: cleanText(whatsappControlConfig.endpoint),
+        controlTokenConfigured: Boolean(cleanText(whatsappControlConfig.token)),
+        maskedControlToken: maskSecret(whatsappControlConfig.token, { visibleStart: 3, visibleEnd: 2 }),
+        instanceId: cleanText(whatsappControlConfig.instanceId),
+        sessionDir: cleanText(whatsappControlConfig.sessionDir),
+        playwrightBrowserChannel: cleanText(whatsappPlaywrightConfig.browserChannel),
+        playwrightExecutablePath: cleanText(whatsappPlaywrightConfig.executablePath),
+        playwrightHeadless: whatsappPlaywrightConfig.headless === true,
+        playwrightWebUrl: cleanText(whatsappPlaywrightConfig.webUrl)
       },
       database: {
         dataDir: databaseConfig.dataDir,
@@ -304,6 +390,7 @@ export function getConfigManagerSnapshot() {
         envPath: databaseConfig.envPath,
         journalMode: databaseConfig.journalMode,
         telegramUserSessionDir: storageConfig.telegramUserSessionDir,
+        whatsappSessionDir: storageConfig.whatsappSessionDir,
         dbExists: fs.existsSync(databaseConfig.dbPath),
         dataDirExists: fs.existsSync(databaseConfig.dataDir)
       }

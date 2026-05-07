@@ -42,12 +42,14 @@ export function getStorageConfig() {
   const dataDir = process.env.APP_DATA_DIR?.trim() || path.join(__dirname, 'data');
   const dbPath = process.env.APP_DB_PATH?.trim() || path.join(dataDir, 'deals.db');
   const telegramUserSessionDir = process.env.TELEGRAM_USER_SESSION_DIR?.trim() || path.join(dataDir, 'telegram-user-sessions');
+  const whatsappSessionDir = process.env.WHATSAPP_SESSION_DIR?.trim() || path.join(dataDir, 'whatsapp-session');
 
   return {
     envPath,
     dataDir,
     dbPath,
-    telegramUserSessionDir
+    telegramUserSessionDir,
+    whatsappSessionDir
   };
 }
 
@@ -114,6 +116,50 @@ export function getWhatsappDeliveryConfig() {
     token: normalizeSecret(process.env.WHATSAPP_DELIVERY_TOKEN, ['DEIN_TOKEN_HIER', 'YOUR_TOKEN_HERE', 'CHANGE_ME']),
     sender: process.env.WHATSAPP_DELIVERY_SENDER?.trim() || '',
     retryLimit: Number.parseInt(process.env.WHATSAPP_DELIVERY_RETRY_LIMIT || '3', 10) || 3
+  };
+}
+
+export function getWhatsappPlaywrightConfig() {
+  const storage = getStorageConfig();
+
+  return {
+    browserChannel: process.env.WHATSAPP_PLAYWRIGHT_BROWSER_CHANNEL?.trim() || 'msedge',
+    executablePath: process.env.WHATSAPP_PLAYWRIGHT_EXECUTABLE_PATH?.trim() || '',
+    headless: (process.env.WHATSAPP_PLAYWRIGHT_HEADLESS?.trim() || '0') === '1',
+    webUrl: process.env.WHATSAPP_PLAYWRIGHT_WEB_URL?.trim() || 'https://web.whatsapp.com/',
+    startupTimeoutMs: Number.parseInt(process.env.WHATSAPP_PLAYWRIGHT_STARTUP_TIMEOUT_MS || '25000', 10) || 25000,
+    actionTimeoutMs: Number.parseInt(process.env.WHATSAPP_PLAYWRIGHT_ACTION_TIMEOUT_MS || '15000', 10) || 15000,
+    loginTimeoutMs: Number.parseInt(process.env.WHATSAPP_PLAYWRIGHT_LOGIN_TIMEOUT_MS || '120000', 10) || 120000,
+    loginPollIntervalMs:
+      Number.parseInt(process.env.WHATSAPP_PLAYWRIGHT_LOGIN_POLL_INTERVAL_MS || '1500', 10) || 1500,
+    keepBrowserOpen: (process.env.WHATSAPP_KEEP_BROWSER_OPEN?.trim() || '0') === '1',
+    sessionDir: storage.whatsappSessionDir
+  };
+}
+
+export function getWhatsappControlConfig() {
+  const storage = getStorageConfig();
+
+  return {
+    endpoint: process.env.WHATSAPP_CONTROL_ENDPOINT?.trim() || '',
+    token: normalizeSecret(process.env.WHATSAPP_CONTROL_TOKEN, ['DEIN_TOKEN_HIER', 'YOUR_TOKEN_HERE', 'CHANGE_ME']),
+    instanceId: process.env.WHATSAPP_INSTANCE_ID?.trim() || 'primary',
+    sessionDir: storage.whatsappSessionDir
+  };
+}
+
+export function getAuthConfig() {
+  const sessionTtlDays = Number.parseInt(process.env.AUTH_SESSION_TTL_DAYS || '14', 10) || 14;
+
+  return {
+    cookieName: process.env.AUTH_COOKIE_NAME?.trim() || 'affiliate_manager_session',
+    sessionTtlDays: Math.max(1, sessionTtlDays),
+    bootstrapAdmin: {
+      email: process.env.AUTH_BOOTSTRAP_ADMIN_EMAIL?.trim() || 'admin@affiliate-manager.local',
+      username: process.env.AUTH_BOOTSTRAP_ADMIN_USERNAME?.trim() || 'admin',
+      displayName: process.env.AUTH_BOOTSTRAP_ADMIN_NAME?.trim() || 'Administrator',
+      password: process.env.AUTH_BOOTSTRAP_ADMIN_PASSWORD?.trim() || 'Admin12345!'
+    }
   };
 }
 

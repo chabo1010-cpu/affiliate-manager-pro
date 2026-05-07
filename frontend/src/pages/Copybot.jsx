@@ -119,6 +119,7 @@ function CopybotPage() {
       const response = await fetch(`${API_BASE_URL}${path}`, {
         ...options,
         signal: controller.signal,
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
           'X-User-Role': user?.role || '',

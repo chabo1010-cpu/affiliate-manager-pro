@@ -507,6 +507,7 @@ function DealEnginePage() {
 
     try {
       const response = await fetch(`${API_BASE_URL}${path}`, {
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
           'X-User-Role': user?.role || ''

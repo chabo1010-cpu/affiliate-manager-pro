@@ -89,6 +89,33 @@
   background: rgba(255, 255, 255, 0.015);
 }
 
+.output-subtabs {
+  margin-top: 0.25rem;
+}
+
+.output-channel-card {
+  gap: 0.8rem;
+}
+
+.output-warning-banner {
+  padding: 0.75rem 0.9rem;
+  border-radius: 16px;
+}
+
+.output-check-grid,
+.output-history-grid {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.output-check-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.output-history-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 @media (max-width: 720px) {
   .settings-hero,
   .settings-tabs-shell {
@@ -103,5 +130,10 @@
   .settings-panel-actions button {
     width: 100%;
     justify-content: center;
+  }
+
+  .output-history-grid,
+  .output-check-grid {
+    grid-template-columns: 1fr;
   }
 }

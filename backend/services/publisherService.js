@@ -5,18 +5,41 @@ import { buildDealStatusKey, syncDealStatusWithQueue } from './databaseService.j
 import {
   PUBLISHING_QUEUE_STATUS,
   isFailedPublishingQueueStatus,
+  isHoldPublishingQueueStatus,
   isRetryPublishingQueueStatus,
   isSendingPublishingQueueStatus,
+  isSkippedPublishingQueueStatus,
   isSentPublishingQueueStatus,
   isWaitingPublishingQueueStatus,
   normalizePublishingQueueStatus
 } from './publishingQueueStateService.js';
-import { expandTelegramPublishingTargets, getTelegramBotClientConfig, getTelegramBotRetryLimit } from './telegramBotClientService.js';
+import {
+  expandTelegramPublishingTargets,
+  getTelegramBotClientConfig,
+  getTelegramBotRetryLimit,
+  getTelegramBotTargetState,
+  recordTelegramBotTargetDelivery
+} from './telegramBotClientService.js';
 import { processTelegramPublishingTarget } from './telegramWorkerService.js';
 import { processWhatsappPublishingTarget } from './whatsappWorkerService.js';
 import { getWhatsappClientConfig, getWhatsappClientRetryLimit } from './whatsappClientService.js';
+import {
+  DEFAULT_WHATSAPP_LIVE_CHANNEL_URL,
+  DEFAULT_WHATSAPP_TEST_TARGET_TYPE,
+  expandWhatsappPublishingTargets,
+  getWhatsappOutputTargetConfig
+} from './whatsappOutputTargetService.js';
 import { processFacebookPublishingTarget } from './facebookWorkerService.js';
 import { getCopybotRuntimeState, isCopybotControlledSourceType } from './copybotControlService.js';
+import { OUTPUT_DISABLED_SKIP, evaluateOutputGate, recordOutputChannelEvent } from './outputChannelService.js';
+import {
+  getWhatsappRuntimeState,
+  recordWhatsappSendError,
+  sendWhatsappChannelUnavailableAlert,
+  sendWhatsappFinalFailureAlert,
+  sendWhatsappRecoveryAlert,
+  sendWhatsappRetryAlert
+} from './whatsappRuntimeService.js';
 
 const db = getDb();
 const PUBLISHER_LOOP_INTERVAL_MS = 15 * 1000;
@@ -53,6 +76,17 @@ function parseJson(value, fallback = null) {
   } catch {
     return fallback;
   }
+}
+
+function isWhatsappTestTargetMeta(targetMeta = {}) {
+  return cleanText(targetMeta?.targetType).toUpperCase() === DEFAULT_WHATSAPP_TEST_TARGET_TYPE;
+}
+
+function isWhatsappLiveTargetMeta(targetMeta = {}, target = {}) {
+  return (
+    targetMeta?.requiresManualActivation === true ||
+    cleanText(target.target_ref).toLowerCase() === DEFAULT_WHATSAPP_LIVE_CHANNEL_URL.toLowerCase()
+  );
 }
 
 function sleepSync(delayMs) {
@@ -196,6 +230,10 @@ function expandPublishingTargets(payload, targets = []) {
 
     if (target.channelType === 'telegram') {
       return expandTelegramPublishingTargets(target, payload);
+    }
+
+    if (target.channelType === 'whatsapp') {
+      return expandWhatsappPublishingTargets(target, payload);
     }
 
     return [target];
@@ -488,6 +526,77 @@ export function enqueueCopybotPublishing(input = {}) {
   });
 }
 
+export async function sendWhatsappOutputTargetTestPost(targetId, input = {}) {
+  const numericTargetId = Number.parseInt(String(targetId ?? ''), 10);
+  if (!Number.isFinite(numericTargetId)) {
+    throw new Error('WhatsApp Ziel ist ungueltig.');
+  }
+
+  const config = getWhatsappOutputTargetConfig();
+  const target = config.targets.find((item) => item.id === numericTargetId);
+  if (!target) {
+    throw new Error('WhatsApp Ziel nicht gefunden.');
+  }
+
+  const link = cleanText(input.link) || 'https://www.amazon.de/dp/B000WATEST1';
+  const queue = createPublishingEntry({
+    sourceType: 'output_channel_test',
+    payload: {
+      title: cleanText(input.title) || `${target.name} Testpost`,
+      link,
+      normalizedUrl: cleanText(input.normalizedUrl) || link,
+      asin: cleanText(input.asin).toUpperCase() || 'B000WATEST1',
+      sellerType: cleanText(input.sellerType) || 'FBM',
+      currentPrice: cleanText(input.currentPrice) || '0.00',
+      oldPrice: cleanText(input.oldPrice) || '',
+      couponCode: cleanText(input.couponCode) || '',
+      testMode: true,
+      skipDealLock: true,
+      skipPostedDealHistory: true,
+      textByChannel: {
+        whatsapp:
+          cleanText(input.text) ||
+          `${target.name}\nTestpost ueber die Publishing Queue.\nDieser Kanal bleibt getrennt vom Live-Output.`
+      },
+      imageVariants: {
+        standard: cleanText(input.imageUrl) || 'https://cdn.example.com/whatsapp-test-output.jpg'
+      },
+      targetImageSources: {
+        whatsapp: 'standard'
+      },
+      whatsappTargetIds: [target.id],
+      whatsappTargetRefs: [target.targetRef]
+    },
+    targets: [
+      {
+        channelType: 'whatsapp',
+        isEnabled: true,
+        imageSource: 'standard',
+        targetRef: target.targetRef,
+        targetLabel: target.targetLabel || target.name,
+        targetMeta: {
+          targetId: target.id,
+          name: target.name,
+          targetRef: target.targetRef,
+          targetType: target.targetType,
+          channelUrl: target.channelUrl || target.targetRef,
+          requiresManualActivation: target.requiresManualActivation === true,
+          isSystem: target.isSystem === true
+        }
+      }
+    ],
+    originOverride: 'manual',
+    skipDealLock: true
+  });
+
+  const processed = await processPublishingQueueEntry(queue.id);
+  return {
+    target,
+    queue: getPublishingQueueEntry(queue.id),
+    results: processed.results
+  };
+}
+
 export function getPublishingQueueEntry(queueId) {
   const queue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(queueId);
   if (!queue) {
@@ -616,6 +725,8 @@ export function getWorkerStatus() {
   const settings = getAppSettings();
   const telegramBot = getTelegramBotClientConfig();
   const whatsappClient = getWhatsappClientConfig();
+  const whatsappTargets = getWhatsappOutputTargetConfig();
+  const whatsappRuntime = getWhatsappRuntimeState();
 
   return {
     channels: stats,
@@ -630,9 +741,32 @@ export function getWorkerStatus() {
     whatsapp: {
       enabled: whatsappClient.enabled,
       endpointConfigured: whatsappClient.endpointConfigured,
+      providerConfigured: whatsappClient.providerConfigured,
+      providerMode: whatsappClient.providerMode,
+      providerLabel: whatsappClient.providerLabel,
       senderConfigured: whatsappClient.senderConfigured,
       sender: whatsappClient.sender,
-      retryLimit: whatsappClient.retryLimit
+      retryLimit: whatsappClient.retryLimit,
+      configuredTargets: whatsappTargets.targets.length,
+      publishTargets: whatsappTargets.effectiveTargets.length,
+      workerEnabled: whatsappRuntime.workerEnabled,
+      workerStatus: whatsappRuntime.workerStatus,
+      connectionStatus: whatsappRuntime.connectionStatus,
+      sessionValid: whatsappRuntime.sessionValid,
+      qrRequired: whatsappRuntime.qrRequired,
+      healthStatus: whatsappRuntime.healthStatus,
+      controlEndpointConfigured: whatsappRuntime.controlEndpointConfigured,
+      lastRestartAt: whatsappRuntime.lastRestartAt,
+      lastSuccessfulPostAt: whatsappRuntime.lastSuccessfulPostAt,
+      lastError: whatsappRuntime.lastError,
+      lastErrorAt: whatsappRuntime.lastErrorAt,
+      errorCount: whatsappRuntime.errorCount,
+      sendCooldownMs: whatsappRuntime.sendCooldownMs,
+      alertsEnabled: whatsappRuntime.alertsEnabled,
+      alertTargetRef: whatsappRuntime.alertTargetRef,
+      browserChannel: whatsappClient.browserChannel,
+      browserExecutablePath: whatsappClient.browserExecutablePath,
+      queue: whatsappRuntime.queue
     },
     facebook: {
       enabled: settings?.facebookEnabled === 1,
@@ -675,7 +809,9 @@ function updateQueueStatus(queueId) {
 
   const targets = db.prepare(`SELECT status FROM publishing_targets WHERE queue_id = ? AND is_enabled = 1`).all(queueId);
   const normalizedStatuses = targets.map((item) => normalizePublishingQueueStatus(item.status, item.status));
-  const nextStatus = normalizedStatuses.every((status) => isSentPublishingQueueStatus(status))
+  const nextStatus = normalizedStatuses.every(
+    (status) => isSentPublishingQueueStatus(status) || isSkippedPublishingQueueStatus(status)
+  )
     ? PUBLISHING_QUEUE_STATUS.sent
     : normalizedStatuses.some((status) => isSendingPublishingQueueStatus(status))
       ? PUBLISHING_QUEUE_STATUS.sending
@@ -683,6 +819,8 @@ function updateQueueStatus(queueId) {
         ? PUBLISHING_QUEUE_STATUS.retry
         : normalizedStatuses.some((status) => isWaitingPublishingQueueStatus(status))
           ? PUBLISHING_QUEUE_STATUS.pending
+          : normalizedStatuses.some((status) => isHoldPublishingQueueStatus(status))
+            ? PUBLISHING_QUEUE_STATUS.hold
           : normalizedStatuses.some((status) => isFailedPublishingQueueStatus(status))
             ? PUBLISHING_QUEUE_STATUS.failed
             : PUBLISHING_QUEUE_STATUS.pending;
@@ -789,6 +927,44 @@ function markTargetFailed(target, errorMessage, retry = true, retryLimitOverride
   });
 }
 
+function markTargetHold(target, errorMessage) {
+  const timestamp = nowIso();
+
+  runWithSqliteWriteRetry(() => {
+    db.prepare(
+      `
+        UPDATE publishing_targets
+        SET status = ?,
+            error_message = ?,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.hold, errorMessage, timestamp, target.id);
+
+    db.prepare(
+      `
+        UPDATE publishing_queue
+        SET status = ?,
+            next_retry_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.hold, timestamp, target.queue_id);
+  });
+
+  safeLogPublishing({
+    queueId: target.queue_id,
+    targetId: target.id,
+    workerType: target.channel_type,
+    level: 'warning',
+    eventType: 'target.hold',
+    message: errorMessage,
+    payload: {
+      hold: true
+    }
+  });
+}
+
 function markTargetSent(target, workerType, workerResult = {}) {
   const timestamp = nowIso();
 
@@ -813,6 +989,57 @@ function markTargetSent(target, workerType, workerResult = {}) {
     message: `${workerType} Worker hat den Beitrag erfolgreich verarbeitet.`,
     payload: workerResult
   });
+}
+
+function markTargetSkipped(target, message, payload = null) {
+  const timestamp = nowIso();
+  const whatsappTargetMeta = target.channel_type === 'whatsapp' ? parseJson(target.target_meta_json, {}) : null;
+
+  runWithSqliteWriteRetry(() =>
+    db.prepare(
+      `
+        UPDATE publishing_targets
+        SET status = ?,
+            error_message = ?,
+            updated_at = ?
+        WHERE id = ?
+      `
+    ).run(PUBLISHING_QUEUE_STATUS.skipped, message, timestamp, target.id)
+  );
+
+  safeLogPublishing({
+    queueId: target.queue_id,
+    targetId: target.id,
+    workerType: target.channel_type,
+    level: 'warning',
+    eventType: 'output.disabled.skip',
+    message,
+    payload
+  });
+
+  if (target.channel_type === 'whatsapp' && String(message || '').includes(OUTPUT_DISABLED_SKIP)) {
+    safeLogPublishing({
+      queueId: target.queue_id,
+      targetId: target.id,
+      workerType: 'whatsapp',
+      level: 'warning',
+      eventType: 'whatsapp.output.disabled.skip',
+      message: `[WHATSAPP_OUTPUT_DISABLED_SKIP] ${message}`,
+      payload
+    });
+
+    if (isWhatsappLiveTargetMeta(whatsappTargetMeta, target)) {
+      safeLogPublishing({
+        queueId: target.queue_id,
+        targetId: target.id,
+        workerType: 'whatsapp',
+        level: 'warning',
+        eventType: 'whatsapp.live.output.disabled.skip',
+        message: `[WHATSAPP_LIVE_OUTPUT_DISABLED_SKIP] ${message}`,
+        payload
+      });
+    }
+  }
 }
 
 function deferTargetDueToCopybotDisabled(target, reason = 'Copybot deaktiviert.') {
@@ -867,6 +1094,51 @@ function getTargetProcessor(target, processorOverrides = {}) {
   return processors[target.channel_type] || null;
 }
 
+function isHoldableWhatsappChannelError(error) {
+  const code = cleanText(error instanceof Error ? error.code || '' : '').toLowerCase();
+  return [
+    'whatsapp_channel_navigation_not_implemented',
+    'whatsapp_channel_composer_not_found',
+    'whatsapp_channel_no_admin_rights'
+  ].includes(code);
+}
+
+function hasExplicitOutputBinding(target = {}, payload = {}) {
+  const targetMeta = parseJson(target.target_meta_json, {});
+
+  if (
+    cleanText(target.target_ref) ||
+    cleanText(targetMeta?.outputChannelKey) ||
+    Number.isFinite(Number.parseInt(String(targetMeta?.targetId ?? ''), 10)) ||
+    cleanText(targetMeta?.chatId) ||
+    cleanText(targetMeta?.targetRef)
+  ) {
+    return true;
+  }
+
+  if (target.channel_type === 'telegram') {
+    return (
+      (Array.isArray(payload.telegramChatIds) && payload.telegramChatIds.some((value) => cleanText(value))) ||
+      (Array.isArray(payload.telegramTargetIds) &&
+        payload.telegramTargetIds.some((value) => Number.isFinite(Number.parseInt(String(value ?? ''), 10))))
+    );
+  }
+
+  if (target.channel_type === 'whatsapp') {
+    return (
+      (Array.isArray(payload.whatsappTargetRefs) && payload.whatsappTargetRefs.some((value) => cleanText(value))) ||
+      (Array.isArray(payload.whatsappTargetIds) &&
+        payload.whatsappTargetIds.some((value) => Number.isFinite(Number.parseInt(String(value ?? ''), 10))))
+    );
+  }
+
+  if (target.channel_type === 'facebook') {
+    return Boolean(cleanText(payload.facebookTargetRef || payload.facebookTarget));
+  }
+
+  return false;
+}
+
 async function processTarget(target, processorOverrides = {}) {
   const queue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
   const payload = parseJson(queue?.payload_json, {});
@@ -880,6 +1152,21 @@ async function processTarget(target, processorOverrides = {}) {
       [target.channel_type]: channelPayload.text
     }
   };
+  const hasProcessorOverride =
+    processorOverrides &&
+    typeof processorOverrides === 'object' &&
+    Object.prototype.hasOwnProperty.call(processorOverrides, target.channel_type) &&
+    typeof processorOverrides[target.channel_type] === 'function';
+  const shouldBypassOutputGate = hasProcessorOverride && !hasExplicitOutputBinding(target, payload);
+  const outputGate = evaluateOutputGate({
+    channelType: target.channel_type,
+    queueSourceType: queue?.source_type || '',
+    targetRef: target.target_ref,
+    targetLabel: target.target_label,
+    targetMetaJson: target.target_meta_json,
+    payload,
+    testMode: payload.testMode === true
+  });
 
   if (isCopybotControlledSourceType(queue?.source_type || '')) {
     const copybotState = getCopybotRuntimeState();
@@ -917,6 +1204,156 @@ async function processTarget(target, processorOverrides = {}) {
         skipped: true,
         reason
       };
+    }
+  }
+
+  if (target.channel_type === 'telegram') {
+    const targetMeta = parseJson(target.target_meta_json, {});
+    const outputState = getTelegramBotTargetState({
+      targetId: targetMeta?.targetId ?? null,
+      chatId: target.target_ref || targetMeta?.chatId || '',
+      isFallback: targetMeta?.isFallback === true,
+      allowAdHoc: targetMeta?.allowAdHoc === true
+    });
+
+    if (outputState.shouldSkip) {
+      const resolvedTarget = outputState.target || {};
+      const targetName =
+        cleanText(resolvedTarget.name) ||
+        cleanText(targetMeta?.name) ||
+        cleanText(target.target_label) ||
+        cleanText(target.target_ref) ||
+        'Telegram Ziel';
+      const reasonSuffix =
+        outputState.reasonCode === 'publishing_disabled'
+          ? 'Publishing ist deaktiviert.'
+          : outputState.reasonCode === 'target_missing' || outputState.reasonCode === 'OUTPUT_TARGET_REMOVED'
+            ? 'Ziel wurde aus der Output-Konfiguration entfernt.'
+            : 'Ziel ist deaktiviert.';
+      const reason = `OUTPUT_DISABLED_SKIP: ${targetName} uebersprungen. ${reasonSuffix} Erst manuell aktivieren.`;
+
+      console.warn('[OUTPUT_DISABLED_SKIP]', {
+        queueId: target.queue_id,
+        targetId: target.id,
+        sourceType: queue?.source_type || '',
+        channelType: target.channel_type,
+        targetName,
+        targetRef: target.target_ref || '',
+        reasonCode: outputState.reasonCode
+      });
+
+      markTargetSkipped(target, reason, {
+        reasonCode: outputState.reasonCode,
+        targetName,
+        targetRef: target.target_ref || '',
+        targetKind: resolvedTarget.targetKind || targetMeta?.targetKind || ''
+      });
+      recordOutputChannelEvent(outputGate.channel, {
+        status: 'disabled_skip',
+        lastErrorAt: nowIso(),
+        lastErrorMessage: reason,
+        queueId: target.queue_id,
+        targetId: target.id,
+        eventType: 'output.disabled.skip',
+        messagePreview: channelPayload.text
+      });
+      recordTelegramBotTargetDelivery({
+        targetId: resolvedTarget.id ?? targetMeta?.targetId ?? null,
+        chatId: target.target_ref || targetMeta?.chatId || '',
+        success: false,
+        errorMessage: reason,
+        deliveryStatus: 'skipped'
+      });
+      const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.sent;
+      const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
+      safeSyncDealStatusWithQueue({
+        queueId: target.queue_id,
+        queueStatus: normalizePublishingQueueStatus(queueStatus, PUBLISHING_QUEUE_STATUS.sent),
+        payload,
+        sourceType: queue?.source_type || '',
+        sourceId: queue?.source_id ?? null,
+        target,
+        message: reason,
+        origin,
+        meta: {
+          dealKey: updatedQueue?.deal_key || '',
+          outputState: {
+            reasonCode: outputState.reasonCode,
+            targetName
+          }
+        }
+      });
+
+      return {
+        targetId: target.id,
+        channelType: target.channel_type,
+        status: PUBLISHING_QUEUE_STATUS.skipped,
+        skipped: true,
+        reason
+      };
+    }
+  }
+
+  if (!outputGate.allowed && !shouldBypassOutputGate) {
+    markTargetSkipped(target, outputGate.message, {
+      reasonCode: OUTPUT_DISABLED_SKIP,
+      channelKey: outputGate.channel?.channelKey || null,
+      targetRef: target.target_ref || '',
+      platform: outputGate.channel?.platform || target.channel_type
+    });
+    recordOutputChannelEvent(outputGate.channel, {
+      status: 'disabled_skip',
+      lastErrorAt: nowIso(),
+      lastErrorMessage: outputGate.message,
+      queueId: target.queue_id,
+      targetId: target.id,
+      eventType: 'output.disabled.skip',
+      messagePreview: channelPayload.text
+    });
+    const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.sent;
+    const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
+    safeSyncDealStatusWithQueue({
+      queueId: target.queue_id,
+      queueStatus: normalizePublishingQueueStatus(queueStatus, PUBLISHING_QUEUE_STATUS.sent),
+      payload,
+      sourceType: queue?.source_type || '',
+      sourceId: queue?.source_id ?? null,
+      target,
+      message: outputGate.message,
+      origin,
+      meta: {
+        dealKey: updatedQueue?.deal_key || '',
+        outputState: {
+          reasonCode: OUTPUT_DISABLED_SKIP,
+          channelKey: outputGate.channel?.channelKey || null
+        }
+      }
+    });
+
+    return {
+      targetId: target.id,
+      channelType: target.channel_type,
+      status: PUBLISHING_QUEUE_STATUS.skipped,
+      skipped: true,
+      reason: outputGate.message
+    };
+  }
+
+  if (target.channel_type === 'whatsapp') {
+    const whatsappTargetMeta = parseJson(target.target_meta_json, {});
+    if (isWhatsappTestTargetMeta(whatsappTargetMeta)) {
+      safeLogPublishing({
+        queueId: target.queue_id,
+        targetId: target.id,
+        workerType: 'whatsapp',
+        eventType: 'whatsapp.test.send.allowed',
+        message: `[WHATSAPP_TEST_SEND_ALLOWED] ${cleanText(target.target_label) || cleanText(target.target_ref) || 'WhatsApp Test Output'} darf senden.`,
+        payload: {
+          targetId: whatsappTargetMeta?.targetId ?? null,
+          targetRef: target.target_ref || whatsappTargetMeta?.targetRef || '',
+          queueSourceType: queue?.source_type || ''
+        }
+      });
     }
   }
 
@@ -968,7 +1405,80 @@ async function processTarget(target, processorOverrides = {}) {
     }
 
     const workerResult = await processor(target, workerPayload, queue);
+    const skippedTargets = Array.isArray(workerResult?.skippedTargets)
+      ? workerResult.skippedTargets
+      : Array.isArray(workerResult?.skippedDisabledTargets)
+        ? workerResult.skippedDisabledTargets
+        : [];
+
+    if (skippedTargets.length && (!Array.isArray(workerResult?.targets) || workerResult.targets.length === 0)) {
+      const skipMessage = `OUTPUT_DISABLED_SKIP: ${skippedTargets
+        .map((entry) => entry.targetName || entry.targetChatId || 'Telegram Ziel')
+        .join(', ')} ist deaktiviert. Erst manuell aktivieren.`;
+
+      markTargetSkipped(target, skipMessage, {
+        skippedTargets
+      });
+      recordOutputChannelEvent(outputGate.channel, {
+        status: 'disabled_skip',
+        lastErrorAt: nowIso(),
+        lastErrorMessage: skipMessage,
+        queueId: target.queue_id,
+        targetId: target.id,
+        eventType: 'output.disabled.skip',
+        messagePreview: channelPayload.text
+      });
+      const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.sent;
+      const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
+      safeSyncDealStatusWithQueue({
+        queueId: target.queue_id,
+        queueStatus: normalizePublishingQueueStatus(queueStatus, PUBLISHING_QUEUE_STATUS.sent),
+        payload,
+        sourceType: queue?.source_type || '',
+        sourceId: queue?.source_id ?? null,
+        target,
+        message: skipMessage,
+        origin,
+        meta: {
+          workerResult,
+          dealKey: updatedQueue?.deal_key || ''
+        }
+      });
+
+      return {
+        targetId: target.id,
+        channelType: target.channel_type,
+        status: PUBLISHING_QUEUE_STATUS.skipped,
+        skipped: true,
+        reason: skipMessage,
+        workerResult
+      };
+    }
+
+    if (skippedTargets.length) {
+      safeLogPublishing({
+        queueId: target.queue_id,
+        targetId: target.id,
+        workerType: target.channel_type,
+        level: 'warning',
+        eventType: 'output.disabled.skip',
+        message: `OUTPUT_DISABLED_SKIP: ${skippedTargets
+          .map((entry) => entry.targetName || entry.targetChatId || 'Telegram Ziel')
+          .join(', ')} ist deaktiviert. Erst manuell aktivieren.`,
+        payload: {
+          skippedTargets
+        }
+      });
+    }
     markTargetSent(target, target.channel_type, workerResult);
+    recordOutputChannelEvent(outputGate.channel, {
+      status: 'sent',
+      lastSentAt: nowIso(),
+      queueId: target.queue_id,
+      targetId: target.id,
+      eventType: 'target.sent',
+      messagePreview: channelPayload.text
+    });
     const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.sent;
     const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
     safeSyncDealStatusWithQueue({
@@ -1006,6 +1516,88 @@ async function processTarget(target, processorOverrides = {}) {
       channelType: target.channel_type
     });
     try {
+      if (target.channel_type === 'whatsapp' && isHoldableWhatsappChannelError(error)) {
+        const errorMessage = error instanceof Error ? error.message : 'WhatsApp Channel Navigation fehlgeschlagen.';
+        const whatsappTargetMeta = parseJson(target.target_meta_json, {});
+
+        markTargetHold(target, errorMessage);
+        recordOutputChannelEvent(outputGate.channel, {
+          status: 'hold',
+          lastErrorAt: nowIso(),
+          lastErrorMessage: errorMessage,
+          queueId: target.queue_id,
+          targetId: target.id,
+          eventType: 'target.hold',
+          messagePreview: channelPayload.text
+        });
+
+        recordWhatsappSendError({
+          outputTargetId: whatsappTargetMeta?.targetId ?? null,
+          errorMessage,
+          code: error instanceof Error ? error.code || '' : '',
+          retryable: false,
+          finalFailure: true,
+          incrementErrorCount: false,
+          deliveryStatus: 'hold'
+        });
+
+        safeLogPublishing({
+          queueId: target.queue_id,
+          targetId: target.id,
+          workerType: 'whatsapp',
+          level: 'warning',
+          eventType: 'whatsapp.channel.navigation.hold',
+          message: `[${cleanText(error instanceof Error ? error.code || '' : '').toUpperCase() || 'WHATSAPP_CHANNEL_NAVIGATION_NOT_IMPLEMENTED'}] ${errorMessage}`,
+          payload: {
+            code: error instanceof Error ? error.code || '' : '',
+            queueId: target.queue_id
+          }
+        });
+        safeLogPublishing({
+          queueId: target.queue_id,
+          targetId: target.id,
+          workerType: 'whatsapp',
+          level: 'warning',
+          eventType: 'whatsapp.queue.hold',
+          message: `[WHATSAPP_QUEUE_HOLD] ${errorMessage}`,
+          payload: {
+            code: error instanceof Error ? error.code || '' : '',
+            queueStatus: PUBLISHING_QUEUE_STATUS.hold,
+            queueId: target.queue_id
+          }
+        });
+
+        const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.hold;
+        const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
+        safeSyncDealStatusWithQueue({
+          queueId: target.queue_id,
+          queueStatus: normalizePublishingQueueStatus(queueStatus, PUBLISHING_QUEUE_STATUS.hold),
+          payload,
+          sourceType: queue?.source_type || '',
+          sourceId: queue?.source_id ?? null,
+          target,
+          message: `${target.channel_type} Target auf HOLD gesetzt.`,
+          errorMessage,
+          origin,
+          meta: {
+            dealKey: updatedQueue?.deal_key || '',
+            holdCode: error instanceof Error ? error.code || '' : ''
+          }
+        });
+
+        await sendWhatsappChannelUnavailableAlert({
+          problem: errorMessage,
+          openItems: getWhatsappRuntimeState().queue.open
+        }).catch(() => null);
+
+        return {
+          targetId: target.id,
+          channelType: target.channel_type,
+          status: PUBLISHING_QUEUE_STATUS.hold,
+          error: errorMessage
+        };
+      }
+
       markTargetFailed(
         target,
         error instanceof Error ? error.message : 'Worker-Fehler',
@@ -1013,6 +1605,16 @@ async function processTarget(target, processorOverrides = {}) {
         error instanceof Error ? error.retryLimit : null
       );
       const queueStatus = updateQueueStatus(target.queue_id) || PUBLISHING_QUEUE_STATUS.failed;
+      const updatedTarget = db.prepare(`SELECT * FROM publishing_targets WHERE id = ?`).get(target.id) || target;
+      recordOutputChannelEvent(outputGate.channel, {
+        status: 'failed',
+        lastErrorAt: nowIso(),
+        lastErrorMessage: error instanceof Error ? error.message : 'Worker-Fehler',
+        queueId: target.queue_id,
+        targetId: target.id,
+        eventType: 'target.failed',
+        messagePreview: channelPayload.text
+      });
       const updatedQueue = db.prepare(`SELECT * FROM publishing_queue WHERE id = ?`).get(target.queue_id);
       safeSyncDealStatusWithQueue({
         queueId: target.queue_id,
@@ -1028,6 +1630,78 @@ async function processTarget(target, processorOverrides = {}) {
           dealKey: updatedQueue?.deal_key || ''
         }
       });
+
+      if (target.channel_type === 'whatsapp') {
+        const whatsappTargetMeta = parseJson(target.target_meta_json, {});
+        if (normalizePublishingQueueStatus(updatedTarget.status, updatedTarget.status) === PUBLISHING_QUEUE_STATUS.retry) {
+          recordWhatsappSendError({
+            outputTargetId: whatsappTargetMeta?.targetId ?? null,
+            errorMessage: error instanceof Error ? error.message : 'WhatsApp Versand wird erneut versucht.',
+            code: error instanceof Error ? error.code || '' : '',
+            retryable: true,
+            finalFailure: false,
+            incrementErrorCount: false
+          });
+          safeLogPublishing({
+            queueId: target.queue_id,
+            targetId: target.id,
+            workerType: 'whatsapp',
+            level: 'warning',
+            eventType: 'whatsapp.send.retry',
+            message: `[WHATSAPP_SEND_RETRY] ${error instanceof Error ? error.message : 'WhatsApp Versand wird erneut versucht.'}`,
+            payload: {
+              code: error instanceof Error ? error.code || '' : '',
+              queueStatus,
+              queueId: target.queue_id
+            }
+          });
+          safeLogPublishing({
+            queueId: target.queue_id,
+            targetId: target.id,
+            workerType: 'whatsapp',
+            level: 'warning',
+            eventType: 'whatsapp.queue.retry',
+            message: `[WHATSAPP_QUEUE_RETRY] ${error instanceof Error ? error.message : 'WhatsApp Queue wartet auf erneuten Versand.'}`,
+            payload: {
+              code: error instanceof Error ? error.code || '' : '',
+              queueStatus,
+              queueId: target.queue_id
+            }
+          });
+          await sendWhatsappRetryAlert({
+            problem: error instanceof Error ? error.message : 'WhatsApp Versand wird erneut versucht.',
+            openItems: getWhatsappRuntimeState().queue.open,
+            code: error instanceof Error ? error.code || '' : ''
+          }).catch(() => null);
+        } else if (normalizePublishingQueueStatus(updatedTarget.status, updatedTarget.status) === PUBLISHING_QUEUE_STATUS.failed) {
+          recordWhatsappSendError({
+            outputTargetId: whatsappTargetMeta?.targetId ?? null,
+            errorMessage: error instanceof Error ? error.message : 'WhatsApp Versand final fehlgeschlagen.',
+            code: error instanceof Error ? error.code || '' : '',
+            retryable: false,
+            finalFailure: true,
+            incrementErrorCount: false
+          });
+          safeLogPublishing({
+            queueId: target.queue_id,
+            targetId: target.id,
+            workerType: 'whatsapp',
+            level: 'error',
+            eventType: 'whatsapp.send.failed.final',
+            message: `[WHATSAPP_SEND_FAILED_FINAL] ${error instanceof Error ? error.message : 'WhatsApp Versand final fehlgeschlagen.'}`,
+            payload: {
+              code: error instanceof Error ? error.code || '' : '',
+              queueStatus,
+              queueId: target.queue_id
+            }
+          });
+          await sendWhatsappFinalFailureAlert({
+            problem: error instanceof Error ? error.message : 'WhatsApp Versand final fehlgeschlagen.',
+            affectedItems: getWhatsappRuntimeState().queue.open,
+            code: error instanceof Error ? error.code || '' : ''
+          }).catch(() => null);
+        }
+      }
     } catch (stateError) {
       safeLogPublishing({
         queueId: target.queue_id,
@@ -1085,6 +1759,16 @@ function listRunnableTargets({ channelType = null, queueId = null, limit = 20 } 
 
 function recoverInterruptedPublishingTargets() {
   const timestamp = nowIso();
+  const recoveredWhatsappTargets = db
+    .prepare(
+      `
+        SELECT COUNT(*) AS count
+        FROM publishing_targets
+        WHERE channel_type = 'whatsapp'
+          AND status IN (?, ?)
+      `
+    )
+    .get(PUBLISHING_QUEUE_STATUS.sending, 'processing');
   const recoveredTargets = runWithSqliteWriteRetry(() =>
     db
       .prepare(
@@ -1124,6 +1808,22 @@ function recoverInterruptedPublishingTargets() {
         recoveredTargets
       }
     });
+
+    if (Number(recoveredWhatsappTargets?.count || 0) > 0) {
+      safeLogPublishing({
+        workerType: 'whatsapp',
+        level: 'warning',
+        eventType: 'whatsapp.recovery.requeue',
+        message: `[WHATSAPP_RECOVERY_REQUEUE] ${Number(recoveredWhatsappTargets.count || 0)} WhatsApp Target(s) nach Neustart auf Retry gesetzt.`,
+        payload: {
+          recoveredQueues,
+          recoveredTargets: Number(recoveredWhatsappTargets.count || 0)
+        }
+      });
+      void sendWhatsappRecoveryAlert({
+        openItems: getWhatsappRuntimeState().queue.open
+      }).catch(() => null);
+    }
   }
 
   return {
@@ -1158,6 +1858,18 @@ export async function processPublishingQueueEntry(queueId, options = {}) {
     sourceId: queue?.source_id ?? null,
     status: queue?.status || ''
   });
+  safeLogPublishing({
+    queueId,
+    workerType: 'publisher',
+    eventType: 'publisher.queue.status',
+    message: `[PUBLISHER_QUEUE_STATUS] queue=${queueId} status=${queue?.status || ''} source=${queue?.source_type || ''}`,
+    payload: {
+      queueId,
+      sourceType: queue?.source_type || '',
+      sourceId: queue?.source_id ?? null,
+      status: queue?.status || ''
+    }
+  });
 
   const results = [];
 
@@ -1176,8 +1888,21 @@ export async function processPublishingQueueEntry(queueId, options = {}) {
     }
   }
 
+  const finalQueue = getPublishingQueueEntry(queueId);
+  safeLogPublishing({
+    queueId,
+    workerType: 'publisher',
+    eventType: 'publisher.queue.status',
+    message: `[PUBLISHER_QUEUE_STATUS] queue=${queueId} final_status=${finalQueue?.status || ''}`,
+    payload: {
+      queueId,
+      finalStatus: finalQueue?.status || '',
+      resultCount: results.length
+    }
+  });
+
   return {
-    queue: getPublishingQueueEntry(queueId),
+    queue: finalQueue,
     results
   };
 }

@@ -45,7 +45,9 @@ function LogsPage() {
       setStatus('');
 
       try {
-        const response = await fetch(`${API_BASE_URL}/api/logs`);
+        const response = await fetch(`${API_BASE_URL}/api/logs`, {
+          credentials: 'include'
+        });
         const data = await response.json().catch(() => ({}));
 
         if (!response.ok) {

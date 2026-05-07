@@ -18,6 +18,7 @@ function ScraperPage() {
       try {
         setLoading(true);
         const response = await fetch(`${API_BASE_URL}/api/learning/overview`, {
+          credentials: 'include',
           headers: {
             'Content-Type': 'application/json',
             'X-User-Role': user?.role || ''

@@ -32,6 +32,7 @@ async function requestJson(url, options = {}) {
   try {
     response = await fetch(url, {
       ...options,
+      credentials: 'include',
       headers: {
         Accept: 'application/json',
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),

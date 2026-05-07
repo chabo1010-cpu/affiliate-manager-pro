@@ -13,8 +13,20 @@ export async function processTelegramPublishingTarget(target, queuePayload) {
       ? queuePayload.imageVariants?.standard || ''
       : '';
   const postedAt = new Date().toISOString();
+  console.info('[TELEGRAM_PUBLISHER_STATUS]', {
+    queueId: target.queue_id,
+    targetId: target.id,
+    targetRef: target.target_ref || '',
+    targetLabel: target.target_label || '',
+    imageSource,
+    hasUploadedImage: Boolean(uploadedImage),
+    hasImageUrl: Boolean(imageUrl),
+    hasCouponCode: Boolean(cleanText(queuePayload.couponCode))
+  });
   const result = await sendTelegramDealToTargets({
     queuePayload,
+    queueId: target.queue_id,
+    publishingTargetId: target.id,
     text: queuePayload.textByChannel?.telegram || queuePayload.title || '',
     uploadedImage,
     imageUrl,
@@ -22,10 +34,20 @@ export async function processTelegramPublishingTarget(target, queuePayload) {
     telegramTargetChatIds: target.target_ref ? [target.target_ref] : [],
     rabattgutscheinCode: queuePayload.couponCode
   });
+  console.info('[TELEGRAM_PUBLISHER_STATUS]', {
+    queueId: target.queue_id,
+    targetId: target.id,
+    targetRef: target.target_ref || '',
+    targetLabel: target.target_label || '',
+    deliveryCount: Array.isArray(result.targets) ? result.targets.length : 0,
+    sentCount: Array.isArray(result.targets) ? result.targets.filter((item) => cleanText(item?.messageId || '')).length : 0,
+    duplicateCount: Array.isArray(result.targets) ? result.targets.filter((item) => item?.duplicateBlocked === true).length : 0,
+    skippedCount: Array.isArray(result.targets) ? result.targets.filter((item) => item?.skipped === true).length : 0
+  });
 
   if (queuePayload.skipPostedDealHistory !== true) {
     result.targets.forEach((delivery) => {
-      if (delivery?.duplicateBlocked === true) {
+      if (delivery?.duplicateBlocked === true || delivery?.skipped === true || !cleanText(delivery?.messageId || '')) {
         return;
       }
 

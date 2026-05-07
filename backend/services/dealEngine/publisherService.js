@@ -32,8 +32,9 @@ export function getDealEngineOutputSnapshot(settings) {
     whatsapp: {
       enabledByEngine: settings.output.whatsappEnabled,
       enabledByClient: whatsappConfig.enabled,
-      configured: whatsappConfig.endpointConfigured,
+      configured: whatsappConfig.providerConfigured,
       sender: whatsappConfig.sender,
+      providerMode: whatsappConfig.providerMode,
       retryLimit: whatsappConfig.retryLimit
     },
     latestQueues: engineQueues
